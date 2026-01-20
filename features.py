@@ -209,12 +209,16 @@ def compute_all_physics_features(params: torch.Tensor) -> torch.Tensor:
     # ========================================================================
 
     # Recombination lifetime (effective)
-    Tau_eff = 1.0 / (1.0/Taue + 1.0/Tauh)
-    Tau_eff_log = torch.log10(Tau_eff + 1e-30)
+    # Protect against division by very small Taue/Tauh values
+    # Clamp lifetimes to minimum value to prevent inf
+    Taue_safe = Taue.clamp(min=1e-30)
+    Tauh_safe = Tauh.clamp(min=1e-30)
+    Tau_eff = 1.0 / (1.0/Taue_safe + 1.0/Tauh_safe)
+    Tau_eff_log = torch.log10(Tau_eff.clamp(min=1e-30))
 
     # Recombination rate proxy
-    Recomb_proxy = 1.0 / (Taue + Tauh)
-    Recomb_proxy_log = torch.log10(Recomb_proxy + 1e-30)
+    Recomb_proxy = 1.0 / (Taue_safe + Tauh_safe)
+    Recomb_proxy_log = torch.log10(Recomb_proxy.clamp(min=1e-30))
 
     # SRH recombination strength
     SRH_strength = (Taue_log + Tauh_log) / 2.0
@@ -356,7 +360,40 @@ def compute_all_physics_features(params: torch.Tensor) -> torch.Tensor:
 
     ], dim=1)
 
+    # Validate: replace any remaining inf/nan with safe values
+    features = torch.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
+
     return features
+
+
+def validate_features(features: torch.Tensor, verbose: bool = True) -> dict:
+    """
+    Validate features for inf/nan values.
+    Returns dict with validation stats.
+    """
+    n_inf = torch.isinf(features).sum().item()
+    n_nan = torch.isnan(features).sum().item()
+    n_total = features.numel()
+
+    stats = {
+        'n_inf': n_inf,
+        'n_nan': n_nan,
+        'n_total': n_total,
+        'pct_invalid': (n_inf + n_nan) / n_total * 100,
+        'has_issues': n_inf > 0 or n_nan > 0
+    }
+
+    if verbose and stats['has_issues']:
+        print(f"WARNING: Features contain {n_inf} inf and {n_nan} nan values ({stats['pct_invalid']:.4f}%)")
+        # Find which features have issues
+        inf_mask = torch.isinf(features).any(dim=0)
+        nan_mask = torch.isnan(features).any(dim=0)
+        feature_names = get_feature_names()
+        for i, name in enumerate(feature_names):
+            if inf_mask[i] or nan_mask[i]:
+                print(f"  - Feature {i} ({name}): inf={inf_mask[i].item()}, nan={nan_mask[i].item()}")
+
+    return stats
 
 
 def get_feature_names() -> list[str]:
