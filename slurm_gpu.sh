@@ -38,17 +38,8 @@ cd $WORK_DIR
 # Create logs directory if needed
 mkdir -p $WORK_DIR/logs
 
-# Activate virtual environment (create if needed)
-if [ ! -d "venv" ]; then
-    python -m venv venv
-    source venv/bin/activate
-    pip install --upgrade pip
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-    pip install lightgbm --config-settings=cmake.define.USE_GPU=ON
-    pip install optuna pandas numpy scikit-learn
-else
-    source venv/bin/activate
-fi
+# Activate virtual environment (must run setup_env.sh first on login node)
+source venv/bin/activate
 
 # Print environment info
 echo ""
