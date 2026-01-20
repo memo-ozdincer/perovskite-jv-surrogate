@@ -32,14 +32,14 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export CUDA_VISIBLE_DEVICES=0
 
 # Working directory
-WORK_DIR="/scratch/memoozd/ts-tools-scratch/dbe"
+WORK_DIR="/scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors"
 cd $WORK_DIR
 
 # Create logs directory if needed
-mkdir -p $WORK_DIR/logs
+mkdir -p /scratch/memoozd/ts-tools-scratch/dbe/logs
 
 # Activate virtual environment (must run setup_env.sh first on login node)
-source venv/bin/activate
+source ../venv/bin/activate
 
 # Print environment info
 echo ""
@@ -50,10 +50,10 @@ echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if tor
 echo ""
 
 # Run training with full HPO
-python scalar_predictors/train.py \
-    --params LHS_parameters_m.txt \
-    --iv IV_m.txt \
-    --output outputs_$(date +%Y%m%d_%H%M%S) \
+python train.py \
+    --params $WORK_DIR/LHS_parameters_m.txt \
+    --iv $WORK_DIR/IV_m.txt \
+    --output $WORK_DIR/outputs_$(date +%Y%m%d_%H%M%S) \
     --device cuda \
     --hpo-trials-nn 300 \
     --hpo-trials-lgbm 500 \

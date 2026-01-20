@@ -27,26 +27,27 @@ module load gcc/12.3 cuda/12.2 python/3.11
 export OMP_NUM_THREADS=24
 export MKL_NUM_THREADS=24
 
-WORK_DIR="/scratch/memoozd/ts-tools-scratch/dbe"
+BASE_DIR="/scratch/memoozd/ts-tools-scratch/dbe"
+WORK_DIR="$BASE_DIR/scalar_predictors"
 cd $WORK_DIR
-mkdir -p $WORK_DIR/logs
+mkdir -p $BASE_DIR/logs
 
 # Activate virtual environment (must run setup_env.sh first on login node)
-source venv/bin/activate
+source $BASE_DIR/venv/bin/activate
 
 echo "Python: $(which python)"
 echo "GPUs available: $(python -c 'import torch; print(torch.cuda.device_count())')"
 
 # Create output directory with timestamp
-OUTPUT_DIR="outputs_4gpu_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="$WORK_DIR/outputs_4gpu_$(date +%Y%m%d_%H%M%S)"
 mkdir -p $OUTPUT_DIR
 
 # Run 4 parallel training jobs, each on a different GPU
 # This is useful if you want to try different random seeds or configurations
 for GPU_ID in 0 1 2 3; do
-    CUDA_VISIBLE_DEVICES=$GPU_ID python scalar_predictors/train.py \
-        --params LHS_parameters_m.txt \
-        --iv IV_m.txt \
+    CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
+        --params $WORK_DIR/LHS_parameters_m.txt \
+        --iv $WORK_DIR/IV_m.txt \
         --output ${OUTPUT_DIR}/gpu${GPU_ID} \
         --device cuda \
         --hpo-trials-nn 300 \

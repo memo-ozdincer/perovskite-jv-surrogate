@@ -7,6 +7,7 @@
 set -e  # Exit on error
 
 WORK_DIR="/scratch/memoozd/ts-tools-scratch/dbe"
+PROJ_DIR="$WORK_DIR/scalar_predictors"
 cd $WORK_DIR
 
 echo "Setting up environment in $WORK_DIR"
@@ -48,6 +49,7 @@ uv pip install \
 
 # Create logs directory
 mkdir -p $WORK_DIR/logs
+mkdir -p $PROJ_DIR
 
 # Verify installation
 echo ""
@@ -75,5 +77,6 @@ print('All dependencies installed successfully!')
 
 echo ""
 echo "============================================"
-echo "Setup complete! Now run: sbatch slurm_gpu.sh"
+echo "Setup complete!"
+echo "Now run: cd $PROJ_DIR && sbatch slurm_gpu.sh"
 echo "============================================"

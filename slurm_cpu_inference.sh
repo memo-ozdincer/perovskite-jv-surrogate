@@ -28,17 +28,18 @@ module load gcc/12.3 python/3.11
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-WORK_DIR="/scratch/memoozd/ts-tools-scratch/dbe"
+BASE_DIR="/scratch/memoozd/ts-tools-scratch/dbe"
+WORK_DIR="$BASE_DIR/scalar_predictors"
 cd $WORK_DIR
-mkdir -p $WORK_DIR/logs
+mkdir -p $BASE_DIR/logs
 
-source venv/bin/activate
+source $BASE_DIR/venv/bin/activate
 
 # Run inference on CPU
-python scalar_predictors/inference.py \
-    --models outputs/models \
-    --input new_parameters.csv \
-    --output predictions.csv \
+python inference.py \
+    --models $WORK_DIR/outputs/models \
+    --input $WORK_DIR/new_parameters.csv \
+    --output $WORK_DIR/predictions.csv \
     --device cpu
 
 echo ""
