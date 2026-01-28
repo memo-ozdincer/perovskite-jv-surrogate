@@ -13,9 +13,10 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 from functools import partial
 
-from models.voc_nn import VocNNConfig, VocNN, VocTrainer
+from models.voc_nn import VocNNConfig, VocNN, VocTrainer, SplitSplineNetConfig, UnifiedSplitSplineNet
 from models.jsc_lgbm import JscLGBMConfig, JscLGBM
 from models.vmpp_lgbm import VmppLGBMConfig, VmppLGBM, JmppLGBM, FFLGBM
+from models.reconstruction import reconstruct_curve, continuity_loss
 
 
 @dataclass
@@ -299,6 +300,160 @@ class LGBMObjective:
 
 
 # ============================================================================
+# CURVE MODEL HPO (for Split-Spline reconstruction)
+# ============================================================================
+
+def sample_curve_config(trial: optuna.Trial, input_dim: int) -> SplitSplineNetConfig:
+    """
+    Sample hyperparameters for curve reconstruction model.
+
+    Key hyperparameters:
+    - Architecture: hidden dims, dropout
+    - Control points: number per region
+    - Training: lr, weight decay, continuity weight
+    """
+    # Architecture - moderate complexity
+    n_layers = trial.suggest_int('n_layers', 2, 4)
+    hidden_dims = []
+    for i in range(n_layers):
+        if i == 0:
+            dim = trial.suggest_categorical(f'hidden_{i}', [256, 512])
+        elif i == 1:
+            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256])
+        else:
+            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128])
+        hidden_dims.append(dim)
+
+    return SplitSplineNetConfig(
+        input_dim=input_dim,
+        hidden_dims=hidden_dims,
+        dropout=trial.suggest_float('dropout', 0.1, 0.3),
+        activation=trial.suggest_categorical('activation', ['silu', 'gelu']),
+        ctrl_points=trial.suggest_int('ctrl_points', 3, 6),
+    )
+
+
+class CurveObjective:
+    """Optuna objective for curve reconstruction model."""
+
+    def __init__(
+        self,
+        X_train: np.ndarray,
+        anchors_train: np.ndarray,
+        curves_train: np.ndarray,
+        X_val: np.ndarray,
+        anchors_val: np.ndarray,
+        curves_val: np.ndarray,
+        v_grid: np.ndarray,
+        device: torch.device,
+        batch_size: int = 2048,
+        max_epochs: int = 50,  # Reduced for HPO
+        patience: int = 10
+    ):
+        self.X_train = torch.from_numpy(X_train).float()
+        self.X_val = torch.from_numpy(X_val).float()
+        self.anchors_train = torch.from_numpy(anchors_train).float()
+        self.anchors_val = torch.from_numpy(anchors_val).float()
+        self.curves_train = torch.from_numpy(curves_train).float()
+        self.curves_val = torch.from_numpy(curves_val).float()
+        self.v_grid = torch.from_numpy(v_grid).float()
+        self.device = device
+        self.batch_size = batch_size
+        self.input_dim = X_train.shape[1]
+        self.max_epochs = max_epochs
+        self.patience = patience
+
+    def __call__(self, trial: optuna.Trial) -> float:
+        config = sample_curve_config(trial, self.input_dim)
+
+        # Additional training hyperparameters
+        lr = trial.suggest_float('lr', 1e-4, 5e-3, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-4, log=True)
+        continuity_weight = trial.suggest_float('continuity_weight', 0.05, 0.5, log=True)
+
+        model = UnifiedSplitSplineNet(config).to(self.device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        train_ds = torch.utils.data.TensorDataset(
+            self.X_train, self.anchors_train, self.curves_train
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            self.X_val, self.anchors_val, self.curves_val
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=self.batch_size, shuffle=True
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=self.batch_size, shuffle=False
+        )
+
+        v_grid = self.v_grid.to(self.device)
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+
+        for epoch in range(self.max_epochs):
+            # Train
+            model.train()
+            for batch_x, batch_anchors, batch_curves in train_loader:
+                batch_x = batch_x.to(self.device)
+                batch_anchors = batch_anchors.to(self.device)
+                batch_curves = batch_curves.to(self.device)
+
+                optimizer.zero_grad()
+                pred_anchors, ctrl1, ctrl2 = model(batch_x)
+                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+
+                # Combined loss: anchor MSE + curve MSE + continuity
+                loss_anchor = torch.nn.functional.mse_loss(pred_anchors, batch_anchors)
+                loss_curve = torch.nn.functional.mse_loss(pred_curve, batch_curves)
+                loss_cont = continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
+
+                loss = loss_anchor + loss_curve + continuity_weight * loss_cont
+
+                if torch.isnan(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            # Validate
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch_x, batch_anchors, batch_curves in val_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_anchors = batch_anchors.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
+
+                    pred_anchors, ctrl1, ctrl2 = model(batch_x)
+                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+
+                    val_loss = torch.nn.functional.mse_loss(pred_curve, batch_curves)
+                    val_losses.append(val_loss.item())
+
+            avg_val_loss = float(np.mean(val_losses))
+
+            # Report for pruning
+            trial.report(avg_val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+            # Early stopping
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    break
+
+        return best_val_loss
+
+
+# ============================================================================
 # DISTRIBUTED HPO ENGINE
 # ============================================================================
 
@@ -410,6 +565,41 @@ class DistributedHPO:
             n_trials=n_trials,
             timeout=self.config.timeout_per_model,
             n_jobs=1,  # Avoid GPU oversubscription
+            show_progress_bar=True,
+            gc_after_trial=True
+        )
+
+        return study.best_params, study
+
+    def optimize_curve(
+        self,
+        X_train: np.ndarray,
+        anchors_train: np.ndarray,
+        curves_train: np.ndarray,
+        X_val: np.ndarray,
+        anchors_val: np.ndarray,
+        curves_val: np.ndarray,
+        v_grid: np.ndarray,
+        device: torch.device,
+        n_trials: int = None
+    ) -> tuple[dict, optuna.Study]:
+        """Run HPO for curve reconstruction model."""
+
+        n_trials = n_trials or self.config.n_trials_nn
+
+        objective = CurveObjective(
+            X_train, anchors_train, curves_train,
+            X_val, anchors_val, curves_val,
+            v_grid, device
+        )
+
+        study = self.create_study('curve_model', sampler='tpe')
+
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            timeout=self.config.timeout_per_model,
+            n_jobs=1,  # GPU model
             show_progress_bar=True,
             gc_after_trial=True
         )
@@ -640,4 +830,75 @@ def get_best_configs_from_study(results: dict) -> dict:
             reg_lambda=params.get('reg_lambda', 0.1),
         )
 
+    # Curve model
+    if 'curve_model' in results:
+        params = results['curve_model']['params']
+        n_layers = params.get('n_layers', 3)
+        hidden_dims = [params.get(f'hidden_{i}', 256 // (2 ** i)) for i in range(n_layers)]
+        configs['curve_model'] = {
+            'config': SplitSplineNetConfig(
+                hidden_dims=hidden_dims,
+                dropout=params.get('dropout', 0.15),
+                activation=params.get('activation', 'silu'),
+                ctrl_points=params.get('ctrl_points', 4),
+            ),
+            'lr': params.get('lr', 1e-3),
+            'weight_decay': params.get('weight_decay', 1e-5),
+            'continuity_weight': params.get('continuity_weight', 0.1),
+        }
+
     return configs
+
+
+def run_curve_hpo(
+    X_train: np.ndarray,
+    anchors_train: np.ndarray,
+    curves_train: np.ndarray,
+    X_val: np.ndarray,
+    anchors_val: np.ndarray,
+    curves_val: np.ndarray,
+    v_grid: np.ndarray,
+    device: torch.device,
+    hpo_config: HPOConfig = None,
+    n_trials: int = None
+) -> dict:
+    """
+    Run HPO for curve reconstruction model separately.
+
+    Returns dict with best params for curve model.
+    """
+    hpo_config = hpo_config or HPOConfig()
+    engine = DistributedHPO(hpo_config)
+
+    # Normalize features
+    feature_mean = X_train.mean(axis=0, keepdims=True)
+    feature_std = X_train.std(axis=0, keepdims=True) + 1e-8
+    X_train_norm = (X_train - feature_mean) / feature_std
+    X_val_norm = (X_val - feature_mean) / feature_std
+
+    print("=" * 60)
+    print("HPO: Curve Reconstruction Model")
+    print("=" * 60)
+
+    n_trials = n_trials or hpo_config.n_trials_nn
+
+    curve_params, curve_study = engine.optimize_curve(
+        X_train_norm, anchors_train, curves_train,
+        X_val_norm, anchors_val, curves_val,
+        v_grid, device, n_trials
+    )
+
+    results = {
+        'curve_model': {
+            'params': curve_params,
+            'study': curve_study,
+            'best_value': curve_study.best_value,
+            'n_trials': len(curve_study.trials)
+        },
+        'normalization': {
+            'feature_mean': feature_mean.tolist(),
+            'feature_std': feature_std.tolist()
+        }
+    }
+
+    return results

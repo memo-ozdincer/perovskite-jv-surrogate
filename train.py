@@ -35,7 +35,7 @@ from models.vmpp_lgbm import (
     build_vmpp_model, build_jmpp_model, build_ff_model
 )
 from models.reconstruction import reconstruct_curve, continuity_loss
-from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study
+from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
 from logging_utils import (
     TrainingLogger, ModelComparisonMetrics,
     compute_multicollinearity, suggest_features_to_drop
@@ -121,12 +121,14 @@ class ScalarPredictorPipeline:
         device: str = 'cuda',
         run_hpo: bool = True,
         run_curve_model: bool = False,
+        run_curve_hpo: bool = False,  # NEW: Run HPO for curve model
         train_cvae: bool = False,
         validate_feature_correlations: bool = True,
         drop_weak_features: bool = False,
         weak_feature_threshold: float = 0.3,
         max_weak_feature_fraction: float = 0.2,
         hpo_config: HPOConfig = None,
+        load_hpo_path: str = None,  # NEW: Path to load HPO results from
         # New config options for robustness and logging
         multicollinearity_threshold: float = 0.85,
         drop_multicollinear: bool = False,
@@ -144,7 +146,9 @@ class ScalarPredictorPipeline:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.run_hpo = run_hpo
         self.run_curve_model = run_curve_model
+        self.run_curve_hpo = run_curve_hpo
         self.train_cvae = train_cvae
+        self.load_hpo_path = load_hpo_path
         self.enable_feature_validation = validate_feature_correlations
         self.drop_weak_features = drop_weak_features
         self.weak_feature_threshold = weak_feature_threshold
@@ -359,6 +363,29 @@ class ScalarPredictorPipeline:
 
         print(f"Physics features reduced: {n_features} -> {self.physics_features_np.shape[1]}")
 
+    def load_hpo_results(self, hpo_path: str) -> dict:
+        """Load HPO results from a JSON file."""
+        print("\n" + "=" * 60)
+        print(f"Loading HPO Results from: {hpo_path}")
+        print("=" * 60)
+
+        with open(hpo_path, 'r') as f:
+            hpo_summary = json.load(f)
+
+        # Convert loaded params to the format expected by get_best_configs_from_study
+        hpo_results = {}
+        for name, summary in hpo_summary.items():
+            # Create a mock result structure
+            hpo_results[name] = {
+                'params': summary['best_params'],
+                # We don't have the study object, but we can create a mock
+                'best_value': summary.get('best_value', 0),
+                'n_trials': summary.get('n_trials', 0)
+            }
+
+        print(f"Loaded HPO results for: {list(hpo_results.keys())}")
+        return hpo_results
+
     def run_hyperparameter_optimization(self):
         """Run HPO for all models."""
         print("\n" + "=" * 60)
@@ -387,20 +414,92 @@ class ScalarPredictorPipeline:
         self.best_configs = get_best_configs_from_study(self.hpo_results)
 
         # Save HPO results
+        self._save_hpo_results()
+
+    def run_curve_hyperparameter_optimization(self):
+        """Run HPO for curve reconstruction model."""
+        print("\n" + "=" * 60)
+        print("Running Curve Model HPO")
+        print("=" * 60)
+
+        train = self.splits['train']
+        val = self.splits['val']
+
+        X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
+        X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
+
+        anchors_train = np.stack(
+            [train['targets']['Jsc'], train['targets']['Voc'],
+             train['targets']['Vmpp'], train['targets']['Jmpp']],
+            axis=1
+        ).astype(np.float32)
+        anchors_val = np.stack(
+            [val['targets']['Jsc'], val['targets']['Voc'],
+             val['targets']['Vmpp'], val['targets']['Jmpp']],
+            axis=1
+        ).astype(np.float32)
+
+        curves_train = train['curves'].astype(np.float32)
+        curves_val = val['curves'].astype(np.float32)
+
+        curve_hpo_results = run_curve_hpo(
+            X_train=X_train_full,
+            anchors_train=anchors_train,
+            curves_train=curves_train,
+            X_val=X_val_full,
+            anchors_val=anchors_val,
+            curves_val=curves_val,
+            v_grid=self.v_grid,
+            device=self.device,
+            hpo_config=self.hpo_config,
+            n_trials=self.hpo_config.n_trials_nn
+        )
+
+        # Merge into existing hpo_results
+        if not hasattr(self, 'hpo_results'):
+            self.hpo_results = {}
+        self.hpo_results['curve_model'] = curve_hpo_results['curve_model']
+
+        # Update best_configs
+        if not hasattr(self, 'best_configs'):
+            self.best_configs = {}
+        curve_configs = get_best_configs_from_study({'curve_model': curve_hpo_results['curve_model']})
+        self.best_configs.update(curve_configs)
+
+        # Save updated HPO results
+        self._save_hpo_results()
+
+        print(f"\nCurve HPO completed. Best value: {curve_hpo_results['curve_model']['best_value']:.6f}")
+
+    def _save_hpo_results(self):
+        """Save all HPO results to JSON."""
         hpo_summary = {}
         for name, result in self.hpo_results.items():
-            hpo_summary[name] = {
-                'best_params': result['params'],
-                'best_value': result['study'].best_value,
-                'n_trials': len(result['study'].trials)
-            }
+            if 'study' in result:
+                hpo_summary[name] = {
+                    'best_params': result['params'],
+                    'best_value': result['study'].best_value,
+                    'n_trials': len(result['study'].trials)
+                }
+            else:
+                # Already in summary format (loaded from file or curve HPO)
+                hpo_summary[name] = {
+                    'best_params': result.get('params', result.get('best_params', {})),
+                    'best_value': result.get('best_value', 0),
+                    'n_trials': result.get('n_trials', 0)
+                }
 
         with open(self.output_dir / 'hpo_results.json', 'w') as f:
             json.dump(hpo_summary, f, indent=2, default=str)
 
-        print("\nHPO Summary:")
+        print("\nHPO Summary saved to:", self.output_dir / 'hpo_results.json')
         for name, summary in hpo_summary.items():
-            print(f"  {name}: best_value={summary['best_value']:.6f}, n_trials={summary['n_trials']}")
+            best_val = summary.get('best_value', 'N/A')
+            n_trials = summary.get('n_trials', 'N/A')
+            if isinstance(best_val, float):
+                print(f"  {name}: best_value={best_val:.6f}, n_trials={n_trials}")
+            else:
+                print(f"  {name}: best_value={best_val}, n_trials={n_trials}")
 
     def train_final_models(self):
         """Train final models with best hyperparameters."""
@@ -557,15 +656,35 @@ class ScalarPredictorPipeline:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        # Use configurable control points (simplified from 6 to 4)
-        config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=self.ctrl_points)
+        # Use HPO'd config if available, otherwise use defaults
+        configs = getattr(self, 'best_configs', {})
+        if 'curve_model' in configs:
+            curve_hpo = configs['curve_model']
+            config = curve_hpo['config']
+            config.input_dim = X_train_full.shape[1]
+            lr = curve_hpo.get('lr', 1e-3)
+            weight_decay = curve_hpo.get('weight_decay', 1e-5)
+            # Override continuity_weight from HPO if available
+            continuity_weight = curve_hpo.get('continuity_weight', self.continuity_weight)
+            print(f"\nUsing HPO'd curve model config:")
+            print(f"  hidden_dims: {config.hidden_dims}")
+            print(f"  ctrl_points: {config.ctrl_points}")
+            print(f"  lr: {lr}")
+            print(f"  continuity_weight: {continuity_weight}")
+        else:
+            # Use configurable control points (simplified from 6 to 4)
+            config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=self.ctrl_points)
+            lr = 1e-3
+            weight_decay = 1e-5
+            continuity_weight = self.continuity_weight
+
         model = UnifiedSplitSplineNet(config).to(self.device)
         multitask_loss = MultiTaskLoss().to(self.device)
 
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(multitask_loss.parameters()),
-            lr=1e-3,
-            weight_decay=1e-5
+            lr=lr,
+            weight_decay=weight_decay
         )
 
         v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
@@ -577,8 +696,8 @@ class ScalarPredictorPipeline:
         patience_counter = 0
 
         print(f"\nTraining curve model with:")
-        print(f"  ctrl_points: {self.ctrl_points}")
-        print(f"  continuity_weight: {self.continuity_weight}")
+        print(f"  ctrl_points: {config.ctrl_points}")
+        print(f"  continuity_weight: {continuity_weight}")
         print(f"  use_hard_clamp_training: {self.use_hard_clamp_training}")
 
         for epoch in range(100):
@@ -617,7 +736,7 @@ class ScalarPredictorPipeline:
 
                 # Add continuity loss with configurable weight
                 cont_loss = continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
-                loss = loss + self.continuity_weight * cont_loss
+                loss = loss + continuity_weight * cont_loss
 
                 # Only add tail penalty if NOT using hard clamp (backward compat)
                 if not self.use_hard_clamp_training:
@@ -1308,8 +1427,18 @@ class ScalarPredictorPipeline:
         self.split_data()
         self.run_feature_validation()
 
-        if self.run_hpo:
+        # Handle HPO: either load from file, run fresh, or skip
+        if self.load_hpo_path:
+            # Load HPO results from previous run
+            loaded_results = self.load_hpo_results(self.load_hpo_path)
+            self.hpo_results = loaded_results
+            self.best_configs = get_best_configs_from_study(loaded_results)
+        elif self.run_hpo:
             self.run_hyperparameter_optimization()
+
+        # Run curve HPO if requested (can be done with or without scalar HPO)
+        if self.run_curve_hpo and self.run_curve_model:
+            self.run_curve_hyperparameter_optimization()
 
         self.train_final_models()
         self.evaluate()
@@ -1347,8 +1476,12 @@ def main():
                         help='Device (cuda/cpu)')
     parser.add_argument('--no-hpo', action='store_true',
                         help='Skip hyperparameter optimization')
+    parser.add_argument('--load-hpo', type=str, default=None,
+                        help='Path to load HPO results from (skips scalar HPO)')
     parser.add_argument('--train-curves', action='store_true',
                         help='Train unified split-spline curve model')
+    parser.add_argument('--curve-hpo', action='store_true',
+                        help='Run HPO for curve reconstruction model')
     parser.add_argument('--train-cvae', action='store_true',
                         help='Train CVAE baseline for curve reconstruction')
     parser.add_argument('--no-feature-validation', action='store_true',
@@ -1356,7 +1489,7 @@ def main():
     parser.add_argument('--drop-weak-features', action='store_true',
                         help='Drop weak physics features (|r| below threshold)')
     parser.add_argument('--hpo-trials-nn', type=int, default=100,
-                        help='Number of HPO trials for NN')
+                        help='Number of HPO trials for NN (also used for curve HPO)')
     parser.add_argument('--hpo-trials-lgbm', type=int, default=200,
                         help='Number of HPO trials for LGBM')
     parser.add_argument('--hpo-timeout', type=int, default=7200,
@@ -1386,17 +1519,22 @@ def main():
         timeout_per_model=args.hpo_timeout
     )
 
+    # If loading HPO, skip running HPO (but can still run curve HPO)
+    run_scalar_hpo = not args.no_hpo and args.load_hpo is None
+
     pipeline = ScalarPredictorPipeline(
         params_file=args.params,
         iv_file=args.iv,
         output_dir=args.output,
         device=args.device,
-        run_hpo=not args.no_hpo,
+        run_hpo=run_scalar_hpo,
         run_curve_model=args.train_curves,
+        run_curve_hpo=args.curve_hpo,
         train_cvae=args.train_cvae,
         validate_feature_correlations=not args.no_feature_validation,
         drop_weak_features=args.drop_weak_features,
         hpo_config=hpo_config,
+        load_hpo_path=args.load_hpo,
         # New options
         multicollinearity_threshold=args.multicollinearity_threshold,
         drop_multicollinear=args.drop_multicollinear,

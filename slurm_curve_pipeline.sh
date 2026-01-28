@@ -10,7 +10,7 @@
 #SBATCH --account=aip-aspuru
 
 # ============================================================================
-# Curve Reconstruction Pipeline - ROBUST VERSION
+# Curve Reconstruction Pipeline - WITH HPO PERSISTENCE
 # ============================================================================
 # Key improvements:
 # - Hard clamping during training (fixes train-test mismatch)
@@ -18,6 +18,26 @@
 # - Multicollinearity check on features
 # - Comprehensive logging (sigma values, constraint violations)
 # - Comparison table output (Split-Spline vs CVAE)
+# - HPO results saved to JSON for reuse
+# - Can skip scalar HPO and load from previous run
+# - Curve reconstruction HPO support
+# ============================================================================
+#
+# USAGE MODES:
+#   1. Full HPO (default): Run all HPO including curve model
+#      sbatch slurm_curve_pipeline.sh
+#
+#   2. Load HPO from file (skip scalar HPO, still runs curve HPO):
+#      sbatch slurm_curve_pipeline.sh /path/to/hpo_results.json
+#
+#   3. Load HPO, skip curve HPO too (just train with existing params):
+#      sbatch slurm_curve_pipeline.sh /path/to/hpo_results.json --no-curve-hpo
+#
+# OUTPUT:
+#   - $OUT_DIR/hpo_results.json : HPO results (can be reused in future runs)
+#   - $OUT_DIR/metrics.json     : Final test metrics
+#   - $OUT_DIR/models/          : Trained model weights
+#
 # ============================================================================
 
 echo "=========================================="
@@ -64,11 +84,32 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION - Adjust these for your run
 # ============================================================================
-HPO_TRIALS_NN=5          # Reduced due to simplified search space
-HPO_TRIALS_LGBM=5        # Reduced due to simplified search space
+HPO_TRIALS_NN=50           # Number of HPO trials for NN and curve model
+HPO_TRIALS_LGBM=100        # Number of HPO trials for LGBM
 HPO_TIMEOUT=7200           # 2 hours per model
-CONTINUITY_WEIGHT=0.5      # Try 0.1, 0.5, or 1.0
-CTRL_POINTS=4              # Simplified from 6
+CONTINUITY_WEIGHT=0.1      # Try 0.1, 0.5, or 1.0 (may be overridden by curve HPO)
+CTRL_POINTS=4              # Simplified from 6 (may be overridden by curve HPO)
+
+# ============================================================================
+# PARSE COMMAND LINE ARGUMENTS
+# ============================================================================
+LOAD_HPO_PATH=""
+RUN_CURVE_HPO="--curve-hpo"  # Default: run curve HPO
+
+# Check for HPO file argument
+if [ -n "$1" ] && [ -f "$1" ]; then
+    LOAD_HPO_PATH="$1"
+    echo "Will load HPO results from: $LOAD_HPO_PATH"
+    shift
+fi
+
+# Check for --no-curve-hpo flag
+for arg in "$@"; do
+    if [ "$arg" == "--no-curve-hpo" ]; then
+        RUN_CURVE_HPO=""
+        echo "Skipping curve HPO"
+    fi
+done
 
 echo ""
 echo "Configuration:"
@@ -76,13 +117,17 @@ echo "  HPO_TRIALS_NN: $HPO_TRIALS_NN"
 echo "  HPO_TRIALS_LGBM: $HPO_TRIALS_LGBM"
 echo "  CONTINUITY_WEIGHT: $CONTINUITY_WEIGHT"
 echo "  CTRL_POINTS: $CTRL_POINTS"
+echo "  LOAD_HPO_PATH: ${LOAD_HPO_PATH:-'(none - will run HPO)'}"
+echo "  RUN_CURVE_HPO: ${RUN_CURVE_HPO:-'(no)'}"
 echo ""
 
-# Run training with all new options
-python train.py \
-    --params "$WORK_DIR/LHS_parameters_m.txt" \
-    --iv "$WORK_DIR/IV_m.txt" \
-    --output "$OUT_DIR" \
+# ============================================================================
+# BUILD COMMAND
+# ============================================================================
+CMD="python train.py \
+    --params \"$WORK_DIR/LHS_parameters_m.txt\" \
+    --iv \"$WORK_DIR/IV_m.txt\" \
+    --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
     --train-cvae \
@@ -92,16 +137,38 @@ python train.py \
     --hpo-trials-lgbm $HPO_TRIALS_LGBM \
     --hpo-timeout $HPO_TIMEOUT \
     --continuity-weight $CONTINUITY_WEIGHT \
-    --ctrl-points $CTRL_POINTS
+    --ctrl-points $CTRL_POINTS"
 
+# Add curve HPO flag if enabled
+if [ -n "$RUN_CURVE_HPO" ]; then
+    CMD="$CMD $RUN_CURVE_HPO"
+fi
+
+# Add load HPO flag if provided
+if [ -n "$LOAD_HPO_PATH" ]; then
+    CMD="$CMD --load-hpo \"$LOAD_HPO_PATH\""
+fi
+
+echo "Running command:"
+echo "$CMD"
+echo ""
+
+# Run the command
+eval $CMD
+
+# ============================================================================
+# OUTPUT FILES
+# ============================================================================
 # The following files will be generated:
-# - $OUT_DIR/training_summary.json       : Overall training summary
-# - $OUT_DIR/multitask_losses.csv        : Per-epoch sigma values
-# - $OUT_DIR/constraint_violations.csv   : Per-epoch constraint violations
-# - $OUT_DIR/multicollinearity.json      : Feature multicollinearity report
-# - $OUT_DIR/model_comparison.json       : Split-Spline vs CVAE metrics
-# - $OUT_DIR/model_comparison.md         : Markdown comparison table
-# - $OUT_DIR/metrics.json                : Final test metrics
+# - $OUT_DIR/hpo_results.json         : HPO results (REUSE THIS FOR FUTURE RUNS)
+# - $OUT_DIR/training_summary.json    : Overall training summary
+# - $OUT_DIR/multitask_losses.csv     : Per-epoch sigma values
+# - $OUT_DIR/constraint_violations.csv: Per-epoch constraint violations
+# - $OUT_DIR/multicollinearity.json   : Feature multicollinearity report
+# - $OUT_DIR/model_comparison.json    : Split-Spline vs CVAE metrics
+# - $OUT_DIR/model_comparison.md      : Markdown comparison table
+# - $OUT_DIR/metrics.json             : Final test metrics
+# - $OUT_DIR/models/                  : Trained model weights
 
 echo ""
 echo "=========================================="
@@ -109,6 +176,10 @@ echo "End time: $(date)"
 echo "=========================================="
 echo ""
 echo "Key output files:"
+echo "  - $OUT_DIR/hpo_results.json (REUSE THIS FOR FUTURE RUNS)"
 echo "  - $OUT_DIR/training_summary.json"
 echo "  - $OUT_DIR/model_comparison.md"
 echo "  - $OUT_DIR/metrics.json"
+echo ""
+echo "To skip scalar HPO in future runs, use:"
+echo "  sbatch slurm_curve_pipeline.sh $OUT_DIR/hpo_results.json"
