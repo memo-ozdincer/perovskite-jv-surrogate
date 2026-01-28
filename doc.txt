@@ -1,0 +1,162 @@
+Documentation: Split-Spline J–V Curve Reconstruction Extension
+Date: 2026-01-28
+
+Overview
+This update extends the scalar-only pipeline into a curve-reconstruction system that predicts full J–V curves (45 points) while enforcing physics constraints. It adds:
+1) Hard constraint projection for anchors.
+2) Unified multi-head network for anchors + curve shape control points.
+3) Differentiable split-spline reconstruction (PCHIP) with continuity loss.
+4) Automatic multi-task loss weighting (Kendall uncertainty).
+5) CVAE baseline for comparative evaluation.
+6) Optional OOD evaluation helper.
+7) Optional uncertainty estimation via MC Dropout.
+
+Key Files Modified/Added
+- models/voc_nn.py: Added hard projection, unified split-spline net, MC-dropout utility.
+- models/reconstruction.py: New split PCHIP reconstruction + continuity loss.
+- models/cvae.py: New CVAE baseline + loss.
+- models/__init__.py: Exported new models/utilities.
+- train.py: Optional curve-model training, full-curve retention, uncertainty-weighted loss.
+
+Detailed Implementation
+
+1) Hard Constraint Projection (Anchors)
+File: models/voc_nn.py
+- Added `physics_projection(raw_outputs)` that enforces:
+  - Jsc > 0
+  - Voc > 0
+  - Vmpp in (0, Voc)
+  - Jmpp in (0, Jsc)
+- This is a hard projection (clamp + min) to guarantee valid physical anchors by construction.
+
+2) Unified Multi-Head Network
+File: models/voc_nn.py
+- Added `SplitSplineNetConfig` with defaults (input_dim=102, hidden_dims=[512,256,128], ctrl_points=6).
+- Added `UnifiedSplitSplineNet`:
+  - Shared backbone
+  - Head A (anchors): predicts 4 scalars [Jsc, Voc, Vmpp, Jmpp] then projected via physics_projection.
+  - Head B (region 1): 6 control points in [0,1] for V∈[0,Vmpp].
+  - Head C (region 2): 6 control points in [0,1] for V∈[Vmpp,Voc].
+
+3) Split-Spline Reconstruction (Differentiable PCHIP)
+File: models/reconstruction.py
+- Added `build_knots(anchors, ctrl1, ctrl2)`:
+  - Region 1 knots: (0,Jsc) → (Vmpp,Jmpp), with 6 intermediate points.
+  - Region 2 knots: (Vmpp,Jmpp) → (Voc,0), with 6 intermediate points.
+- Added `pchip_interpolate_batch` and `_pchip_slopes` (Fritsch–Carlson) for monotonic cubic interpolation.
+- Added `reconstruct_curve(anchors, ctrl1, ctrl2, v_grid)`:
+  - Evaluates region 1 and 2 splines and stitches at Vmpp.
+  - Enforces J=0 for V > Voc to prevent invalid tail.
+- Added `continuity_loss`:
+  - C1 continuity (value + derivative) at Vmpp using finite differences with local grid spacing.
+
+4) Multi-Task Loss Weighting (Kendall et al.)
+File: train.py
+- Added `MultiTaskLoss`:
+  - Trainable log-variances for anchor loss and curve loss.
+  - Loss = L_anchor/(2σ_a^2)+logσ_a + L_curve/(2σ_c^2)+logσ_c.
+
+5) Curve Training Pipeline (Optional)
+File: train.py
+- Retained full J–V curves in data splits: `splits[*]['curves']`.
+- Added `run_curve_model` flag in `ScalarPredictorPipeline`.
+- Added `train_curve_model()`:
+  - Normalizes inputs.
+  - Trains `UnifiedSplitSplineNet` with `MultiTaskLoss`.
+  - Adds continuity regularization: 0.1 * continuity_loss.
+  - Early stopping with patience=15.
+- Added CLI flag `--train-curves` to enable this training path.
+
+6) CVAE Baseline
+File: models/cvae.py
+- Added `ConditionalVAE`:
+  - Encoder: (curve + params) → latent (mu, logvar)
+  - Decoder: (latent + params) → reconstructed curve
+- Added `cvae_loss` = MSE + β·KL.
+
+7) Uncertainty Quantification
+File: models/voc_nn.py
+- Added `predict_with_uncertainty(model, x, n_samples)`:
+  - Uses MC Dropout to estimate mean and std.
+  - Restores original train/eval state after inference.
+
+8) Optional OOD Evaluation Helper
+File: train.py
+- Added `test_ood_generalization(...)` helper:
+  - Bandgap-based extrapolation: train low bandgap, test high bandgap.
+  - Leave-one-material-out if material labels are supplied.
+
+Behavior Changes and Constraints
+- Anchors are now always physically valid via hard projection.
+- Curve reconstruction is monotonic in each region and stitched at Vmpp.
+- Curve values beyond Voc are clamped to zero.
+
+How to Use
+- Standard scalar training remains unchanged.
+- Enable curve training with:
+  - `python train.py --train-curves`
+- Curve model is stored in `self.models['curve_model']`.
+
+What Is Not Yet Wired
+- Inference pipeline for full curves is not yet integrated into inference.py.
+- Curve-model evaluation metrics (region-wise MSE) are not yet logged in evaluate().
+
+Suggested Next Steps
+- Integrate curve reconstruction into inference (predict anchors+ctrl → curve).
+- Add curve metrics: full-curve MSE and region-wise MSE (0→Vmpp, Vmpp→Voc).
+- Add CVAE training/eval wrapper for side-by-side benchmarks.
+- Add OOD evaluation calls using available metadata (bandgap/material labels).
+
+Status Update (2026-01-28)
+
+✅ Completed (new)
+1) Data pipeline verification
+- Curves retained in splits and checked for correct shape (N, 45).
+- Voltage grid retained and stored in splits and model config for downstream inference.
+
+2) Feature validation + optional pruning
+- Added correlation-based validation for engineered physics features.
+- Optional feature dropping via CLI with stored feature mask for inference consistency.
+
+3) Curve inference integration
+- Added full-curve inference with optional MC-dropout uncertainty.
+- Exports curve predictions and a separate v-grid CSV.
+- Inference uses stored feature mask + normalization parameters.
+
+4) Curve evaluation metrics
+- Full-curve MSE + region-wise MSE during validation.
+- Anchor MAE + FF MAPE + constraint violations during evaluation.
+
+5) CVAE training + evaluation wrapper
+- CVAE training pipeline + evaluation (curve MSE + constraint violations).
+- CVAE model saved for comparison.
+
+6) Control-point monotonicity fix + Voc tail handling
+- Control points now use cumulative scaling to ensure monotone knots.
+- Optional monotonicity checks added.
+- Removed hard Voc clamp during training and added soft tail penalty.
+
+How It Was Done (high-level)
+- Added feature correlation validation and optional masking.
+- Stored v-grid and normalization stats in model artifacts.
+- Implemented curve prediction + uncertainty in inference.
+- Added curve metrics to validation + test evaluation.
+- Fixed spline knot construction to guarantee monotonic regions.
+
+Key Files Updated
+- models/reconstruction.py: monotonic control points, optional validation, optional Voc clamp.
+- features.py: feature correlation validation helper.
+- train.py: curve retention checks, feature validation/drop, curve metrics, CVAE train/eval, model saving.
+- inference.py: curve prediction, uncertainty, v-grid export, feature-mask support.
+
+What’s Left (still missing)
+1) Ablation studies runner + results table.
+2) OOD evaluation runs (bandgap extrapolation, leave-one-material-out, extreme ranges).
+3) Uncertainty calibration demo (coverage + plots).
+4) Automated test suite for constraints/monotonicity/continuity.
+
+Current Usage Additions
+- Train curves: python train.py --train-curves
+- Train CVAE: python train.py --train-cvae
+- Drop weak features: python train.py --drop-weak-features
+- Curve inference: python inference.py --predict-curve --input ... --output ...

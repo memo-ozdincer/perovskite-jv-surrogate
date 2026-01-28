@@ -471,6 +471,64 @@ class UnifiedSplitSplineNet(nn.Module):
         return anchors, ctrl1, ctrl2
 
 
+class SplitSplineCtrlNet(nn.Module):
+    """
+    Control-point network for split-spline reconstruction.
+    Outputs only control points; anchors are supplied externally (e.g., LGBM).
+    """
+
+    def __init__(self, config: SplitSplineNetConfig):
+        super().__init__()
+        self.config = config
+
+        layers = []
+        prev_dim = config.input_dim
+        for hidden_dim in config.hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(self._get_activation(config.activation))
+            layers.append(nn.Dropout(config.dropout))
+            prev_dim = hidden_dim
+        self.backbone = nn.Sequential(*layers)
+
+        self.head_region1 = nn.Sequential(
+            nn.Linear(prev_dim, 64),
+            self._get_activation(config.activation),
+            nn.Linear(64, config.ctrl_points),
+            nn.Sigmoid()
+        )
+        self.head_region2 = nn.Sequential(
+            nn.Linear(prev_dim, 64),
+            self._get_activation(config.activation),
+            nn.Linear(64, config.ctrl_points),
+            nn.Sigmoid()
+        )
+
+        self._init_weights()
+
+    def _get_activation(self, name: str) -> nn.Module:
+        activations = {
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU(),
+            'mish': nn.Mish(),
+            'relu': nn.ReLU(),
+            'leaky_relu': nn.LeakyReLU(0.1),
+        }
+        return activations.get(name, nn.SiLU())
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.backbone(x)
+        ctrl1 = self.head_region1(features)
+        ctrl2 = self.head_region2(features)
+        return ctrl1, ctrl2
+
+
 @torch.no_grad()
 def predict_with_uncertainty(
     model: nn.Module,

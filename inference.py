@@ -10,11 +10,12 @@ import numpy as np
 import torch
 import lightgbm as lgb
 
-from config import COLNAMES
+from config import COLNAMES, V_GRID
 from features import compute_all_physics_features, compute_jsc_ceiling, compute_voc_ceiling
-from models.voc_nn import VocNN, VocNNConfig
+from models.voc_nn import VocNN, VocNNConfig, SplitSplineNetConfig, UnifiedSplitSplineNet
 from models.jsc_lgbm import JscLGBMConfig
 from models.vmpp_lgbm import VmppLGBMConfig
+from models.reconstruction import reconstruct_curve
 
 
 @dataclass
@@ -56,6 +57,10 @@ class ScalarPredictor:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.models = {}
         self.configs = {}
+        self.physics_feature_mask = None
+        self.curve_feature_mean = None
+        self.curve_feature_std = None
+        self.v_grid = V_GRID.astype(np.float32)
 
         self._load_models()
 
@@ -98,11 +103,39 @@ class ScalarPredictor:
                 norm_params = json.load(f)
                 self.voc_feature_mean = np.array(norm_params['voc_feature_mean'])
                 self.voc_feature_std = np.array(norm_params['voc_feature_std'])
+                self.voc_target_mean = float(norm_params.get('voc_target_mean', 0.0))
+                self.voc_target_std = float(norm_params.get('voc_target_std', 1.0))
+                self.curve_feature_mean = np.array(norm_params.get('curve_feature_mean')) if norm_params.get('curve_feature_mean') is not None else None
+                self.curve_feature_std = np.array(norm_params.get('curve_feature_std')) if norm_params.get('curve_feature_std') is not None else None
+                if 'physics_feature_mask' in norm_params:
+                    mask_indices = norm_params['physics_feature_mask']
+                    self.physics_feature_mask = np.array(mask_indices, dtype=int)
             print("Loaded normalization parameters for Voc NN")
         else:
             print("WARNING: No normalization parameters found. Predictions may be incorrect.")
             self.voc_feature_mean = None
             self.voc_feature_std = None
+            self.voc_target_mean = 0.0
+            self.voc_target_std = 1.0
+
+        # Load curve model (optional)
+        curve_model_path = self.models_dir / 'curve_model.pt'
+        if curve_model_path.exists():
+            curve_config_dict = self.configs.get('curve_model', {})
+            self.v_grid = np.array(curve_config_dict.get('v_grid', V_GRID), dtype=np.float32)
+
+            curve_config = SplitSplineNetConfig(
+                input_dim=curve_config_dict.get('input_dim', 102),
+                hidden_dims=curve_config_dict.get('hidden_dims', [512, 256, 128]),
+                dropout=curve_config_dict.get('dropout', 0.15),
+                activation=curve_config_dict.get('activation', 'silu'),
+                ctrl_points=curve_config_dict.get('ctrl_points', 6),
+            )
+            self.models['curve_model'] = UnifiedSplitSplineNet(curve_config).to(self.device)
+            self.models['curve_model'].load_state_dict(
+                torch.load(curve_model_path, map_location=self.device)
+            )
+            self.models['curve_model'].eval()
 
         print("All models loaded successfully")
 
@@ -116,7 +149,7 @@ class ScalarPredictor:
         Returns:
             PredictionResult with all predictions
         """
-        params = params.astype(np.float32)
+        params = np.atleast_2d(params).astype(np.float32)
         N = params.shape[0]
 
         # Convert to tensor for feature computation
@@ -125,6 +158,9 @@ class ScalarPredictor:
         # Compute physics features
         physics_features = compute_all_physics_features(params_tensor)
         physics_features_np = physics_features.cpu().numpy()
+
+        if self.physics_feature_mask is not None:
+            physics_features_np = physics_features_np[:, self.physics_feature_mask]
 
         # Compute ceilings
         jsc_ceiling = compute_jsc_ceiling(params_tensor).cpu().numpy()
@@ -142,6 +178,9 @@ class ScalarPredictor:
 
         with torch.no_grad():
             Voc = self.models['voc_nn'](X_tensor, voc_ceiling_tensor).cpu().numpy()
+
+        # Denormalize Voc predictions if needed
+        Voc = Voc * self.voc_target_std + self.voc_target_mean
 
         # 2. Predict Jsc
         X_jsc = np.hstack([
@@ -195,6 +234,66 @@ class ScalarPredictor:
             Pmpp=Pmpp,
             PCE=PCE
         )
+
+    def _prepare_curve_inputs(self, params: np.ndarray) -> torch.Tensor:
+        """Prepare normalized inputs for curve model."""
+        params = np.atleast_2d(params).astype(np.float32)
+        params_tensor = torch.from_numpy(params).to(self.device)
+
+        physics_features = compute_all_physics_features(params_tensor)
+        physics_features_np = physics_features.cpu().numpy()
+
+        if self.physics_feature_mask is not None:
+            physics_features_np = physics_features_np[:, self.physics_feature_mask]
+
+        X_full = np.hstack([params, physics_features_np]).astype(np.float32)
+
+        if self.curve_feature_mean is not None and self.curve_feature_std is not None:
+            X_full = (X_full - self.curve_feature_mean) / self.curve_feature_std
+
+        return torch.from_numpy(X_full).float().to(self.device)
+
+    def predict_full_curve(
+        self,
+        params: np.ndarray,
+        return_uncertainty: bool = False,
+        n_samples: int = 50
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """
+        Predict full J-V curve from material parameters.
+
+        Returns:
+            v_grid: (45,) voltage points
+            j_curve: (N, 45) current predictions
+            j_std: (N, 45) uncertainty (optional)
+        """
+        if 'curve_model' not in self.models:
+            raise ValueError("Curve model not loaded. Train with --train-curves first.")
+
+        x = self._prepare_curve_inputs(params)
+        v_grid_tensor = torch.from_numpy(self.v_grid).float().to(self.device)
+
+        model = self.models['curve_model']
+
+        if return_uncertainty:
+            was_training = model.training
+            model.train()
+            curves = []
+            for _ in range(n_samples):
+                anchors, ctrl1, ctrl2 = model(x)
+                curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                curves.append(curve)
+            stacked = torch.stack(curves)
+            mean = stacked.mean(dim=0)
+            std = stacked.std(dim=0)
+            if not was_training:
+                model.eval()
+            return self.v_grid, mean.cpu().numpy(), std.cpu().numpy()
+
+        with torch.no_grad():
+            anchors, ctrl1, ctrl2 = model(x)
+            curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+        return self.v_grid, curve.cpu().numpy(), None
 
     def predict_from_dataframe(self, df) -> PredictionResult:
         """Predict from pandas DataFrame with named columns."""
@@ -285,6 +384,12 @@ def main():
                         help='Path to output predictions CSV')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device (cuda/cpu)')
+    parser.add_argument('--predict-curve', action='store_true',
+                        help='Predict full J-V curves instead of scalar outputs')
+    parser.add_argument('--curve-uncertainty', action='store_true',
+                        help='Estimate uncertainty via MC dropout for curves')
+    parser.add_argument('--mc-samples', type=int, default=50,
+                        help='Number of MC samples for curve uncertainty')
 
     args = parser.parse_args()
 
@@ -304,12 +409,35 @@ def main():
 
     # Predict
     print(f"Running inference on {len(params)} samples...")
-    result = predictor.predict(params.astype(np.float32))
 
-    # Save results
-    output_df = result.to_dataframe()
-    output_df.to_csv(args.output, index=False)
-    print(f"Predictions saved to {args.output}")
+    if args.predict_curve:
+        v_grid, j_curve, j_std = predictor.predict_full_curve(
+            params.astype(np.float32),
+            return_uncertainty=args.curve_uncertainty,
+            n_samples=args.mc_samples
+        )
+
+        import pandas as pd
+        curve_cols = [f"J_{i}" for i in range(j_curve.shape[1])]
+        output_df = pd.DataFrame(j_curve, columns=curve_cols)
+
+        if j_std is not None:
+            std_cols = [f"Jstd_{i}" for i in range(j_std.shape[1])]
+            output_df = pd.concat([output_df, pd.DataFrame(j_std, columns=std_cols)], axis=1)
+
+        output_df.to_csv(args.output, index=False)
+
+        vgrid_path = Path(args.output).with_name(Path(args.output).stem + '_vgrid.csv')
+        vgrid_df = pd.DataFrame([v_grid], columns=[f"V_{i}" for i in range(len(v_grid))])
+        vgrid_df.to_csv(vgrid_path, index=False)
+
+        print(f"Curve predictions saved to {args.output}")
+        print(f"Voltage grid saved to {vgrid_path}")
+    else:
+        result = predictor.predict(params.astype(np.float32))
+        output_df = result.to_dataframe()
+        output_df.to_csv(args.output, index=False)
+        print(f"Predictions saved to {args.output}")
 
 
 if __name__ == '__main__':

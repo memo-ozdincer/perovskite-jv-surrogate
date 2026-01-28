@@ -16,18 +16,18 @@ import torch.nn.functional as F
 
 from config import (
     COLNAMES, DEFAULT_PARAMS_FILE, DEFAULT_IV_FILE,
-    RANDOM_SEED, VAL_SPLIT, TEST_SPLIT, V_GRID
+    RANDOM_SEED, VAL_SPLIT, TEST_SPLIT
 )
 from data import (
     load_raw_data, prepare_tensors, extract_targets_gpu, split_indices
 )
 from features import (
     compute_all_physics_features, get_feature_names,
-    compute_jsc_ceiling, compute_voc_ceiling, validate_physics_features
+    compute_jsc_ceiling, compute_voc_ceiling
 )
 from models.voc_nn import (
     VocNNConfig, VocNN, VocTrainer, build_voc_model,
-    SplitSplineNetConfig, UnifiedSplitSplineNet
+    SplitSplineNetConfig, UnifiedSplitSplineNet, SplitSplineCtrlNet
 )
 from models.jsc_lgbm import JscLGBMConfig, JscLGBM, build_jsc_model
 from models.vmpp_lgbm import (
@@ -95,11 +95,6 @@ class ScalarPredictorPipeline:
         device: str = 'cuda',
         run_hpo: bool = True,
         run_curve_model: bool = False,
-        train_cvae: bool = False,
-        validate_feature_correlations: bool = True,
-        drop_weak_features: bool = False,
-        weak_feature_threshold: float = 0.3,
-        max_weak_feature_fraction: float = 0.2,
         hpo_config: HPOConfig = None
     ):
         self.params_file = params_file
@@ -110,11 +105,6 @@ class ScalarPredictorPipeline:
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.run_hpo = run_hpo
         self.run_curve_model = run_curve_model
-        self.train_cvae = train_cvae
-        self.enable_feature_validation = validate_feature_correlations
-        self.drop_weak_features = drop_weak_features
-        self.weak_feature_threshold = weak_feature_threshold
-        self.max_weak_feature_fraction = max_weak_feature_fraction
         self.hpo_config = hpo_config or HPOConfig()
 
         # Will be populated during pipeline
@@ -124,9 +114,6 @@ class ScalarPredictorPipeline:
         self.physics_features = None
         self.models = {}
         self.metrics = {}
-        self.physics_feature_mask = None
-        self.physics_feature_names = get_feature_names()
-        self.v_grid = V_GRID.astype(np.float32)
 
         print(f"Device: {self.device}")
         if self.device.type == 'cuda':
@@ -208,58 +195,8 @@ class ScalarPredictorPipeline:
                 'jsc_ceiling': self.jsc_ceiling[idx],
                 'voc_ceiling': self.voc_ceiling[idx],
                 'targets': {k: v[idx] for k, v in self.targets_np.items()},
-                'curves': self.iv_data[idx],
-                'v_grid': self.v_grid
+                'curves': self.iv_data[idx]
             }
-
-        # Debug + verification
-        train_curves = self.splits['train']['curves']
-        assert train_curves.shape[1] == self.v_grid.shape[0], (
-            f"Curve dimension mismatch: {train_curves.shape[1]} vs v_grid {self.v_grid.shape[0]}"
-        )
-        assert 'curves' in self.splits['train'], "Curves not being retained!"
-        print(f"Curves retained. Train curves shape: {train_curves.shape}, v_grid: {self.v_grid.shape}")
-
-    def run_feature_validation(self):
-        """Validate engineered physics features and optionally drop weak ones."""
-        if not self.enable_feature_validation:
-            return
-
-        train = self.splits['train']
-        weak_features, weak_indices = validate_physics_features(
-            train['X_physics'],
-            train['targets'],
-            feature_names=self.physics_feature_names,
-            threshold=self.weak_feature_threshold
-        )
-
-        self.weak_features = weak_features
-        weak_fraction = len(weak_indices) / max(1, train['X_physics'].shape[1])
-
-        if len(weak_indices) > 0:
-            print(f"Weak feature fraction: {weak_fraction:.2%}")
-            if self.drop_weak_features or weak_fraction > self.max_weak_feature_fraction:
-                print("Dropping weak features based on correlation threshold.")
-                self._apply_feature_mask(weak_indices)
-            else:
-                print("WARNING: Weak features detected. Consider dropping them for robustness.")
-
-    def _apply_feature_mask(self, weak_indices: list[int]):
-        """Apply a mask to remove weak physics features across all splits."""
-        n_features = self.physics_features_np.shape[1]
-        mask = np.ones(n_features, dtype=bool)
-        mask[weak_indices] = False
-
-        self.physics_feature_mask = mask
-        self.physics_feature_names = [
-            name for i, name in enumerate(self.physics_feature_names) if mask[i]
-        ]
-
-        self.physics_features_np = self.physics_features_np[:, mask]
-        for split in self.splits.values():
-            split['X_physics'] = split['X_physics'][:, mask]
-
-        print(f"Physics features reduced: {n_features} -> {self.physics_features_np.shape[1]}")
 
     def run_hyperparameter_optimization(self):
         """Run HPO for all models."""
@@ -407,11 +344,6 @@ class ScalarPredictorPipeline:
             print("\n--- Training Unified Split-Spline Curve Model ---")
             self.train_curve_model()
 
-        # 7. Train CVAE baseline (optional)
-        if self.train_cvae:
-            print("\n--- Training CVAE Baseline ---")
-            self.train_cvae_baseline()
-
     def train_curve_model(self):
         """Train unified split-spline model for full J-V reconstruction."""
         train = self.splits['train']
@@ -426,14 +358,8 @@ class ScalarPredictorPipeline:
         X_train_full = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
         X_val_full = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
 
-        anchors_train = np.stack(
-            [train['targets']['Jsc'], train['targets']['Voc'], train['targets']['Vmpp'], train['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
-        anchors_val = np.stack(
-            [val['targets']['Jsc'], val['targets']['Voc'], val['targets']['Vmpp'], val['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
+        anchors_train = self._predict_curve_anchors(train)
+        anchors_val = self._predict_curve_anchors(val)
 
         curves_train = train['curves'].astype(np.float32)
         curves_val = val['curves'].astype(np.float32)
@@ -453,17 +379,12 @@ class ScalarPredictorPipeline:
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
         config = SplitSplineNetConfig(input_dim=X_train_full.shape[1])
-        model = UnifiedSplitSplineNet(config).to(self.device)
-        multitask_loss = MultiTaskLoss().to(self.device)
+        model = SplitSplineCtrlNet(config).to(self.device)
 
-        optimizer = torch.optim.AdamW(
-            list(model.parameters()) + list(multitask_loss.parameters()),
-            lr=1e-3,
-            weight_decay=1e-5
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 
-        v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
-        self._curve_monotonicity_checked = False
+        from config import V_GRID
+        v_grid = torch.from_numpy(V_GRID).float().to(self.device)
 
         best_val = float('inf')
         best_state = None
@@ -479,22 +400,11 @@ class ScalarPredictorPipeline:
                 batch_curves = batch_curves.to(self.device)
 
                 optimizer.zero_grad()
-                pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                pred_curve = reconstruct_curve(
-                    pred_anchors, ctrl1, ctrl2, v_grid,
-                    clamp_voc=False,
-                    validate_monotonicity=not self._curve_monotonicity_checked
-                )
-                self._curve_monotonicity_checked = True
+                ctrl1, ctrl2 = model(batch_x)
+                pred_curve = reconstruct_curve(batch_anchors, ctrl1, ctrl2, v_grid)
 
-                loss, metrics = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
-                loss = loss + 0.1 * continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
-
-                # Soft penalty for J > 0 beyond Voc to avoid hard clamping discontinuity
-                v_oc = pred_anchors[:, 1].unsqueeze(1)
-                tail_mask = v_grid.unsqueeze(0) > v_oc
-                tail_penalty = (torch.relu(pred_curve) * tail_mask).mean()
-                loss = loss + 10.0 * tail_penalty
+                loss = F.mse_loss(pred_curve, batch_curves)
+                loss = loss + 0.1 * continuity_loss(batch_anchors, ctrl1, ctrl2, v_grid)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -504,56 +414,19 @@ class ScalarPredictorPipeline:
             # Validation
             model.eval()
             val_losses = []
-            sum_sq_full = 0.0
-            sum_cnt = 0.0
-            sum_sq_r1 = 0.0
-            sum_cnt_r1 = 0.0
-            sum_sq_r2 = 0.0
-            sum_cnt_r2 = 0.0
-            ff_mape_sum = 0.0
-            ff_cnt = 0.0
             with torch.no_grad():
                 for batch_x, batch_anchors, batch_curves in val_loader:
                     batch_x = batch_x.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
-                    pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=False)
-                    val_loss, _ = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
+                    ctrl1, ctrl2 = model(batch_x)
+                    pred_curve = reconstruct_curve(batch_anchors, ctrl1, ctrl2, v_grid)
+                    val_loss = F.mse_loss(pred_curve, batch_curves)
                     val_losses.append(val_loss.item())
-
-                    err = (pred_curve - batch_curves) ** 2
-                    sum_sq_full += err.sum().item()
-                    sum_cnt += err.numel()
-
-                    vmpp = pred_anchors[:, 2].unsqueeze(1)
-                    mask_r1 = v_grid.unsqueeze(0) <= vmpp
-                    mask_r2 = ~mask_r1
-                    sum_sq_r1 += (err * mask_r1).sum().item()
-                    sum_cnt_r1 += mask_r1.sum().item()
-                    sum_sq_r2 += (err * mask_r2).sum().item()
-                    sum_cnt_r2 += mask_r2.sum().item()
-
-                    ff_pred = (pred_anchors[:, 2] * pred_anchors[:, 3]) / (
-                        pred_anchors[:, 0] * pred_anchors[:, 1] + 1e-12
-                    )
-                    ff_true = (batch_anchors[:, 2] * batch_anchors[:, 3]) / (
-                        batch_anchors[:, 0] * batch_anchors[:, 1] + 1e-12
-                    )
-                    ff_mape_sum += torch.abs((ff_pred - ff_true) / (ff_true + 1e-12)).sum().item()
-                    ff_cnt += ff_true.numel()
 
             avg_val = float(np.mean(val_losses))
             if epoch % 10 == 0:
-                mse_full = sum_sq_full / max(1.0, sum_cnt)
-                mse_r1 = sum_sq_r1 / max(1.0, sum_cnt_r1)
-                mse_r2 = sum_sq_r2 / max(1.0, sum_cnt_r2)
-                ff_mape = (ff_mape_sum / max(1.0, ff_cnt)) * 100
-                print(
-                    f"Epoch {epoch}: train_loss={np.mean(epoch_losses):.6f}, "
-                    f"val_loss={avg_val:.6f}, mse_full={mse_full:.6f}, "
-                    f"mse_r1={mse_r1:.6f}, mse_r2={mse_r2:.6f}, ff_mape={ff_mape:.2f}%"
-                )
+                print(f"Epoch {epoch}: train_loss={np.mean(epoch_losses):.6f}, val_loss={avg_val:.6f}")
 
             if avg_val < best_val:
                 best_val = avg_val
@@ -570,259 +443,26 @@ class ScalarPredictorPipeline:
 
         self.models['curve_model'] = model
 
-    def evaluate_curve_model(self, split_name: str = 'test') -> dict:
-        """Evaluate the curve model with full + region-wise metrics."""
-        if 'curve_model' not in self.models:
-            raise ValueError("Curve model not trained.")
+    def _predict_curve_anchors(self, split: dict) -> np.ndarray:
+        """Predict anchors using LGBM heads (and Voc NN) for curve training."""
+        X_raw = split['X_raw']
+        X_physics = split['X_physics']
 
-        split = self.splits[split_name]
-        X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
-        X_full = (X_full - self.curve_feature_mean) / self.curve_feature_std
-
-        anchors_true = np.stack(
-            [split['targets']['Jsc'], split['targets']['Voc'], split['targets']['Vmpp'], split['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
-        curves_true = split['curves'].astype(np.float32)
-
-        ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(X_full),
-            torch.from_numpy(anchors_true),
-            torch.from_numpy(curves_true)
-        )
-        loader = torch.utils.data.DataLoader(ds, batch_size=2048)
-
-        model = self.models['curve_model']
-        model.eval()
-
-        v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
-
-        sum_sq_full = 0.0
-        sum_cnt = 0.0
-        sum_sq_r1 = 0.0
-        sum_cnt_r1 = 0.0
-        sum_sq_r2 = 0.0
-        sum_cnt_r2 = 0.0
-
-        jsc_mae = 0.0
-        voc_mae = 0.0
-        vmpp_mae = 0.0
-        jmpp_mae = 0.0
-        ff_mape_sum = 0.0
-        ff_cnt = 0.0
-
-        violations = {
-            'jsc_negative': 0,
-            'voc_negative': 0,
-            'vmpp_invalid': 0,
-            'jmpp_invalid': 0,
-            'j_exceeds_jsc': 0
-        }
-
+        # Voc NN (normalized)
+        X_full = np.hstack([X_raw, X_physics])
+        X_norm = (X_full - self.voc_feature_mean) / self.voc_feature_std
+        X_tensor = torch.from_numpy(X_norm).float().to(self.device)
         with torch.no_grad():
-            for batch_x, batch_anchors, batch_curves in loader:
-                batch_x = batch_x.to(self.device)
-                batch_anchors = batch_anchors.to(self.device)
-                batch_curves = batch_curves.to(self.device)
+            voc_pred_norm = self.models['voc_nn'](X_tensor).cpu().numpy()
+        voc_pred = voc_pred_norm * self.voc_target_std + self.voc_target_mean
 
-                pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=False)
+        # LGBM anchors
+        jsc_pred = self.models['jsc_lgbm'].predict(X_raw, X_physics, split['jsc_ceiling'])
+        vmpp_pred = self.models['vmpp_lgbm'].predict(X_raw, X_physics, voc_pred)
+        jmpp_pred = self.models['jmpp_lgbm'].predict(X_raw, X_physics, jsc_pred, vmpp_pred)
 
-                err = (pred_curve - batch_curves) ** 2
-                sum_sq_full += err.sum().item()
-                sum_cnt += err.numel()
-
-                vmpp = pred_anchors[:, 2].unsqueeze(1)
-                mask_r1 = v_grid.unsqueeze(0) <= vmpp
-                mask_r2 = ~mask_r1
-                sum_sq_r1 += (err * mask_r1).sum().item()
-                sum_cnt_r1 += mask_r1.sum().item()
-                sum_sq_r2 += (err * mask_r2).sum().item()
-                sum_cnt_r2 += mask_r2.sum().item()
-
-                jsc_mae += torch.abs(pred_anchors[:, 0] - batch_anchors[:, 0]).sum().item()
-                voc_mae += torch.abs(pred_anchors[:, 1] - batch_anchors[:, 1]).sum().item()
-                vmpp_mae += torch.abs(pred_anchors[:, 2] - batch_anchors[:, 2]).sum().item()
-                jmpp_mae += torch.abs(pred_anchors[:, 3] - batch_anchors[:, 3]).sum().item()
-
-                ff_pred = (pred_anchors[:, 2] * pred_anchors[:, 3]) / (
-                    pred_anchors[:, 0] * pred_anchors[:, 1] + 1e-12
-                )
-                ff_true = (batch_anchors[:, 2] * batch_anchors[:, 3]) / (
-                    batch_anchors[:, 0] * batch_anchors[:, 1] + 1e-12
-                )
-                ff_mape_sum += torch.abs((ff_pred - ff_true) / (ff_true + 1e-12)).sum().item()
-                ff_cnt += ff_true.numel()
-
-                violations['jsc_negative'] += (pred_anchors[:, 0] < 0).sum().item()
-                violations['voc_negative'] += (pred_anchors[:, 1] < 0).sum().item()
-                violations['vmpp_invalid'] += ((pred_anchors[:, 2] <= 0) | (pred_anchors[:, 2] >= pred_anchors[:, 1])).sum().item()
-                violations['jmpp_invalid'] += ((pred_anchors[:, 3] <= 0) | (pred_anchors[:, 3] >= pred_anchors[:, 0])).sum().item()
-                violations['j_exceeds_jsc'] += (pred_curve > pred_anchors[:, 0].unsqueeze(1)).sum().item()
-
-        n_samples = max(1, len(split['X_raw']))
-        results = {
-            'mse_full_curve': sum_sq_full / max(1.0, sum_cnt),
-            'mse_region1': sum_sq_r1 / max(1.0, sum_cnt_r1),
-            'mse_region2': sum_sq_r2 / max(1.0, sum_cnt_r2),
-            'mae_jsc': jsc_mae / n_samples,
-            'mae_voc': voc_mae / n_samples,
-            'mae_vmpp': vmpp_mae / n_samples,
-            'mae_jmpp': jmpp_mae / n_samples,
-            'mape_ff': (ff_mape_sum / max(1.0, ff_cnt)) * 100,
-            'constraint_violations': violations
-        }
-
-        print("\nCurve Model Metrics:")
-        for k, v in results.items():
-            if k != 'constraint_violations':
-                print(f"  {k}: {v}")
-        print(f"  constraint_violations: {results['constraint_violations']}")
-
-        return results
-
-    def train_cvae_baseline(self, epochs: int = 100, beta: float = 0.001):
-        """Train CVAE baseline for curve reconstruction."""
-        from models.cvae import ConditionalVAE, cvae_loss
-
-        train = self.splits['train']
-        val = self.splits['val']
-
-        X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
-        X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
-
-        self.cvae_feature_mean = X_train_full.mean(axis=0, keepdims=True)
-        self.cvae_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
-        X_train_full = (X_train_full - self.cvae_feature_mean) / self.cvae_feature_std
-        X_val_full = (X_val_full - self.cvae_feature_mean) / self.cvae_feature_std
-
-        curves_train = train['curves'].astype(np.float32)
-        curves_val = val['curves'].astype(np.float32)
-
-        train_ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(curves_train),
-            torch.from_numpy(X_train_full)
-        )
-        val_ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(curves_val),
-            torch.from_numpy(X_val_full)
-        )
-
-        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
-        val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
-
-        cvae = ConditionalVAE(curve_dim=curves_train.shape[1], cond_dim=X_train_full.shape[1], latent_dim=16).to(self.device)
-        optimizer = torch.optim.Adam(cvae.parameters(), lr=1e-3)
-
-        best_val = float('inf')
-        best_state = None
-
-        for epoch in range(epochs):
-            cvae.train()
-            train_losses = []
-            for batch_curves, batch_cond in train_loader:
-                batch_curves = batch_curves.to(self.device)
-                batch_cond = batch_cond.to(self.device)
-                recon, mu, logvar = cvae(batch_curves, batch_cond)
-                loss = cvae_loss(recon, batch_curves, mu, logvar, beta=beta)
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(cvae.parameters(), 1.0)
-                optimizer.step()
-                train_losses.append(loss.item())
-
-            cvae.eval()
-            val_losses = []
-            with torch.no_grad():
-                for batch_curves, batch_cond in val_loader:
-                    batch_curves = batch_curves.to(self.device)
-                    batch_cond = batch_cond.to(self.device)
-                    recon, mu, logvar = cvae(batch_curves, batch_cond)
-                    val_loss = cvae_loss(recon, batch_curves, mu, logvar, beta=beta)
-                    val_losses.append(val_loss.item())
-
-            avg_val = float(np.mean(val_losses))
-            if epoch % 10 == 0:
-                print(f"CVAE Epoch {epoch}: train_loss={np.mean(train_losses):.6f}, val_loss={avg_val:.6f}")
-
-            if avg_val < best_val:
-                best_val = avg_val
-                best_state = {k: v.cpu().clone() for k, v in cvae.state_dict().items()}
-
-        if best_state is not None:
-            cvae.load_state_dict(best_state)
-
-        self.models['cvae'] = cvae
-        return cvae
-
-    def evaluate_cvae(self, split_name: str = 'test', n_samples: int = 5) -> dict:
-        """Evaluate CVAE baseline using conditional generation."""
-        if 'cvae' not in self.models:
-            raise ValueError("CVAE not trained.")
-
-        split = self.splits[split_name]
-        X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
-        X_full = (X_full - self.cvae_feature_mean) / self.cvae_feature_std
-
-        curves_true = split['curves'].astype(np.float32)
-
-        ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(curves_true),
-            torch.from_numpy(X_full)
-        )
-        loader = torch.utils.data.DataLoader(ds, batch_size=2048)
-
-        model = self.models['cvae']
-        model.eval()
-        v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
-
-        sum_sq_full = 0.0
-        sum_cnt = 0.0
-        violations = {
-            'jsc_negative': 0,
-            'voc_negative': 0,
-            'vmpp_invalid': 0,
-            'jmpp_invalid': 0,
-            'j_exceeds_jsc': 0
-        }
-
-        with torch.no_grad():
-            for batch_curves, batch_cond in loader:
-                batch_curves = batch_curves.to(self.device)
-                batch_cond = batch_cond.to(self.device)
-
-                preds = []
-                for _ in range(n_samples):
-                    z = torch.randn(batch_cond.size(0), model.latent_dim, device=self.device)
-                    preds.append(model.decode(z, batch_cond))
-                pred_curve = torch.stack(preds).mean(dim=0)
-
-                err = (pred_curve - batch_curves) ** 2
-                sum_sq_full += err.sum().item()
-                sum_cnt += err.numel()
-
-                pred_targets = extract_targets_gpu(pred_curve, v_grid)
-                jsc = pred_targets['Jsc']
-                voc = pred_targets['Voc']
-                vmpp = pred_targets['Vmpp']
-                jmpp = pred_targets['Jmpp']
-
-                violations['jsc_negative'] += (jsc < 0).sum().item()
-                violations['voc_negative'] += (voc < 0).sum().item()
-                violations['vmpp_invalid'] += ((vmpp <= 0) | (vmpp >= voc)).sum().item()
-                violations['jmpp_invalid'] += ((jmpp <= 0) | (jmpp >= jsc)).sum().item()
-                violations['j_exceeds_jsc'] += (pred_curve > jsc.unsqueeze(1)).sum().item()
-
-        results = {
-            'mse_full_curve': sum_sq_full / max(1.0, sum_cnt),
-            'constraint_violations': violations
-        }
-
-        print("\nCVAE Metrics:")
-        print(f"  mse_full_curve: {results['mse_full_curve']}")
-        print(f"  constraint_violations: {results['constraint_violations']}")
-
-        return results
+        anchors = np.stack([jsc_pred, voc_pred, vmpp_pred, jmpp_pred], axis=1).astype(np.float32)
+        return anchors
 
     def _train_voc_model(self, trainer, train_loader, val_loader, config):
         """Custom training loop for Voc model."""
@@ -934,14 +574,6 @@ class ScalarPredictorPipeline:
         self.metrics['pmpp'] = self._compute_metrics(test['targets']['Pmpp'], pmpp_pred, 'Pmpp')
         self.metrics['pce'] = self._compute_metrics(test['targets']['PCE'], pce_pred, 'PCE')
 
-        # Curve model metrics (if trained)
-        if 'curve_model' in self.models:
-            self.metrics['curve'] = self.evaluate_curve_model(split_name='test')
-
-        # CVAE baseline metrics (if trained)
-        if 'cvae' in self.models:
-            self.metrics['cvae'] = self.evaluate_cvae(split_name='test')
-
         # Save metrics
         with open(self.output_dir / 'metrics.json', 'w') as f:
             json.dump(self.metrics, f, indent=2)
@@ -990,14 +622,6 @@ class ScalarPredictorPipeline:
         self.models['jmpp_lgbm'].save(str(models_dir / 'jmpp_lgbm.txt'))
         self.models['ff_lgbm'].save(str(models_dir / 'ff_lgbm.txt'))
 
-        # Save curve model (if trained)
-        if 'curve_model' in self.models:
-            torch.save(self.models['curve_model'].state_dict(), models_dir / 'curve_model.pt')
-
-        # Save CVAE (if trained)
-        if 'cvae' in self.models:
-            torch.save(self.models['cvae'].state_dict(), models_dir / 'cvae.pt')
-
         # Save configs
         configs = {
             'voc_nn': self.models['voc_nn'].config.__dict__ if hasattr(self.models['voc_nn'], 'config') else {},
@@ -1008,15 +632,9 @@ class ScalarPredictorPipeline:
 
         if 'curve_model' in self.models:
             configs['curve_model'] = {
-                **(self.models['curve_model'].config.__dict__ if hasattr(self.models['curve_model'], 'config') else {}),
-                'v_grid': self.v_grid.tolist()
-            }
-
-        if 'cvae' in self.models:
-            configs['cvae'] = {
-                'curve_dim': self.splits['train']['curves'].shape[1],
-                'cond_dim': self.splits['train']['X_raw'].shape[1] + self.splits['train']['X_physics'].shape[1],
-                'latent_dim': 16
+                'type': 'ctrl_net',
+                'input_dim': getattr(self.models['curve_model'], 'config', SplitSplineNetConfig()).input_dim,
+                'ctrl_points': getattr(self.models['curve_model'], 'config', SplitSplineNetConfig()).ctrl_points
             }
 
         with open(models_dir / 'configs.json', 'w') as f:
@@ -1033,14 +651,14 @@ class ScalarPredictorPipeline:
             if hasattr(self, 'curve_feature_mean') and hasattr(self, 'curve_feature_std'):
                 normalization_params['curve_feature_mean'] = self.curve_feature_mean.tolist()
                 normalization_params['curve_feature_std'] = self.curve_feature_std.tolist()
-            if hasattr(self, 'cvae_feature_mean') and hasattr(self, 'cvae_feature_std'):
-                normalization_params['cvae_feature_mean'] = self.cvae_feature_mean.tolist()
-                normalization_params['cvae_feature_std'] = self.cvae_feature_std.tolist()
-            if self.physics_feature_mask is not None:
-                normalization_params['physics_feature_mask'] = np.where(self.physics_feature_mask)[0].tolist()
             with open(models_dir / 'normalization.json', 'w') as f:
                 json.dump(normalization_params, f)
             print("Saved normalization parameters for Voc NN (features + targets)")
+
+        # Save curve control-point model if trained
+        if 'curve_model' in self.models:
+            torch.save(self.models['curve_model'].state_dict(), models_dir / 'curve_model.pt')
+            print("Saved curve control-point model")
 
         print(f"Models saved to {models_dir}")
 
@@ -1052,7 +670,6 @@ class ScalarPredictorPipeline:
         self.extract_targets()
         self.compute_features()
         self.split_data()
-        self.run_feature_validation()
 
         if self.run_hpo:
             self.run_hyperparameter_optimization()
@@ -1085,12 +702,6 @@ def main():
                         help='Skip hyperparameter optimization')
     parser.add_argument('--train-curves', action='store_true',
                         help='Train unified split-spline curve model')
-    parser.add_argument('--train-cvae', action='store_true',
-                        help='Train CVAE baseline for curve reconstruction')
-    parser.add_argument('--no-feature-validation', action='store_true',
-                        help='Skip physics feature correlation validation')
-    parser.add_argument('--drop-weak-features', action='store_true',
-                        help='Drop weak physics features (|r| below threshold)')
     parser.add_argument('--hpo-trials-nn', type=int, default=100,
                         help='Number of HPO trials for NN')
     parser.add_argument('--hpo-trials-lgbm', type=int, default=200,
@@ -1113,9 +724,6 @@ def main():
         device=args.device,
         run_hpo=not args.no_hpo,
         run_curve_model=args.train_curves,
-        train_cvae=args.train_cvae,
-        validate_feature_correlations=not args.no_feature_validation,
-        drop_weak_features=args.drop_weak_features,
         hpo_config=hpo_config
     )
 

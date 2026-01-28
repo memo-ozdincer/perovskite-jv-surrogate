@@ -418,6 +418,73 @@ def validate_features(features: torch.Tensor, verbose: bool = True) -> dict:
     return stats
 
 
+def validate_physics_features(
+    features: np.ndarray,
+    targets: dict | "pd.DataFrame",
+    feature_names: list[str] | None = None,
+    target_names: list[str] | None = None,
+    threshold: float = 0.3,
+    verbose: bool = True
+) -> tuple[list[str], list[int]]:
+    """
+    Empirically validate engineered features via Pearson correlation.
+
+    Returns:
+        weak_features: list of feature names with max |r| < threshold
+        weak_indices: list of indices for weak features
+    """
+    if feature_names is None:
+        feature_names = get_feature_names()
+
+    if target_names is None:
+        target_names = ['Jsc', 'Voc', 'Vmpp', 'Jmpp', 'FF', 'PCE']
+
+    # Convert targets to a dict of arrays
+    if hasattr(targets, "__dataframe__"):
+        import pandas as pd
+        targets_df = pd.DataFrame(targets)
+        targets_dict = {name: targets_df[name].values for name in target_names if name in targets_df}
+    elif isinstance(targets, dict):
+        targets_dict = {name: np.asarray(targets[name]) for name in target_names if name in targets}
+    else:
+        raise TypeError("targets must be a dict or pandas DataFrame")
+
+    if not targets_dict:
+        raise ValueError("No valid targets found for feature validation")
+
+    feature_matrix = np.asarray(features)
+    weak_features = []
+    weak_indices = []
+
+    if verbose:
+        print("\n=== FEATURE VALIDATION ===")
+
+    for i in range(feature_matrix.shape[1]):
+        feat = feature_matrix[:, i]
+        max_r = 0.0
+        for name, target in targets_dict.items():
+            if np.std(feat) < 1e-12 or np.std(target) < 1e-12:
+                r = 0.0
+            else:
+                r = np.corrcoef(feat, target)[0, 1]
+                if np.isnan(r):
+                    r = 0.0
+            max_r = max(max_r, abs(r))
+
+        if max_r < threshold:
+            weak_features.append(feature_names[i] if i < len(feature_names) else f"feature_{i}")
+            weak_indices.append(i)
+            if verbose:
+                print(f"⚠️  WEAK: {feature_names[i] if i < len(feature_names) else f'feature_{i}'} (max |r| = {max_r:.3f})")
+        elif verbose:
+            print(f"✓  {feature_names[i] if i < len(feature_names) else f'feature_{i}'} (max |r| = {max_r:.3f})")
+
+    if verbose:
+        print(f"\nWeak features to consider dropping: {weak_features}")
+
+    return weak_features, weak_indices
+
+
 def get_feature_names() -> list[str]:
     """Return names for all physics features in order."""
     return [
