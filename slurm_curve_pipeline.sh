@@ -64,8 +64,8 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION - Adjust these for your run
 # ============================================================================
-HPO_TRIALS_NN=50           # Reduced due to simplified search space
-HPO_TRIALS_LGBM=100        # Reduced due to simplified search space
+HPO_TRIALS_NN=5          # Reduced due to simplified search space
+HPO_TRIALS_LGBM=5        # Reduced due to simplified search space
 HPO_TIMEOUT=7200           # 2 hours per model
 CONTINUITY_WEIGHT=0.5      # Try 0.1, 0.5, or 1.0
 CTRL_POINTS=4              # Simplified from 6
