@@ -46,40 +46,41 @@ class HPOConfig:
 # ============================================================================
 
 def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
-    """Sample hyperparameters for Voc neural network."""
+    """Sample hyperparameters for Voc neural network - optimized for 99.9% accuracy."""
 
-    # Architecture - allow deep and wide networks
-    n_layers = trial.suggest_int('n_layers', 3, 8)
+    # Architecture - MUCH deeper and wider for 99.9% accuracy target
+    n_layers = trial.suggest_int('n_layers', 6, 12)  # Deeper networks
     hidden_dims = []
     for i in range(n_layers):
-        dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256, 512, 768, 1024])
+        # Wider networks with focus on large sizes
+        dim = trial.suggest_categorical(f'hidden_{i}', [256, 512, 768, 1024, 1536, 2048])
         hidden_dims.append(dim)
 
     return VocNNConfig(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
 
-        # Regularization
-        dropout=trial.suggest_float('dropout', 0.0, 0.5),
+        # Regularization - lighter to allow model to fit better
+        dropout=trial.suggest_float('dropout', 0.0, 0.2),  # Reduced max dropout
         use_layer_norm=trial.suggest_categorical('use_layer_norm', [True, False]),
-        use_residual=trial.suggest_categorical('use_residual', [True, False]),
+        use_residual=True,  # ALWAYS use residuals for deep networks
 
-        # Activation
+        # Activation - focus on smooth activations
         activation=trial.suggest_categorical(
-            'activation', ['gelu', 'silu', 'mish', 'leaky_relu']
+            'activation', ['gelu', 'silu', 'mish']  # Removed leaky_relu
         ),
 
-        # Physics-informed losses
-        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-4, 0.1, log=True),
-        physics_weight=trial.suggest_float('physics_weight', 1e-3, 1.0, log=True),
+        # Physics losses - DRASTICALLY REDUCED to prioritize accuracy over physics
+        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-6, 1e-3, log=True),  # 100x smaller
+        physics_weight=trial.suggest_float('physics_weight', 1e-5, 1e-2, log=True),    # 100x smaller
 
-        # Optimizer
-        lr=trial.suggest_float('lr', 1e-5, 1e-2, log=True),
-        weight_decay=trial.suggest_float('weight_decay', 1e-7, 1e-3, log=True),
+        # Optimizer - wider LR range and stronger regularization
+        lr=trial.suggest_float('lr', 1e-6, 5e-3, log=True),  # Lower minimum LR
+        weight_decay=trial.suggest_float('weight_decay', 1e-8, 1e-4, log=True),
 
-        # Training
-        epochs=trial.suggest_int('epochs', 50, 300),
-        patience=trial.suggest_int('patience', 10, 30),
+        # Training - longer training for convergence
+        epochs=trial.suggest_int('epochs', 100, 500),  # Longer training
+        patience=trial.suggest_int('patience', 20, 50),  # More patience
         use_amp=True,
     )
 
@@ -149,7 +150,14 @@ class VocNNObjective:
             with torch.no_grad():
                 for batch_x, _ in val_loader:
                     batch_x = batch_x.to(self.device)
-                    val_preds.append(model(batch_x))
+                    pred = model(batch_x)
+                    val_preds.append(pred)
+
+                    # DEBUG: Check for identical predictions (remove after debugging)
+                    if epoch == 0 and trial.number % 50 == 0:
+                        print(f"\nTrial {trial.number}, Epoch {epoch}:")
+                        print(f"  Pred range: [{pred.min().item():.6f}, {pred.max().item():.6f}]")
+                        print(f"  Pred mean: {pred.mean().item():.6f}, std: {pred.std().item():.6f}")
 
             val_pred = torch.cat(val_preds)
             val_loss = torch.nn.functional.mse_loss(val_pred, self.y_val.to(self.device)).item()

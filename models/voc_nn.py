@@ -98,11 +98,16 @@ class VocNN(nn.Module):
 
         self.backbone = nn.Sequential(*layers)
 
-        # Output head with physics constraint
+        # Output head - MUCH WIDER for 99.9% accuracy
+        # Use 3 hidden layers instead of 1 for better expressiveness
         self.output_head = nn.Sequential(
-            nn.Linear(prev_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, 1)
+            nn.Linear(prev_dim, 256),  # Much wider
+            self._get_activation(config.activation),
+            nn.Dropout(config.dropout * 0.5),  # Lighter dropout in output
+            nn.Linear(256, 128),
+            self._get_activation(config.activation),
+            nn.Dropout(config.dropout * 0.5),
+            nn.Linear(128, 1)
         )
 
         # Initialize weights
@@ -119,30 +124,42 @@ class VocNN(nn.Module):
         return activations.get(name, nn.GELU())
 
     def _init_weights(self):
+        """Initialize weights with activation-specific strategies."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                # Use different init for different activations
+                if self.config.activation in ['gelu', 'silu', 'mish']:
+                    # For smooth activations, use Xavier/Glorot
+                    nn.init.xavier_normal_(m.weight, gain=1.0)
+                else:
+                    # For ReLU-like, use Kaiming
+                    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor, voc_ceiling: torch.Tensor = None) -> torch.Tensor:
         """
-        Forward pass with optional physics constraint.
+        Forward pass with NO hard constraints - ceiling only used in loss function.
 
         Args:
             x: Input features (N, input_dim)
-            voc_ceiling: Upper bound for Voc from physics (N,)
+            voc_ceiling: Optional physics ceiling - NOT USED in forward pass
+                        (kept for API compatibility, used only in loss function)
 
         Returns:
-            Predicted Voc (N,)
+            Predicted Voc (N,) - unconstrained for maximum learning capacity
         """
         h = self.backbone(x)
         out = self.output_head(h).squeeze(-1)
 
-        # Apply soft physics constraint: Voc <= min(Eg, Vbi)
-        if voc_ceiling is not None:
-            # Sigmoid-based soft clamping
-            out = voc_ceiling * torch.sigmoid(out)
+        # NO CONSTRAINTS - let the model learn freely
+        # Physics guidance is handled entirely through the loss function
+        # This allows the model to explore beyond theoretical limits if data supports it
+        # For 99.9% accuracy, we need to trust the data, not impose hard limits
 
         return out
 
