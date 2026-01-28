@@ -55,8 +55,8 @@ python train.py \
     --iv $WORK_DIR/IV_m.txt \
     --output $WORK_DIR/outputs_$(date +%Y%m%d_%H%M%S) \
     --device cuda \
-    --hpo-trials-nn 300 \
-    --hpo-trials-lgbm 500 \
+    --hpo-trials-nn 5 \
+    --hpo-trials-lgbm 50 \
     --hpo-timeout 7200
 
 echo ""
