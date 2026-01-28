@@ -4,10 +4,10 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
-#SBATCH --time=20:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/scalar_pred_hpo_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/scalar_pred_hpo_%j.err
-#SBATCH --account=rrg-aspuru
+#SBATCH --account=aip-aspuru
 
 # ============================================================================
 # Scalar PV Predictors - GPU Training with HPO

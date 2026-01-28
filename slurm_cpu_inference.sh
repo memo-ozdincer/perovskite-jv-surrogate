@@ -7,7 +7,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/scalar_pred_inference_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/scalar_pred_inference_%j.err
-#SBATCH --account=rrg-aspuru
+#SBATCH --account=aip-aspuru
 
 # ============================================================================
 # Scalar PV Predictors - CPU-only Batch Inference
