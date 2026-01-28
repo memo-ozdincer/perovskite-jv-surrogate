@@ -61,43 +61,43 @@ echo ""
 #     --verbose
 
 # Option 2: Quick test with subset (1000 samples, all models)
-echo "Running quick test with 1000 samples..."
-python debug_train.py \
-    --params $WORK_DIR/LHS_parameters_m.txt \
-    --iv $WORK_DIR/IV_m.txt \
-    --device cuda \
-    --n-samples 1000 \
-    --all \
-    --epochs 10 \
-    --n-estimators 50
+# echo "Running quick test with 1000 samples..."
+# python debug_train.py \
+#     --params $WORK_DIR/LHS_parameters_m.txt \
+#     --iv $WORK_DIR/IV_m.txt \
+#     --device cuda \
+#     --n-samples 1000 \
+#     --all \
+#     --epochs 10 \
+#     --n-estimators 50
 
 # Option 3: Single model test (Voc NN)
 # echo "Training Voc NN..."
+# python debug_train.py \
+#     --params $WORK_DIR/LHS_parameters_m.txt \
+#     --iv $WORK_DIR/IV_m.txt \
+#     --device cuda \
+#     --model voc_nn \
+#     --epochs 20
+
+# Option 4: Single model test (Jsc LGBM)
+echo "Training Jsc LGBM..."
 python debug_train.py \
     --params $WORK_DIR/LHS_parameters_m.txt \
     --iv $WORK_DIR/IV_m.txt \
     --device cuda \
-    --model voc_nn \
-    --epochs 20
-
-# Option 4: Single model test (Jsc LGBM)
-# echo "Training Jsc LGBM..."
-# python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
-#     --device cuda \
-#     --model jsc_lgbm \
-#     --n-estimators 200
+    --model jsc_lgbm \
+    --n-estimators 200
 
 # Option 5: Full debug run (all models, full data, minimal epochs)
-# echo "Running full debug (all models, minimal epochs)..."
-# python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
-#     --device cuda \
-#     --all \
-#     --epochs 20 \
-#     --n-estimators 100
+echo "Running full debug (all models, minimal epochs)..."
+python debug_train.py \
+    --params $WORK_DIR/LHS_parameters_m.txt \
+    --iv $WORK_DIR/IV_m.txt \
+    --device cuda \
+    --all \
+    --epochs 20 \
+    --n-estimators 100
 
 echo ""
 echo "=========================================="
