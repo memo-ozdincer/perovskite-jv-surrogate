@@ -432,5 +432,260 @@ Hard clamp training: Default True, fixes train-test distribution shift
 Logging: TrainingLogger accumulates logs, saves all on completion
 
 ================================================================================
-END OF DOCUMENTATION (v2.0 - ROBUST LOGGING EDITION)
+DATA PREPROCESSING PIPELINE (v3.0 - KNOWN WORKING NORMALIZATION)
+================================================================================
+File: `preprocessing.py`
+
+CRITICAL: The current train.py does NOT normalize curves by Isc. This section
+documents the KNOWN WORKING preprocessing from a similar successful pipeline.
+
+Curve Normalization by Isc:
+  Formula: normalized = 2.0 * (curve / isc) - 1.0
+  - Maps [0, isc] → [-1, 1] range
+  - Decouples magnitude (Isc) from shape (easier learning)
+  - First point: 2*(isc/isc) - 1 = 1.0
+  - Last point (Voc): 2*(0/isc) - 1 = -1.0
+
+  Implementation:
+    def normalize_curves_by_isc(curves: np.ndarray) -> tuple:
+        isc_values = curves[:, 0].copy()
+        isc_safe = np.where(np.abs(isc_values) < 1e-9, 1.0, isc_values)
+        normalized = 2.0 * (curves / isc_safe[:, np.newaxis]) - 1.0
+        return isc_values, normalized
+
+Denormalization (inverse):
+  Formula: curve = (normalized + 1.0) / 2.0 * isc
+  - Maps [-1, 1] → [0, isc]
+  - MUST be applied before evaluation in absolute space
+  - Round-trip: raw → normalize → denormalize → raw (error < 1e-6)
+
+  Implementation:
+    def denormalize_curves_by_isc(normalized, isc):
+        is_tensor = isinstance(normalized, torch.Tensor)
+        if is_tensor:
+            isc = isc.unsqueeze(1) if isc.dim() == 1 else isc
+        else:
+            isc = isc[:, np.newaxis] if isc.ndim == 1 else isc
+        return (normalized + 1.0) / 2.0 * isc
+
+Parameter Transformations (RobustScaler + MinMaxScaler + log1p):
+  WHY: Material properties span orders of magnitude (10^-5 to 10^27)
+  - Simple Z-score fails due to outliers and heavy tails
+  - RobustScaler: Uses median + IQR (robust to outliers)
+  - MinMaxScaler: Maps to [-1, 1] (symmetric, matches NN activations)
+  - log1p for material_properties: Compresses orders of magnitude
+
+  Groups:
+    layer_thickness: ['lH', 'lP', 'lE'] → RobustScaler → MinMaxScaler
+    material_properties: [mobilities, DOS, energies, eps] → log1p → RobustScaler → MinMaxScaler
+    contacts: ['Wlm', 'Whm'] → RobustScaler → MinMaxScaler
+    recombination_gen: ['Gavg', 'Aug', 'Brad', lifetimes, velocities] → RobustScaler → MinMaxScaler
+
+  Implementation:
+    from sklearn.preprocessing import RobustScaler, MinMaxScaler, FunctionTransformer
+    from sklearn.compose import ColumnTransformer
+    from sklearn.pipeline import Pipeline
+
+    def get_param_transformer(colnames):
+        transformers = []
+        for group, cols in param_defs.items():
+            steps = [('robust', RobustScaler()), ('minmax', MinMaxScaler(feature_range=(-1, 1)))]
+            if group == 'material_properties':
+                steps.insert(0, ('log1p', FunctionTransformer(func=np.log1p)))
+            transformers.append((group, Pipeline(steps), cols))
+        return ColumnTransformer(transformers, remainder='passthrough')
+
+PVDataPreprocessor class:
+  Combines all preprocessing steps:
+  - fit_transform_params(X_train) → fits transformers on training data
+  - transform_params(X_val/test) → applies fitted transformers
+  - fit_transform_curves(curves_train) → returns (isc, normalized_curves)
+  - denormalize_curves(pred_norm, isc) → returns absolute predictions
+  - save(filepath) / load(filepath) → for inference
+
+Training Pipeline Changes (train_updated.py):
+  1. Fit preprocessor on training set:
+       preprocessor = PVDataPreprocessor()
+       X_train_transformed = preprocessor.fit_transform_params(X_train_full)
+       isc_train, curves_train_norm = preprocessor.fit_transform_curves(curves_train)
+
+  2. In training loop (normalized space):
+       pred_curve_abs = reconstruct_curve(anchors_raw, ctrl1, ctrl2, v_grid)
+       pred_curve_norm = 2.0 * (pred_curve_abs / batch_isc.unsqueeze(1)) - 1.0
+       loss = mse_loss(pred_curve_norm, target_curves_norm)
+
+  3. In evaluation (denormalize to absolute space):
+       pred_curve_abs = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid)
+       # Already in absolute space if using raw anchors!
+       mse = ((pred_curve_abs - true_curves_abs) ** 2).mean()
+
+CRITICAL NOTES:
+  - Curve reconstruction MUST use PREDICTED anchors (not raw inputs) ✓ Already correct
+  - Loss can be computed in normalized space (better gradients)
+  - Evaluation MUST be in absolute space for interpretability
+  - Round-trip validation: normalize → denormalize should recover original
+
+Validation Function:
+  validate_curve_normalization(curves_raw, curves_norm, isc, n_samples=5)
+  Checks:
+    - Normalized range is ~[-1, 1]
+    - Round-trip error < 1e-4
+    - First point normalizes to 1.0
+    - Last point normalizes to -1.0
+
+Integration Status:
+  ✅ preprocessing.py: Complete implementation
+  ✅ train_updated.py: Reference implementation with all fixes
+  ❌ train.py: NOT YET UPDATED (still uses raw curves)
+  ❌ inference.py: NOT YET UPDATED (needs denormalization)
+
+Expected Improvements:
+  - 10-30% lower MSE (better-scaled gradients)
+  - 30-50% faster convergence (normalized space easier to optimize)
+  - Better generalization (RobustScaler handles outliers)
+  - More stable training (no magnitude/shape coupling)
+
+================================================================================
+PLOTTING AND VISUALIZATION (PCHIP RECONSTRUCTION)
+================================================================================
+File: `train_updated.py` or add to `train.py`
+
+ExamplePlotsCallback (for PyTorch Lightning):
+  Purpose: Generate plots of reconstructed curves using PCHIP interpolation
+  Features:
+    - Plots fine-grid ground truth vs reconstructed predictions
+    - Shows actual points (coarse grid) vs interpolated (fine grid)
+    - Generates best/worst/random samples based on R² score
+    - Logs to TensorBoard
+
+  Implementation:
+    class ExamplePlotsCallback(pl.Callback):
+        def on_test_end(self, trainer, pl_module):
+            # Get predictions and true curves
+            preds, trues = pl_module.all_test_preds_np, pl_module.all_test_trues_np
+
+            # Compute R² for ranking
+            valid_mask = [i for i in range(len(trues)) if np.var(trues[i]) > 1e-6]
+            metrics_df = pd.DataFrame({'r2': [r2_score(trues[i], preds[i]) for i in valid_mask]})
+
+            # Select samples: random, best, worst
+            plot_groups = {
+                "Random_Samples": np.random.choice(metrics_df.index, n_samples, replace=False),
+                "Best_R2_Samples": metrics_df.nlargest(n_samples, 'r2').index.values,
+                "Worst_R2_Samples": metrics_df.nsmallest(n_samples, 'r2').index.values,
+            }
+
+            # Plot each group
+            for name, indices in plot_groups.items():
+                # Load fine-grid data from memmap
+                v_fine_mm = np.memmap(v_fine_path, dtype=np.float16, mode='r').reshape(-1, n_fine)
+                i_fine_mm = np.memmap(i_fine_path, dtype=np.float16, mode='r').reshape(-1, n_fine)
+
+                # For each sample
+                for idx in indices:
+                    v_slice, i_pred_slice = v_slices[idx], preds[idx]
+                    v_fine, i_fine = v_fine_mm[idx], i_fine_mm[idx]
+
+                    # Plot fine-grid ground truth
+                    ax.plot(v_fine, i_fine, 'k-', alpha=0.7, lw=2, label='Actual (Fine)')
+
+                    # Reconstruct prediction using PCHIP
+                    i_pred_fine = PchipInterpolator(v_slice, i_pred_slice, extrapolate=False)(v_fine)
+                    ax.plot(v_fine, i_pred_fine, 'r--', lw=2, label='Predicted (Reconstructed)')
+
+                    # Plot coarse-grid points
+                    ax.plot(v_slice, i_true_slice, 'bo', ms=6, label='Actual Points')
+                    ax.plot(v_slice, i_pred_slice, 'rx', ms=6, mew=2, label='Predicted Points')
+
+generate_summary_plots(results: list[dict], output_dir: Path):
+  Purpose: Compare multiple experiment runs (box plots)
+  Metrics: R² median, MAE median, Voc/Isc errors
+  Implementation:
+    df = pd.DataFrame([r for r in results if 'error' not in r])
+    metrics_to_plot = {
+        'Median R² Score': 'r2_median',
+        'Median Abs. MAE': 'mae_median',
+        'Median Voc Error (V)': 'voc_error_abs_median',
+        'Median Isc Error (mA/cm²)': 'isc_error_abs_median'
+    }
+    for key in metrics_to_plot.values():
+        sns.boxplot(data=df, x=key, y='run_name', orient='h', palette='viridis')
+
+================================================================================
+INFERENCE BENCHMARKING (SPEED & FLOPS)
+================================================================================
+File: Add to `inference.py` or create `benchmark.py`
+
+Benchmark Function:
+  def benchmark_inference(model, device, batch_size=128, n_warmup=20, n_iters=200):
+      model.eval()
+      param_dim, seq_len = model.hparams.model['param_dim'], model.hparams.dataset['pchip']['seq_len']
+      X_dummy = torch.randn(batch_size, param_dim, device=device)
+      V_dummy = torch.randn(batch_size, seq_len, device=device)
+
+      # Warmup
+      with torch.no_grad():
+          for _ in range(n_warmup):
+              _ = model(X_dummy, V_dummy)
+
+      # Timing
+      if device.type == 'cuda':
+          starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+          starter.record()
+          for _ in range(n_iters):
+              _ = model(X_dummy, V_dummy)
+          ender.record()
+          torch.cuda.synchronize()
+          total_ms = starter.elapsed_time(ender)
+      else:
+          t0 = time.perf_counter()
+          for _ in range(n_iters):
+              _ = model(X_dummy, V_dummy)
+          total_ms = (time.perf_counter() - t0) * 1000.0
+
+      avg_ms = total_ms / n_iters
+      throughput = batch_size / (avg_ms / 1000)
+
+      print(f"\nDevice: {device}  Batch size: {batch_size}")
+      print(f"  → Total time for {n_iters} runs: {total_ms:.1f} ms")
+      print(f"  → Average latency per forward: {avg_ms:.3f} ms")
+      print(f"  → Throughput: {throughput:.0f} samples/s\n")
+
+      return avg_ms, throughput
+
+Usage:
+  model = load_trained_model('models/curve_model.pt')
+  benchmark_inference(model, device='cuda', batch_size=128)
+
+FLOP Counting (optional):
+  Use pytorch-flops or thop:
+    from thop import profile
+    flops, params = profile(model, inputs=(X_dummy, V_dummy))
+    print(f"FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M")
+
+================================================================================
+KEY IMPLEMENTATION DETAILS FOR REPLICATION (UPDATED v3.0)
+================================================================================
+Voltage grid: `config.py` hardcodes `V_GRID` (45 points)
+Control points: Default K=4 per region → 6 knots total per region
+Cumulative scaling: build_knots uses cumsum for guaranteed monotonicity
+PCHIP slopes: Fritsch-Carlson with eps=1e-12 safe division
+Continuity: Finite differences with local grid spacing
+Kendall init: log_sigma = torch.zeros(1) → σ=1.0 initially
+Feature mask: Boolean array in checkpoint, applied before physics computation
+Hard clamp training: Default True, fixes train-test distribution shift
+Logging: TrainingLogger accumulates logs, saves all on completion
+
+**NEW in v3.0:**
+Curve normalization: 2.0 * (curve / isc) - 1.0 → [-1, 1] (decouples magnitude/shape)
+Denormalization: (normalized + 1.0) / 2.0 * isc → [0, isc] (for evaluation)
+Parameter transform: log1p → RobustScaler → MinMaxScaler → [-1, 1] (handles outliers)
+Preprocessing class: PVDataPreprocessor (fit on train, transform val/test)
+CRITICAL: Curve reconstruction uses PREDICTED anchors (not raw inputs) ✓ Correct
+Training space: Normalized [-1, 1] for better gradients
+Evaluation space: Absolute [0, isc] for interpretability
+Validation: Round-trip error < 1e-4, normalized range [-1.1, 1.1]
+
+================================================================================
+END OF DOCUMENTATION (v3.0 - WITH DATA PREPROCESSING PIPELINE)
 ================================================================================

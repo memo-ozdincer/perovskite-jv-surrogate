@@ -750,101 +750,117 @@ def run_full_hpo(
 
 
 def get_best_configs_from_study(results: dict) -> dict:
-    """Extract best configurations from HPO results."""
+    """
+    Extract best configurations from HPO results.
+
+    FIXED: Default values now match the search space ranges.
+    """
     configs = {}
 
-    # Voc NN
+    # Voc NN - defaults match search space: n_layers in [2,3], hidden in [128,256]/[64,128]
     if 'voc_nn' in results:
         params = results['voc_nn']['params']
-        n_layers = params.get('n_layers', 6)
-        hidden_dims = [params.get(f'hidden_{i}', 256) for i in range(n_layers)]
+        n_layers = params.get('n_layers', 2)  # FIXED: was 6, search space is 2-3
+        hidden_dims = []
+        for i in range(n_layers):
+            if i == 0:
+                hidden_dims.append(params.get(f'hidden_{i}', 256))  # First layer default
+            else:
+                hidden_dims.append(params.get(f'hidden_{i}', 128))  # Later layers default
         configs['voc_nn'] = VocNNConfig(
             hidden_dims=hidden_dims,
-            dropout=params.get('dropout', 0.1),
-            use_layer_norm=params.get('use_layer_norm', True),
+            dropout=params.get('dropout', 0.15),  # FIXED: was 0.1, search is 0.1-0.25
+            use_layer_norm=True,  # Always True in search space
             use_residual=params.get('use_residual', True),
             activation=params.get('activation', 'gelu'),
             jacobian_weight=params.get('jacobian_weight', 0.01),
-            physics_weight=params.get('physics_weight', 0.1),
-            lr=params.get('lr', 1e-3),
+            physics_weight=params.get('physics_weight', 0.05),  # FIXED: middle of 0.01-0.1
+            lr=params.get('lr', 5e-4),  # FIXED: middle of 5e-5 to 1e-3
             weight_decay=params.get('weight_decay', 1e-5),
         )
 
-    # Jsc LGBM
+    # Jsc LGBM - defaults match search space
     if 'jsc_lgbm' in results:
         params = results['jsc_lgbm']['params']
         configs['jsc_lgbm'] = JscLGBMConfig(
-            num_leaves=params.get('num_leaves', 255),
-            max_depth=params.get('max_depth', 15),
-            learning_rate=params.get('learning_rate', 0.05),
-            n_estimators=params.get('n_estimators', 2000),
-            min_child_samples=params.get('min_child_samples', 20),
-            subsample=params.get('subsample', 0.8),
-            colsample_bytree=params.get('colsample_bytree', 0.8),
-            reg_alpha=params.get('reg_alpha', 0.1),
-            reg_lambda=params.get('reg_lambda', 0.1),
+            num_leaves=params.get('num_leaves', 127),  # FIXED: middle of 31-255
+            max_depth=params.get('max_depth', 10),  # FIXED: middle of 6-15
+            learning_rate=params.get('learning_rate', 0.03),  # FIXED: middle of 0.01-0.1
+            n_estimators=params.get('n_estimators', 1000),  # FIXED: middle of 500-2000
+            min_child_samples=params.get('min_child_samples', 25),  # FIXED: middle of 10-50
+            subsample=params.get('subsample', 0.85),  # FIXED: middle of 0.7-0.95
+            colsample_bytree=params.get('colsample_bytree', 0.85),
+            reg_alpha=params.get('reg_alpha', 0.01),  # FIXED: middle of 1e-4 to 1.0 (log)
+            reg_lambda=params.get('reg_lambda', 0.01),
         )
 
     # Vmpp LGBM
     if 'vmpp_lgbm' in results:
         params = results['vmpp_lgbm']['params']
         configs['vmpp_lgbm'] = VmppLGBMConfig(
-            num_leaves=params.get('num_leaves', 255),
-            max_depth=params.get('max_depth', 15),
-            learning_rate=params.get('learning_rate', 0.05),
-            n_estimators=params.get('n_estimators', 2000),
-            min_child_samples=params.get('min_child_samples', 20),
-            subsample=params.get('subsample', 0.8),
-            colsample_bytree=params.get('colsample_bytree', 0.8),
-            reg_alpha=params.get('reg_alpha', 0.1),
-            reg_lambda=params.get('reg_lambda', 0.1),
+            num_leaves=params.get('num_leaves', 127),
+            max_depth=params.get('max_depth', 10),
+            learning_rate=params.get('learning_rate', 0.03),
+            n_estimators=params.get('n_estimators', 1000),
+            min_child_samples=params.get('min_child_samples', 25),
+            subsample=params.get('subsample', 0.85),
+            colsample_bytree=params.get('colsample_bytree', 0.85),
+            reg_alpha=params.get('reg_alpha', 0.01),
+            reg_lambda=params.get('reg_lambda', 0.01),
         )
 
-    # Jmpp LGBM (uses VmppLGBMConfig)
+    # Jmpp LGBM
     if 'jmpp_lgbm' in results:
         params = results['jmpp_lgbm']['params']
         configs['jmpp_lgbm'] = VmppLGBMConfig(
             num_leaves=params.get('num_leaves', 127),
-            max_depth=params.get('max_depth', 12),
-            learning_rate=params.get('learning_rate', 0.05),
-            n_estimators=params.get('n_estimators', 1500),
-            min_child_samples=params.get('min_child_samples', 20),
-            subsample=params.get('subsample', 0.8),
-            colsample_bytree=params.get('colsample_bytree', 0.8),
-            reg_alpha=params.get('reg_alpha', 0.1),
-            reg_lambda=params.get('reg_lambda', 0.1),
+            max_depth=params.get('max_depth', 10),
+            learning_rate=params.get('learning_rate', 0.03),
+            n_estimators=params.get('n_estimators', 1000),
+            min_child_samples=params.get('min_child_samples', 25),
+            subsample=params.get('subsample', 0.85),
+            colsample_bytree=params.get('colsample_bytree', 0.85),
+            reg_alpha=params.get('reg_alpha', 0.01),
+            reg_lambda=params.get('reg_lambda', 0.01),
         )
 
-    # FF LGBM (uses VmppLGBMConfig)
+    # FF LGBM
     if 'ff_lgbm' in results:
         params = results['ff_lgbm']['params']
         configs['ff_lgbm'] = VmppLGBMConfig(
             num_leaves=params.get('num_leaves', 127),
-            max_depth=params.get('max_depth', 12),
-            learning_rate=params.get('learning_rate', 0.05),
-            n_estimators=params.get('n_estimators', 1500),
-            min_child_samples=params.get('min_child_samples', 20),
-            subsample=params.get('subsample', 0.8),
-            colsample_bytree=params.get('colsample_bytree', 0.8),
-            reg_alpha=params.get('reg_alpha', 0.1),
-            reg_lambda=params.get('reg_lambda', 0.1),
+            max_depth=params.get('max_depth', 10),
+            learning_rate=params.get('learning_rate', 0.03),
+            n_estimators=params.get('n_estimators', 1000),
+            min_child_samples=params.get('min_child_samples', 25),
+            subsample=params.get('subsample', 0.85),
+            colsample_bytree=params.get('colsample_bytree', 0.85),
+            reg_alpha=params.get('reg_alpha', 0.01),
+            reg_lambda=params.get('reg_lambda', 0.01),
         )
 
-    # Curve model
+    # Curve model - defaults match search space
     if 'curve_model' in results:
         params = results['curve_model']['params']
-        n_layers = params.get('n_layers', 3)
-        hidden_dims = [params.get(f'hidden_{i}', 256 // (2 ** i)) for i in range(n_layers)]
+        n_layers = params.get('n_layers', 3)  # Search is 2-4
+        hidden_dims = []
+        for i in range(n_layers):
+            if i == 0:
+                hidden_dims.append(params.get(f'hidden_{i}', 256))
+            elif i == 1:
+                hidden_dims.append(params.get(f'hidden_{i}', 128))
+            else:
+                hidden_dims.append(params.get(f'hidden_{i}', 64))
         configs['curve_model'] = {
             'config': SplitSplineNetConfig(
                 hidden_dims=hidden_dims,
-                dropout=params.get('dropout', 0.15),
+                dropout=params.get('dropout', 0.2),  # FIXED: middle of 0.1-0.3
                 activation=params.get('activation', 'silu'),
-                ctrl_points=params.get('ctrl_points', 4),
+                ctrl_points=params.get('ctrl_points', 4),  # FIXED: middle of 3-6
             ),
             'lr': params.get('lr', 1e-3),
             'weight_decay': params.get('weight_decay', 1e-5),
-            'continuity_weight': params.get('continuity_weight', 0.1),
+            'continuity_weight': params.get('continuity_weight', 0.15),  # FIXED: middle of 0.05-0.5
         }
 
     return configs

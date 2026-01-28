@@ -5,32 +5,13 @@ Fully vectorized on GPU using PyTorch.
 """
 import torch
 import numpy as np
-from config import COLNAMES, KB_T
+from config import COLNAMES, KB_T, LOG_SCALE_PARAMS
 
 # Column index mapping for fast tensor access
 COL_IDX = {name: i for i, name in enumerate(COLNAMES)}
 
-
-def safe_exponentiate(values: torch.Tensor, threshold: float = 100.0) -> torch.Tensor:
-    """
-    Safely convert from log10 to linear scale, handling cases where
-    data is already in linear scale.
-
-    Args:
-        values: Input tensor (could be log10 or linear scale)
-        threshold: If abs(value) > threshold, assume already linear scale
-
-    Returns:
-        Values in linear scale
-    """
-    # Check if values are in log10 scale (typically -10 to 40) or linear scale (huge numbers)
-    is_log_scale = (values.abs() < threshold).all()
-
-    if is_log_scale:
-        return 10 ** values
-    else:
-        # Already in linear scale - return as is
-        return values
+# Pre-compute which column indices need log10->linear conversion
+LOG_SCALE_INDICES = {COL_IDX[name] for name in LOG_SCALE_PARAMS if name in COL_IDX}
 
 
 def compute_all_physics_features(params: torch.Tensor) -> torch.Tensor:
@@ -47,23 +28,24 @@ def compute_all_physics_features(params: torch.Tensor) -> torch.Tensor:
     N = params.shape[0]
 
     # Extract raw columns (some are log10 scale, some linear)
+    # LINEAR scale parameters - use directly
     lH = params[:, COL_IDX['lH']]        # nm, linear
     lP = params[:, COL_IDX['lP']]        # nm, linear
     lE = params[:, COL_IDX['lE']]        # nm, linear
 
-    # Mobilities (log10 scale) -> convert to linear
-    muHh = safe_exponentiate(params[:, COL_IDX['muHh']])  # m²/V/s
-    muPh = safe_exponentiate(params[:, COL_IDX['muPh']])
-    muPe = safe_exponentiate(params[:, COL_IDX['muPe']])
-    muEe = safe_exponentiate(params[:, COL_IDX['muEe']])
+    # Mobilities (log10 scale in input) -> convert to linear via 10^x
+    muHh = 10 ** params[:, COL_IDX['muHh']]  # m²/V/s
+    muPh = 10 ** params[:, COL_IDX['muPh']]
+    muPe = 10 ** params[:, COL_IDX['muPe']]
+    muEe = 10 ** params[:, COL_IDX['muEe']]
 
-    # Density of states (log10 scale) -> convert to linear
-    NvH = safe_exponentiate(params[:, COL_IDX['NvH']])    # m⁻³
-    NcH = safe_exponentiate(params[:, COL_IDX['NcH']])
-    NvE = safe_exponentiate(params[:, COL_IDX['NvE']])
-    NcE = safe_exponentiate(params[:, COL_IDX['NcE']])
-    NvP = safe_exponentiate(params[:, COL_IDX['NvP']])
-    NcP = safe_exponentiate(params[:, COL_IDX['NcP']])
+    # Density of states (log10 scale in input) -> convert to linear
+    NvH = 10 ** params[:, COL_IDX['NvH']]    # m⁻³
+    NcH = 10 ** params[:, COL_IDX['NcH']]
+    NvE = 10 ** params[:, COL_IDX['NvE']]
+    NcE = 10 ** params[:, COL_IDX['NcE']]
+    NvP = 10 ** params[:, COL_IDX['NvP']]
+    NcP = 10 ** params[:, COL_IDX['NcP']]
 
     # Energy levels (eV, linear)
     chiHh = params[:, COL_IDX['chiHh']]      # Hole ionization potential HTL
@@ -82,25 +64,25 @@ def compute_all_physics_features(params: torch.Tensor) -> torch.Tensor:
     epsP = params[:, COL_IDX['epsP']]
     epsE = params[:, COL_IDX['epsE']]
 
-    # Generation rate (log10 scale) -> convert to linear
-    Gavg = safe_exponentiate(params[:, COL_IDX['Gavg']])  # m⁻⁴s⁻¹
-    Gavg_log = torch.log10(Gavg.clamp(min=1e-30))    # Ensure log version is consistent
+    # Generation rate (log10 scale in input) -> convert to linear
+    Gavg_log = params[:, COL_IDX['Gavg']]  # Keep log version directly from input
+    Gavg = 10 ** Gavg_log  # m⁻³s⁻¹ (generation rate)
 
-    # Recombination coefficients (log10 scale) -> convert to linear
-    Aug = safe_exponentiate(params[:, COL_IDX['Aug']])    # m⁶/s (Auger)
-    Brad = safe_exponentiate(params[:, COL_IDX['Brad']])  # m³/s (Radiative)
-    Aug_log = torch.log10(Aug.clamp(min=1e-30))
-    Brad_log = torch.log10(Brad.clamp(min=1e-30))
+    # Recombination coefficients (log10 scale in input) -> convert to linear
+    Aug_log = params[:, COL_IDX['Aug']]
+    Brad_log = params[:, COL_IDX['Brad']]
+    Aug = 10 ** Aug_log    # m⁶/s (Auger)
+    Brad = 10 ** Brad_log  # m³/s (Radiative)
 
-    # Lifetimes (log10 scale) -> convert to linear
-    Taue = safe_exponentiate(params[:, COL_IDX['Taue']])  # s
-    Tauh = safe_exponentiate(params[:, COL_IDX['Tauh']])
-    Taue_log = torch.log10(Taue.clamp(min=1e-30))
-    Tauh_log = torch.log10(Tauh.clamp(min=1e-30))
+    # Lifetimes (log10 scale in input) -> convert to linear
+    Taue_log = params[:, COL_IDX['Taue']]
+    Tauh_log = params[:, COL_IDX['Tauh']]
+    Taue = 10 ** Taue_log  # s
+    Tauh = 10 ** Tauh_log
 
-    # Surface recombination velocities (log10 scale) -> convert to linear
-    vII = safe_exponentiate(params[:, COL_IDX['vII']])    # m⁴/s
-    vIII = safe_exponentiate(params[:, COL_IDX['vIII']])
+    # Surface recombination velocities (log10 scale in input) -> convert to linear
+    vII = 10 ** params[:, COL_IDX['vII']]    # m/s
+    vIII = 10 ** params[:, COL_IDX['vIII']]
 
     # Convert thicknesses to meters for physics calculations
     lH_m = lH * 1e-9
@@ -531,11 +513,11 @@ def compute_jsc_ceiling(params: torch.Tensor) -> torch.Tensor:
     Compute analytical ceiling for Jsc (before losses).
     J_ceiling = q * G_avg * L_P
 
-    NOTE: Handles both log10 and linear scale inputs for Gavg.
+    Gavg is in log10 scale in input, convert to linear.
     """
     Q_E = 1.602e-19
     lP_m = params[:, COL_IDX['lP']] * 1e-9
-    Gavg = safe_exponentiate(params[:, COL_IDX['Gavg']])
+    Gavg = 10 ** params[:, COL_IDX['Gavg']]  # log10 -> linear
     return Q_E * Gavg * lP_m
 
 

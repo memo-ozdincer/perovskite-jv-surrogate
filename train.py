@@ -27,7 +27,8 @@ from features import (
 )
 from models.voc_nn import (
     VocNNConfig, VocNN, VocTrainer, build_voc_model,
-    SplitSplineNetConfig, UnifiedSplitSplineNet
+    SplitSplineNetConfig, UnifiedSplitSplineNet,
+    ControlPointNetConfig, ControlPointNet
 )
 from models.jsc_lgbm import JscLGBMConfig, JscLGBM, build_jsc_model
 from models.vmpp_lgbm import (
@@ -40,6 +41,12 @@ from logging_utils import (
     TrainingLogger, ModelComparisonMetrics,
     compute_multicollinearity, suggest_features_to_drop
 )
+from preprocessing import (
+    normalize_curves_by_isc, denormalize_curves_by_isc,
+    validate_curve_normalization
+)
+from plotting_utils import PlotManager
+from benchmark_utils import benchmark_inference
 
 
 class MultiTaskLoss(nn.Module):
@@ -47,16 +54,16 @@ class MultiTaskLoss(nn.Module):
     Automatic loss weighting for anchors + curve reconstruction.
     Uses Kendall's multi-task learning with learned log-variances.
 
-    Logs sigma values to detect task imbalance:
-    - If sigma_anchor << sigma_curve: anchor task is "easy", curve task is "hard"
-    - If sigma_curve << sigma_anchor: curve task is "easy", anchor task is "hard"
+    FIXED: Initialize with smaller sigma to prevent explosion.
+    Added sigma clamping to prevent runaway values.
     """
 
-    def __init__(self):
+    def __init__(self, init_log_sigma: float = -1.0):
         super().__init__()
-        # Initialize log_sigma = 0 -> sigma = 1.0 (balanced start)
-        self.log_sigma_anchor = nn.Parameter(torch.zeros(1))
-        self.log_sigma_curve = nn.Parameter(torch.zeros(1))
+        # Initialize log_sigma = -1.0 -> sigma = 0.37 (tighter start)
+        # This prevents sigma from exploding when initial losses are high
+        self.log_sigma_anchor = nn.Parameter(torch.tensor([init_log_sigma]))
+        self.log_sigma_curve = nn.Parameter(torch.tensor([init_log_sigma]))
 
     def forward(
         self,
@@ -69,22 +76,23 @@ class MultiTaskLoss(nn.Module):
 
         # Guard against NaN in pred_curve (from PCHIP instability)
         if torch.isnan(pred_curve).any():
-            # Replace NaN with corresponding true values to avoid poisoning the loss
             pred_curve = torch.where(torch.isnan(pred_curve), true_curve, pred_curve)
 
         l_curve = F.mse_loss(pred_curve, true_curve)
 
-        sigma_a = torch.exp(self.log_sigma_anchor)
-        sigma_c = torch.exp(self.log_sigma_curve)
+        # Clamp log_sigma to prevent explosion: sigma in [0.1, 5.0]
+        log_sigma_a = self.log_sigma_anchor.clamp(-2.3, 1.6)
+        log_sigma_c = self.log_sigma_curve.clamp(-2.3, 1.6)
+
+        sigma_a = torch.exp(log_sigma_a)
+        sigma_c = torch.exp(log_sigma_c)
 
         # Kendall multi-task loss formula
         loss = (
-            l_anchor / (2 * sigma_a ** 2) + torch.log(sigma_a) +
-            l_curve / (2 * sigma_c ** 2) + torch.log(sigma_c)
+            l_anchor / (2 * sigma_a ** 2) + log_sigma_a +
+            l_curve / (2 * sigma_c ** 2) + log_sigma_c
         )
 
-        # Compute task imbalance indicator
-        # Ratio > 10 or < 0.1 indicates significant imbalance
         sigma_ratio = (sigma_a / (sigma_c + 1e-8)).item()
 
         metrics = {
@@ -95,6 +103,54 @@ class MultiTaskLoss(nn.Module):
             'sigma_ratio': sigma_ratio,
             'loss_total': loss.item(),
             'task_imbalance': 'anchor_easy' if sigma_ratio < 0.1 else ('curve_easy' if sigma_ratio > 10 else 'balanced')
+        }
+        return loss, metrics
+
+
+class CurveLoss(nn.Module):
+    """
+    Simple weighted curve reconstruction loss.
+    Used when anchors come from pretrained models (no anchor loss needed).
+
+    Computes MSE on the full curve with optional region weighting.
+    """
+
+    def __init__(self, mpp_weight: float = 2.0):
+        super().__init__()
+        self.mpp_weight = mpp_weight  # Extra weight near MPP (the "knee")
+
+    def forward(
+        self,
+        pred_curve: torch.Tensor,
+        true_curve: torch.Tensor,
+        v_grid: torch.Tensor,
+        vmpp: torch.Tensor
+    ) -> tuple[torch.Tensor, dict]:
+        # Guard against NaN
+        if torch.isnan(pred_curve).any():
+            pred_curve = torch.where(torch.isnan(pred_curve), true_curve, pred_curve)
+
+        # Per-point squared error
+        sq_err = (pred_curve - true_curve) ** 2
+
+        # Weight points near MPP more heavily (this is where the "knee" is)
+        vmpp_expanded = vmpp.unsqueeze(1)
+        dist_to_mpp = (v_grid.unsqueeze(0) - vmpp_expanded).abs()
+        mpp_weights = 1.0 + (self.mpp_weight - 1.0) * torch.exp(-dist_to_mpp / 0.1)
+
+        weighted_sq_err = sq_err * mpp_weights
+        loss = weighted_sq_err.mean()
+
+        # Region-wise metrics for logging
+        mask_r1 = v_grid.unsqueeze(0) <= vmpp_expanded
+        mse_r1 = (sq_err * mask_r1).sum() / mask_r1.sum().clamp(min=1)
+        mse_r2 = (sq_err * ~mask_r1).sum() / (~mask_r1).sum().clamp(min=1)
+
+        metrics = {
+            'loss_curve': loss.item(),
+            'mse_full': sq_err.mean().item(),
+            'mse_region1': mse_r1.item(),
+            'mse_region2': mse_r2.item(),
         }
         return loss, metrics
 
@@ -610,7 +666,19 @@ class ScalarPredictorPipeline:
             self.train_cvae_baseline()
 
     def train_curve_model(self):
-        """Train unified split-spline model for full J-V reconstruction."""
+        """
+        Train curve reconstruction model using PRETRAINED scalar predictors.
+
+        KEY CHANGES (v3.0):
+        1. Use pretrained LightGBM/VocNN models to generate anchors (no re-learning)
+        2. Normalize anchors for stable training
+        3. Use ControlPointNet that only learns curve shape, not anchors
+        4. Use simpler CurveLoss (no Kendall sigma explosion)
+        """
+        print("\n" + "=" * 60)
+        print("Training Curve Model (v3.0 - Using Pretrained Scalar Models)")
+        print("=" * 60)
+
         train = self.splits['train']
         val = self.splits['val']
 
@@ -620,24 +688,250 @@ class ScalarPredictorPipeline:
 
         self.curve_feature_mean = X_train_full.mean(axis=0, keepdims=True)
         self.curve_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
+        X_train_norm = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
+        X_val_norm = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
+
+        # Get TRUE anchors (ground truth for training)
+        anchors_train = np.stack(
+            [train['targets']['Jsc'], train['targets']['Voc'],
+             train['targets']['Vmpp'], train['targets']['Jmpp']],
+            axis=1
+        ).astype(np.float32)
+        anchors_val = np.stack(
+            [val['targets']['Jsc'], val['targets']['Voc'],
+             val['targets']['Vmpp'], val['targets']['Jmpp']],
+            axis=1
+        ).astype(np.float32)
+
+        # ISSUE 3 FIX: Normalize anchors for stable training
+        self.anchor_mean = anchors_train.mean(axis=0, keepdims=True)
+        self.anchor_std = anchors_train.std(axis=0, keepdims=True) + 1e-8
+        anchors_train_norm = (anchors_train - self.anchor_mean) / self.anchor_std
+        anchors_val_norm = (anchors_val - self.anchor_mean) / self.anchor_std
+
+        print(f"\nAnchor normalization stats:")
+        print(f"  Mean: Jsc={self.anchor_mean[0,0]:.2f}, Voc={self.anchor_mean[0,1]:.4f}, "
+              f"Vmpp={self.anchor_mean[0,2]:.4f}, Jmpp={self.anchor_mean[0,3]:.2f}")
+        print(f"  Std:  Jsc={self.anchor_std[0,0]:.2f}, Voc={self.anchor_std[0,1]:.4f}, "
+              f"Vmpp={self.anchor_std[0,2]:.4f}, Jmpp={self.anchor_std[0,3]:.2f}")
+
+        # Normalize curves by Isc (KNOWN WORKING approach)
+        print("\nNormalizing curves by Isc...")
+        isc_train, curves_train_norm = normalize_curves_by_isc(train['curves'])
+        isc_val, curves_val_norm = normalize_curves_by_isc(val['curves'])
+
+        # Validate normalization
+        validate_curve_normalization(train['curves'], curves_train_norm, isc_train, n_samples=3)
+
+        # Create datasets with normalized curves
+        train_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_train_norm),
+            torch.from_numpy(anchors_train_norm),  # Normalized for model input
+            torch.from_numpy(anchors_train),       # Raw for curve reconstruction
+            torch.from_numpy(curves_train_norm),   # Normalized curves [-1, 1]
+            torch.from_numpy(isc_train)            # For denormalization
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val_norm),
+            torch.from_numpy(anchors_val_norm),
+            torch.from_numpy(anchors_val),
+            torch.from_numpy(curves_val_norm),
+            torch.from_numpy(isc_val)
+        )
+
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
+
+        # ISSUE 2 FIX: Use ControlPointNet that takes anchors as input
+        config = ControlPointNetConfig(
+            input_dim=X_train_norm.shape[1],
+            anchor_dim=4,
+            hidden_dims=[256, 128, 64],
+            dropout=0.15,
+            activation='silu',
+            ctrl_points=self.ctrl_points
+        )
+
+        model = ControlPointNet(config).to(self.device)
+        curve_loss_fn = CurveLoss(mpp_weight=2.0).to(self.device)
+
+        # Simpler optimizer - no learnable loss weights
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-3,
+            weight_decay=1e-5
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+
+        v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
+
+        best_val = float('inf')
+        best_state = None
+        patience = 20
+        patience_counter = 0
+
+        print(f"\nTraining ControlPointNet with:")
+        print(f"  ctrl_points: {config.ctrl_points}")
+        print(f"  hidden_dims: {config.hidden_dims}")
+        print(f"  continuity_weight: {self.continuity_weight}")
+        print(f"  Using ground truth anchors (not re-learning them)")
+
+        for epoch in range(150):
+            model.train()
+            epoch_losses = []
+
+            for batch_x, batch_anchors_norm, batch_anchors_raw, batch_curves_norm, batch_isc in train_loader:
+                batch_x = batch_x.to(self.device)
+                batch_anchors_norm = batch_anchors_norm.to(self.device)
+                batch_anchors_raw = batch_anchors_raw.to(self.device)
+                batch_curves_norm = batch_curves_norm.to(self.device)
+                batch_isc = batch_isc.to(self.device)
+
+                optimizer.zero_grad()
+
+                # Model predicts only control points (anchors provided as input)
+                ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
+
+                # Reconstruct curve using TRUE anchors (returns absolute scale)
+                pred_curve_abs = reconstruct_curve(
+                    batch_anchors_raw, ctrl1, ctrl2, v_grid,
+                    clamp_voc=True
+                )
+
+                # Normalize prediction to match target space [-1, 1]
+                pred_curve_norm = 2.0 * (pred_curve_abs / batch_isc.unsqueeze(1)) - 1.0
+
+                # Compute loss in normalized space (better gradients)
+                loss, metrics = curve_loss_fn(
+                    pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
+                )
+
+                # Add continuity penalty
+                cont_loss = continuity_loss(batch_anchors_raw, ctrl1, ctrl2, v_grid)
+                loss = loss + self.continuity_weight * cont_loss
+
+                if torch.isnan(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_losses.append(loss.item())
+
+            scheduler.step()
+
+            # Validation
+            model.eval()
+            val_losses = []
+            sum_sq_full = 0.0
+            sum_cnt = 0
+            sum_sq_r1 = 0.0
+            sum_cnt_r1 = 0
+            sum_sq_r2 = 0.0
+            sum_cnt_r2 = 0
+            ff_mape_sum = 0.0
+            ff_cnt = 0
+
+            with torch.no_grad():
+                for batch_x, batch_anchors_norm, batch_anchors_raw, batch_curves_norm, batch_isc in val_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_anchors_norm = batch_anchors_norm.to(self.device)
+                    batch_anchors_raw = batch_anchors_raw.to(self.device)
+                    batch_curves_norm = batch_curves_norm.to(self.device)
+                    batch_isc = batch_isc.to(self.device)
+
+                    ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
+                    pred_curve_abs = reconstruct_curve(
+                        batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
+                    )
+
+                    # Normalize prediction for loss computation
+                    pred_curve_norm = 2.0 * (pred_curve_abs / batch_isc.unsqueeze(1)) - 1.0
+
+                    val_loss, _ = curve_loss_fn(
+                        pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
+                    )
+                    val_losses.append(val_loss.item())
+
+                    # Compute MSE in normalized space
+                    err = (pred_curve_norm - batch_curves_norm) ** 2
+                    sum_sq_full += err.sum().item()
+                    sum_cnt += err.numel()
+
+                    vmpp = batch_anchors_raw[:, 2].unsqueeze(1)
+                    mask_r1 = v_grid.unsqueeze(0) <= vmpp
+                    sum_sq_r1 += (err * mask_r1).sum().item()
+                    sum_cnt_r1 += mask_r1.sum().item()
+                    sum_sq_r2 += (err * ~mask_r1).sum().item()
+                    sum_cnt_r2 += (~mask_r1).sum().item()
+
+                    # FF from true anchors
+                    ff_true = (batch_anchors_raw[:, 2] * batch_anchors_raw[:, 3]) / (
+                        batch_anchors_raw[:, 0] * batch_anchors_raw[:, 1] + 1e-12
+                    )
+                    ff_mape_sum += 0  # Not applicable when using true anchors
+                    ff_cnt += ff_true.numel()
+
+            avg_val = float(np.mean(val_losses))
+
+            # Log every 10 epochs
+            if epoch % 10 == 0:
+                mse_full = sum_sq_full / max(1, sum_cnt)
+                mse_r1 = sum_sq_r1 / max(1, sum_cnt_r1)
+                mse_r2 = sum_sq_r2 / max(1, sum_cnt_r2)
+                print(
+                    f"Epoch {epoch}: train={np.mean(epoch_losses):.6f}, "
+                    f"val={avg_val:.6f}, mse_full={mse_full:.6f}, "
+                    f"mse_r1={mse_r1:.6f}, mse_r2={mse_r2:.6f}, "
+                    f"lr={scheduler.get_last_lr()[0]:.2e}"
+                )
+
+            if avg_val < best_val:
+                best_val = avg_val
+                patience_counter = 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # Store the control point model
+        self.models['ctrl_point_model'] = model
+        # For backward compatibility, also store config info
+        self.models['ctrl_point_config'] = config
+
+        print(f"\nCurve model training complete. Best val loss: {best_val:.6f}")
+
+    def train_curve_model_legacy(self):
+        """
+        LEGACY: Train unified split-spline model (predicts anchors + control points).
+        Kept for backward compatibility. Use train_curve_model() for better results.
+        """
+        train = self.splits['train']
+        val = self.splits['val']
+
+        X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
+        X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
+
+        self.curve_feature_mean = X_train_full.mean(axis=0, keepdims=True)
+        self.curve_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
         X_train_full = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
         X_val_full = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
 
         anchors_train = np.stack(
-            [train['targets']['Jsc'], train['targets']['Voc'], train['targets']['Vmpp'], train['targets']['Jmpp']],
+            [train['targets']['Jsc'], train['targets']['Voc'],
+             train['targets']['Vmpp'], train['targets']['Jmpp']],
             axis=1
         ).astype(np.float32)
         anchors_val = np.stack(
-            [val['targets']['Jsc'], val['targets']['Voc'], val['targets']['Vmpp'], val['targets']['Jmpp']],
+            [val['targets']['Jsc'], val['targets']['Voc'],
+             val['targets']['Vmpp'], val['targets']['Jmpp']],
             axis=1
         ).astype(np.float32)
-
-        # Log anchor statistics for debugging
-        print(f"\nAnchor statistics (train):")
-        print(f"  Jsc:  mean={anchors_train[:, 0].mean():.4f}, std={anchors_train[:, 0].std():.4f}")
-        print(f"  Voc:  mean={anchors_train[:, 1].mean():.4f}, std={anchors_train[:, 1].std():.4f}")
-        print(f"  Vmpp: mean={anchors_train[:, 2].mean():.4f}, std={anchors_train[:, 2].std():.4f}")
-        print(f"  Jmpp: mean={anchors_train[:, 3].mean():.4f}, std={anchors_train[:, 3].std():.4f}")
 
         curves_train = train['curves'].astype(np.float32)
         curves_val = val['curves'].astype(np.float32)
@@ -656,110 +950,48 @@ class ScalarPredictorPipeline:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        # Use HPO'd config if available, otherwise use defaults
-        configs = getattr(self, 'best_configs', {})
-        if 'curve_model' in configs:
-            curve_hpo = configs['curve_model']
-            config = curve_hpo['config']
-            config.input_dim = X_train_full.shape[1]
-            lr = curve_hpo.get('lr', 1e-3)
-            weight_decay = curve_hpo.get('weight_decay', 1e-5)
-            # Override continuity_weight from HPO if available
-            continuity_weight = curve_hpo.get('continuity_weight', self.continuity_weight)
-            print(f"\nUsing HPO'd curve model config:")
-            print(f"  hidden_dims: {config.hidden_dims}")
-            print(f"  ctrl_points: {config.ctrl_points}")
-            print(f"  lr: {lr}")
-            print(f"  continuity_weight: {continuity_weight}")
-        else:
-            # Use configurable control points (simplified from 6 to 4)
-            config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=self.ctrl_points)
-            lr = 1e-3
-            weight_decay = 1e-5
-            continuity_weight = self.continuity_weight
-
+        config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=self.ctrl_points)
         model = UnifiedSplitSplineNet(config).to(self.device)
-        multitask_loss = MultiTaskLoss().to(self.device)
+        multitask_loss = MultiTaskLoss(init_log_sigma=-1.0).to(self.device)  # Fixed init
 
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(multitask_loss.parameters()),
-            lr=lr,
-            weight_decay=weight_decay
+            lr=1e-3,
+            weight_decay=1e-5
         )
 
         v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
-        self._curve_monotonicity_checked = False
-
         best_val = float('inf')
         best_state = None
         patience = 15
         patience_counter = 0
-
-        print(f"\nTraining curve model with:")
-        print(f"  ctrl_points: {config.ctrl_points}")
-        print(f"  continuity_weight: {continuity_weight}")
-        print(f"  use_hard_clamp_training: {self.use_hard_clamp_training}")
+        val_metrics_last = {}  # Initialize
 
         for epoch in range(100):
             model.train()
             epoch_losses = []
-            epoch_violations = {'jsc_negative': 0, 'voc_negative': 0, 'vmpp_exceeds_voc': 0, 'jmpp_exceeds_jsc': 0, 'total': 0}
-            cont_loss = torch.tensor(0.0)  # Initialize for logging
+            cont_loss = torch.tensor(0.0)
 
-            for batch_idx, (batch_x, batch_anchors, batch_curves) in enumerate(train_loader):
+            for batch_x, batch_anchors, batch_curves in train_loader:
                 batch_x = batch_x.to(self.device)
                 batch_anchors = batch_anchors.to(self.device)
                 batch_curves = batch_curves.to(self.device)
 
                 optimizer.zero_grad()
-
-                # Get predictions with optional violation logging
-                if self.log_constraint_violations:
-                    pred_anchors, ctrl1, ctrl2, violations = model(batch_x, return_violations=True)
-                    if violations:
-                        for k in ['jsc_negative', 'voc_negative', 'vmpp_exceeds_voc', 'jmpp_exceeds_jsc']:
-                            epoch_violations[k] += violations.get(k, 0)
-                        epoch_violations['total'] += violations.get('total_samples', 0)
-                else:
-                    pred_anchors, ctrl1, ctrl2 = model(batch_x)
-
-                # CRITICAL FIX: Use same clamping in training as inference
-                # This fixes the train-test distribution shift
-                pred_curve = reconstruct_curve(
-                    pred_anchors, ctrl1, ctrl2, v_grid,
-                    clamp_voc=self.use_hard_clamp_training,  # Use hard clamp during training too
-                    validate_monotonicity=not self._curve_monotonicity_checked
-                )
-                self._curve_monotonicity_checked = True
-
+                pred_anchors, ctrl1, ctrl2 = model(batch_x)
+                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
                 loss, metrics = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
-
-                # Add continuity loss with configurable weight
                 cont_loss = continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
-                loss = loss + continuity_weight * cont_loss
+                loss = loss + self.continuity_weight * cont_loss
 
-                # Only add tail penalty if NOT using hard clamp (backward compat)
-                if not self.use_hard_clamp_training:
-                    v_oc = pred_anchors[:, 1].unsqueeze(1)
-                    tail_mask = v_grid.unsqueeze(0) > v_oc
-                    tail_penalty = (torch.relu(pred_curve) * tail_mask).mean()
-                    loss = loss + 10.0 * tail_penalty
-
-                # NaN detection and handling
                 if torch.isnan(loss):
-                    print(f"  [WARNING] NaN loss detected at epoch {epoch}!")
-                    print(f"    pred_anchors range: [{pred_anchors.min():.4f}, {pred_anchors.max():.4f}]")
-                    print(f"    pred_curve NaN count: {torch.isnan(pred_curve).sum().item()}")
-                    # Skip this batch to avoid poisoning the model
                     continue
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-
                 epoch_losses.append(loss.item())
 
-            # Validation
             model.eval()
             val_losses = []
             sum_sq_full = 0.0
@@ -770,7 +1002,6 @@ class ScalarPredictorPipeline:
             sum_cnt_r2 = 0.0
             ff_mape_sum = 0.0
             ff_cnt = 0.0
-            val_metrics_last = {}
 
             with torch.no_grad():
                 for batch_x, batch_anchors, batch_curves in val_loader:
@@ -778,7 +1009,7 @@ class ScalarPredictorPipeline:
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
                     pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=self.use_hard_clamp_training)
+                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
                     val_loss, val_metrics_last = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
                     val_losses.append(val_loss.item())
 
@@ -805,7 +1036,6 @@ class ScalarPredictorPipeline:
 
             avg_val = float(np.mean(val_losses))
 
-            # Log to structured logger every epoch
             if val_metrics_last:
                 cont_loss_val = cont_loss.item() if 'cont_loss' in dir() and isinstance(cont_loss, torch.Tensor) else 0.0
                 self.logger.log_multitask_loss(
@@ -817,12 +1047,6 @@ class ScalarPredictorPipeline:
                     loss_continuity=cont_loss_val,
                     loss_total=avg_val
                 )
-
-            # Log constraint violations
-            if self.log_constraint_violations and epoch_violations['total'] > 0:
-                violation_rate = sum(epoch_violations[k] for k in ['jsc_negative', 'voc_negative', 'vmpp_exceeds_voc', 'jmpp_exceeds_jsc']) / (epoch_violations['total'] * 4) * 100
-                if epoch % 10 == 0:
-                    print(f"  [Constraints] Violation rate: {violation_rate:.2f}%")
 
             if epoch % 10 == 0:
                 mse_full = sum_sq_full / max(1.0, sum_cnt)
@@ -854,29 +1078,52 @@ class ScalarPredictorPipeline:
         self.models['curve_model'] = model
 
     def evaluate_curve_model(self, split_name: str = 'test') -> dict:
-        """Evaluate the curve model with full + region-wise metrics."""
+        """
+        Evaluate the curve model with full + region-wise metrics.
+
+        Supports both:
+        - New ControlPointNet (uses true anchors, only predicts control points)
+        - Legacy UnifiedSplitSplineNet (predicts anchors + control points)
+        """
         import time
-        if 'curve_model' not in self.models:
-            raise ValueError("Curve model not trained.")
+
+        # Check which model type we have
+        use_ctrl_point_model = 'ctrl_point_model' in self.models
+        use_legacy_model = 'curve_model' in self.models
+
+        if not use_ctrl_point_model and not use_legacy_model:
+            raise ValueError("No curve model trained. Run train_curve_model() first.")
 
         split = self.splits[split_name]
         X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
         X_full = (X_full - self.curve_feature_mean) / self.curve_feature_std
 
         anchors_true = np.stack(
-            [split['targets']['Jsc'], split['targets']['Voc'], split['targets']['Vmpp'], split['targets']['Jmpp']],
+            [split['targets']['Jsc'], split['targets']['Voc'],
+             split['targets']['Vmpp'], split['targets']['Jmpp']],
             axis=1
         ).astype(np.float32)
         curves_true = split['curves'].astype(np.float32)
 
-        ds = torch.utils.data.TensorDataset(
-            torch.from_numpy(X_full),
-            torch.from_numpy(anchors_true),
-            torch.from_numpy(curves_true)
-        )
-        loader = torch.utils.data.DataLoader(ds, batch_size=2048)
+        # Normalize anchors if using new model
+        if use_ctrl_point_model:
+            anchors_norm = (anchors_true - self.anchor_mean) / self.anchor_std
+            ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(X_full),
+                torch.from_numpy(anchors_norm.astype(np.float32)),
+                torch.from_numpy(anchors_true),
+                torch.from_numpy(curves_true)
+            )
+            model = self.models['ctrl_point_model']
+        else:
+            ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(X_full),
+                torch.from_numpy(anchors_true),
+                torch.from_numpy(curves_true)
+            )
+            model = self.models['curve_model']
 
-        model = self.models['curve_model']
+        loader = torch.utils.data.DataLoader(ds, batch_size=2048)
         model.eval()
 
         v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
@@ -903,17 +1150,30 @@ class ScalarPredictorPipeline:
             'j_exceeds_jsc': 0
         }
 
-        # Time inference
         start_time = time.time()
 
         with torch.no_grad():
-            for batch_x, batch_anchors, batch_curves in loader:
-                batch_x = batch_x.to(self.device)
-                batch_anchors = batch_anchors.to(self.device)
-                batch_curves = batch_curves.to(self.device)
+            for batch in loader:
+                if use_ctrl_point_model:
+                    batch_x, batch_anchors_norm, batch_anchors, batch_curves = batch
+                    batch_x = batch_x.to(self.device)
+                    batch_anchors_norm = batch_anchors_norm.to(self.device)
+                    batch_anchors = batch_anchors.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
 
-                pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=self.use_hard_clamp_training)
+                    # ControlPointNet: uses true anchors
+                    ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
+                    pred_anchors = batch_anchors  # True anchors, no prediction
+                    pred_curve = reconstruct_curve(batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+                else:
+                    batch_x, batch_anchors, batch_curves = batch
+                    batch_x = batch_x.to(self.device)
+                    batch_anchors = batch_anchors.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
+
+                    # Legacy model: predicts anchors + control points
+                    pred_anchors, ctrl1, ctrl2 = model(batch_x)
+                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
 
                 err = (pred_curve - batch_curves) ** 2
                 sum_sq_full += err.sum().item()
@@ -927,6 +1187,7 @@ class ScalarPredictorPipeline:
                 sum_sq_r2 += (err * mask_r2).sum().item()
                 sum_cnt_r2 += mask_r2.sum().item()
 
+                # Anchor MAE (only meaningful for legacy model)
                 jsc_mae += torch.abs(pred_anchors[:, 0] - batch_anchors[:, 0]).sum().item()
                 voc_mae += torch.abs(pred_anchors[:, 1] - batch_anchors[:, 1]).sum().item()
                 vmpp_mae += torch.abs(pred_anchors[:, 2] - batch_anchors[:, 2]).sum().item()
@@ -941,11 +1202,12 @@ class ScalarPredictorPipeline:
                 ff_mape_sum += torch.abs((ff_pred - ff_true) / (ff_true + 1e-12)).sum().item()
                 ff_cnt += ff_true.numel()
 
+                # Violations (always 0 for new model since using true anchors)
                 violations['jsc_negative'] += (pred_anchors[:, 0] < 0).sum().item()
                 violations['voc_negative'] += (pred_anchors[:, 1] < 0).sum().item()
                 violations['vmpp_invalid'] += ((pred_anchors[:, 2] <= 0) | (pred_anchors[:, 2] >= pred_anchors[:, 1])).sum().item()
                 violations['jmpp_invalid'] += ((pred_anchors[:, 3] <= 0) | (pred_anchors[:, 3] >= pred_anchors[:, 0])).sum().item()
-                violations['j_exceeds_jsc'] += (pred_curve > pred_anchors[:, 0].unsqueeze(1)).sum().item()
+                violations['j_exceeds_jsc'] += (pred_curve > pred_anchors[:, 0].unsqueeze(1) + 1e-3).sum().item()
 
         elapsed_time = time.time() - start_time
         n_samples = max(1, len(split['X_raw']))

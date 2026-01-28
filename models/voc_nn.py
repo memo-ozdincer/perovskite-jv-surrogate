@@ -541,6 +541,114 @@ class UnifiedSplitSplineNet(nn.Module):
         return anchors, ctrl1, ctrl2
 
 
+@dataclass
+class ControlPointNetConfig:
+    """Configuration for control-point-only network (anchors provided externally)."""
+    input_dim: int = 31 + 71  # raw params + physics features
+    anchor_dim: int = 4       # Jsc, Voc, Vmpp, Jmpp (normalized)
+    hidden_dims: list = None
+    dropout: float = 0.15
+    activation: str = 'silu'
+    ctrl_points: int = 4
+
+    def __post_init__(self):
+        if self.hidden_dims is None:
+            self.hidden_dims = [256, 128, 64]
+
+
+class ControlPointNet(nn.Module):
+    """
+    Network that predicts ONLY spline control points.
+    Anchors are provided as input (from pretrained scalar predictors).
+
+    This decouples anchor prediction from curve shape learning:
+    - Anchors come from well-trained LightGBM/VocNN models
+    - This network only learns the curve shape between anchor points
+
+    Inputs:
+      - x: (N, input_dim) raw + physics features
+      - anchors: (N, 4) normalized [Jsc, Voc, Vmpp, Jmpp] from pretrained models
+
+    Outputs:
+      - ctrl_region1: (N, K) sigmoid control points for 0->Vmpp region
+      - ctrl_region2: (N, K) sigmoid control points for Vmpp->Voc region
+    """
+
+    def __init__(self, config: ControlPointNetConfig):
+        super().__init__()
+        self.config = config
+
+        # Combine features + anchors as input
+        total_input = config.input_dim + config.anchor_dim
+
+        layers = []
+        prev_dim = total_input
+        for hidden_dim in config.hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(self._get_activation(config.activation))
+            layers.append(nn.Dropout(config.dropout))
+            prev_dim = hidden_dim
+        self.backbone = nn.Sequential(*layers)
+
+        # Control point heads - predict shape between anchors
+        self.head_region1 = nn.Sequential(
+            nn.Linear(prev_dim, 32),
+            self._get_activation(config.activation),
+            nn.Linear(32, config.ctrl_points),
+            nn.Softplus()  # Positive values for cumsum, better than Sigmoid for monotonicity
+        )
+        self.head_region2 = nn.Sequential(
+            nn.Linear(prev_dim, 32),
+            self._get_activation(config.activation),
+            nn.Linear(32, config.ctrl_points),
+            nn.Softplus()
+        )
+
+        self._init_weights()
+
+    def _get_activation(self, name: str) -> nn.Module:
+        activations = {
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU(),
+            'mish': nn.Mish(),
+            'relu': nn.ReLU(),
+        }
+        return activations.get(name, nn.SiLU())
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, anchors_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            x: (N, input_dim) normalized features
+            anchors_norm: (N, 4) normalized anchors [Jsc, Voc, Vmpp, Jmpp]
+
+        Returns:
+            ctrl1: (N, K) control points for region 1
+            ctrl2: (N, K) control points for region 2
+        """
+        # Concatenate features with anchor information
+        combined = torch.cat([x, anchors_norm], dim=1)
+        features = self.backbone(combined)
+
+        ctrl1 = self.head_region1(features)
+        ctrl2 = self.head_region2(features)
+
+        # Normalize to sum to 1 for proper interpolation weighting
+        ctrl1 = ctrl1 / (ctrl1.sum(dim=1, keepdim=True) + 1e-8)
+        ctrl2 = ctrl2 / (ctrl2.sum(dim=1, keepdim=True) + 1e-8)
+
+        return ctrl1, ctrl2
+
+
 @torch.no_grad()
 def predict_with_uncertainty(
     model: nn.Module,
