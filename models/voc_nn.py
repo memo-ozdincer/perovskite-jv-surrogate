@@ -18,8 +18,8 @@ class VocNNConfig:
     use_layer_norm: bool = True
     use_residual: bool = True
     activation: str = 'gelu'
-    jacobian_weight: float = 0.01
-    physics_weight: float = 0.1
+    jacobian_weight: float = 0.01  # Smoothness regularization
+    physics_weight: float = 0.1     # Physical ceiling constraint
     lr: float = 1e-3
     weight_decay: float = 1e-5
     epochs: int = 100
@@ -28,7 +28,9 @@ class VocNNConfig:
 
     def __post_init__(self):
         if self.hidden_dims is None:
-            self.hidden_dims = [512, 512, 256, 256, 128, 64]
+            # Simpler default: 3 layers tapering from 256 -> 64
+            # Prevents overfitting on limited data
+            self.hidden_dims = [256, 128, 64]
 
 
 class ResidualBlock(nn.Module):
@@ -98,17 +100,9 @@ class VocNN(nn.Module):
 
         self.backbone = nn.Sequential(*layers)
 
-        # Output head - MUCH WIDER for 99.9% accuracy
-        # Use 3 hidden layers instead of 1 for better expressiveness
-        self.output_head = nn.Sequential(
-            nn.Linear(prev_dim, 256),  # Much wider
-            self._get_activation(config.activation),
-            nn.Dropout(config.dropout * 0.5),  # Lighter dropout in output
-            nn.Linear(256, 128),
-            self._get_activation(config.activation),
-            nn.Dropout(config.dropout * 0.5),
-            nn.Linear(128, 1)
-        )
+        # Output head - SIMPLE: single linear layer
+        # Overparameterized heads cause overfitting on limited data
+        self.output_head = nn.Linear(prev_dim, 1)
 
         # Initialize weights
         self._init_weights()

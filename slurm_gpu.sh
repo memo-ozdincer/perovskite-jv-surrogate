@@ -49,14 +49,15 @@ echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available()
 echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")')"
 echo ""
 
-# Run training with full HPO
+# Run training with optimized HPO
+# Simplified architecture requires fewer trials
 python train.py \
     --params $WORK_DIR/LHS_parameters_m.txt \
     --iv $WORK_DIR/IV_m.txt \
     --output $WORK_DIR/outputs_$(date +%Y%m%d_%H%M%S) \
     --device cuda \
-    --hpo-trials-nn 5 \
-    --hpo-trials-lgbm 50 \
+    --hpo-trials-nn 100 \
+    --hpo-trials-lgbm 200 \
     --hpo-timeout 7200
 
 echo ""

@@ -21,9 +21,10 @@ from models.vmpp_lgbm import VmppLGBMConfig, VmppLGBM, JmppLGBM, FFLGBM
 @dataclass
 class HPOConfig:
     """Global HPO configuration."""
-    # Trial counts (make them large - we have compute)
-    n_trials_nn: int = 300
-    n_trials_lgbm: int = 500
+    # Trial counts - reduced after architecture simplification
+    # Simpler search space requires fewer trials
+    n_trials_nn: int = 100
+    n_trials_lgbm: int = 200
 
     # Parallelization
     n_parallel_trials: int = 24  # Match GPU node cores
@@ -46,33 +47,35 @@ class HPOConfig:
 # ============================================================================
 
 def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
-    """Sample hyperparameters for Voc neural network - optimized for 99.9% accuracy."""
+    """Sample hyperparameters for Voc neural network - simplified architecture to prevent overfitting."""
 
-    # Architecture - MUCH deeper and wider for 99.9% accuracy target
-    n_layers = trial.suggest_int('n_layers', 6, 12)  # Deeper networks
+    # Architecture - SHALLOW and focused to match data complexity
+    # Deep networks overfit on limited data; LGBM achieves R²>0.97 with same features
+    n_layers = trial.suggest_int('n_layers', 2, 5)  # Shallow networks
     hidden_dims = []
     for i in range(n_layers):
-        # Wider networks with focus on large sizes
-        dim = trial.suggest_categorical(f'hidden_{i}', [256, 512, 768, 1024, 1536, 2048])
+        # Moderate sizes - start wide, taper down
+        dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256, 512])
         hidden_dims.append(dim)
 
     return VocNNConfig(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
 
-        # Regularization - lighter to allow model to fit better
-        dropout=trial.suggest_float('dropout', 0.0, 0.2),  # Reduced max dropout
+        # Regularization - moderate to balance fitting and generalization
+        dropout=trial.suggest_float('dropout', 0.05, 0.3),  # Standard dropout range
         use_layer_norm=trial.suggest_categorical('use_layer_norm', [True, False]),
-        use_residual=True,  # ALWAYS use residuals for deep networks
+        use_residual=trial.suggest_categorical('use_residual', [True, False]),  # Optional for shallow nets
 
         # Activation - focus on smooth activations
         activation=trial.suggest_categorical(
             'activation', ['gelu', 'silu', 'mish']  # Removed leaky_relu
         ),
 
-        # Physics losses - DRASTICALLY REDUCED to prioritize accuracy over physics
-        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-6, 1e-3, log=True),  # 100x smaller
-        physics_weight=trial.suggest_float('physics_weight', 1e-5, 1e-2, log=True),    # 100x smaller
+        # Physics losses - MEANINGFUL WEIGHTS for actual guidance
+        # These need to be comparable to MSE loss to have impact
+        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-4, 0.1, log=True),  # Smoothness regularization
+        physics_weight=trial.suggest_float('physics_weight', 1e-3, 0.5, log=True),    # Physical ceiling constraint
 
         # Optimizer - wider LR range and stronger regularization
         lr=trial.suggest_float('lr', 1e-6, 5e-3, log=True),  # Lower minimum LR
@@ -100,14 +103,18 @@ class VocNNObjective:
         batch_size: int = 4096
     ):
         self.X_train = torch.from_numpy(X_train).float()
-        self.y_train = torch.from_numpy(y_train).float()
         self.X_val = torch.from_numpy(X_val).float()
-        self.y_val = torch.from_numpy(y_val).float()
         self.ceiling_train = torch.from_numpy(voc_ceiling_train).float()
         self.ceiling_val = torch.from_numpy(voc_ceiling_val).float()
         self.device = device
         self.batch_size = batch_size
         self.input_dim = X_train.shape[1]
+
+        # Normalize targets for stable training
+        self.y_mean = y_train.mean()
+        self.y_std = y_train.std() + 1e-8
+        self.y_train = torch.from_numpy((y_train - self.y_mean) / self.y_std).float()
+        self.y_val = torch.from_numpy((y_val - self.y_mean) / self.y_std).float()
 
     def __call__(self, trial: optuna.Trial) -> float:
         config = sample_voc_nn_config(trial, self.input_dim)
@@ -132,16 +139,19 @@ class VocNNObjective:
         patience_counter = 0
 
         for epoch in range(config.epochs):
-            # Train epoch
+            # Train epoch - MATCH ACTUAL TRAINING OBJECTIVE
             model.train()
             for batch_x, batch_y in train_loader:
                 batch_x = batch_x.to(self.device)
                 batch_y = batch_y.to(self.device)
 
                 trainer.optimizer.zero_grad()
-                pred = model(batch_x)
+                # Use same loss as actual training: MSE + Jacobian regularization
+                pred, jac_norm = model.forward_with_jacobian(batch_x)
                 loss = torch.nn.functional.mse_loss(pred, batch_y)
+                loss = loss + config.jacobian_weight * jac_norm
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 trainer.optimizer.step()
 
             # Validate

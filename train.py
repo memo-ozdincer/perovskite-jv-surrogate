@@ -220,20 +220,26 @@ class ScalarPredictorPipeline:
         X_train_full = np.hstack([train['X_raw'], train['X_physics']])
         X_val_full = np.hstack([val['X_raw'], val['X_physics']])
 
-        # CRITICAL: Standardize features to prevent gradient explosion
+        # CRITICAL: Standardize features AND targets to prevent gradient explosion
         # Store normalization params for inference
         self.voc_feature_mean = X_train_full.mean(axis=0, keepdims=True)
         self.voc_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
         X_train_full = (X_train_full - self.voc_feature_mean) / self.voc_feature_std
         X_val_full = (X_val_full - self.voc_feature_mean) / self.voc_feature_std
 
+        # Normalize targets for stable training
+        self.voc_target_mean = train['targets']['Voc'].mean()
+        self.voc_target_std = train['targets']['Voc'].std() + 1e-8
+        y_train_voc = (train['targets']['Voc'] - self.voc_target_mean) / self.voc_target_std
+        y_val_voc = (val['targets']['Voc'] - self.voc_target_mean) / self.voc_target_std
+
         train_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_train_full).float(),
-            torch.from_numpy(train['targets']['Voc']).float()
+            torch.from_numpy(y_train_voc).float()
         )
         val_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_val_full).float(),
-            torch.from_numpy(val['targets']['Voc']).float()
+            torch.from_numpy(y_val_voc).float()
         )
 
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=4096, shuffle=True)
@@ -353,13 +359,16 @@ class ScalarPredictorPipeline:
 
         test = self.splits['test']
 
-        # Voc NN
+        # Voc NN - CRITICAL: Normalize inputs AND denormalize outputs
         X_test_full = np.hstack([test['X_raw'], test['X_physics']])
-        X_test_tensor = torch.from_numpy(X_test_full).float().to(self.device)
+        X_test_normalized = (X_test_full - self.voc_feature_mean) / self.voc_feature_std
+        X_test_tensor = torch.from_numpy(X_test_normalized).float().to(self.device)
 
         self.models['voc_nn'].eval()
         with torch.no_grad():
-            voc_pred = self.models['voc_nn'](X_test_tensor).cpu().numpy()
+            voc_pred_normalized = self.models['voc_nn'](X_test_tensor).cpu().numpy()
+            # Denormalize predictions back to original scale
+            voc_pred = voc_pred_normalized * self.voc_target_std + self.voc_target_mean
 
         self.metrics['voc'] = self._compute_metrics(test['targets']['Voc'], voc_pred, 'Voc')
 
@@ -455,15 +464,17 @@ class ScalarPredictorPipeline:
         with open(models_dir / 'configs.json', 'w') as f:
             json.dump(configs, f, indent=2, default=str)
 
-        # Save normalization parameters for Voc NN
+        # Save normalization parameters for Voc NN (features AND targets)
         if hasattr(self, 'voc_feature_mean') and hasattr(self, 'voc_feature_std'):
             normalization_params = {
                 'voc_feature_mean': self.voc_feature_mean.tolist(),
-                'voc_feature_std': self.voc_feature_std.tolist()
+                'voc_feature_std': self.voc_feature_std.tolist(),
+                'voc_target_mean': float(self.voc_target_mean),
+                'voc_target_std': float(self.voc_target_std)
             }
             with open(models_dir / 'normalization.json', 'w') as f:
                 json.dump(normalization_params, f)
-            print("Saved normalization parameters for Voc NN")
+            print("Saved normalization parameters for Voc NN (features + targets)")
 
         print(f"Models saved to {models_dir}")
 
@@ -505,9 +516,9 @@ def main():
                         help='Device (cuda/cpu)')
     parser.add_argument('--no-hpo', action='store_true',
                         help='Skip hyperparameter optimization')
-    parser.add_argument('--hpo-trials-nn', type=int, default=300,
+    parser.add_argument('--hpo-trials-nn', type=int, default=100,
                         help='Number of HPO trials for NN')
-    parser.add_argument('--hpo-trials-lgbm', type=int, default=500,
+    parser.add_argument('--hpo-trials-lgbm', type=int, default=200,
                         help='Number of HPO trials for LGBM')
     parser.add_argument('--hpo-timeout', type=int, default=7200,
                         help='HPO timeout per model (seconds)')
