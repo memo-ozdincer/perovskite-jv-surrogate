@@ -11,6 +11,7 @@ def build_knots(
     anchors: torch.Tensor,
     ctrl1: torch.Tensor,
     ctrl2: torch.Tensor,
+    j_end: float = 0.0,
     validate_monotonicity: bool = False,
     return_violation_counts: bool = False
 ):
@@ -53,7 +54,7 @@ def build_knots(
     j1_interior = j_sc.unsqueeze(1) - j1_scale * j_range1
     j1_knots = torch.cat([j_sc.unsqueeze(1), j1_interior, j_mpp.unsqueeze(1)], dim=1)
 
-    # Region 2: Jmpp -> 0 (same cumulative scaling approach)
+    # Region 2: Jmpp -> J_end (same cumulative scaling approach)
     v2_norm = torch.linspace(0, 1, n_ctrl + 2, device=device)
     # Clamp (v_oc - v_mpp) to ensure non-negative range
     v_range2 = (v_oc - v_mpp).clamp(min=eps).unsqueeze(1)
@@ -62,10 +63,14 @@ def build_knots(
     j2_cumsum = torch.cumsum(ctrl2, dim=1)
     j2_final = j2_cumsum[:, -1:].clamp(min=eps)  # Ensure non-zero divisor
     j2_scale = j2_cumsum / j2_final
-    # j2_interior goes from near Jmpp (scale~0) to near 0 (scale~1)
-    j2_interior = j_mpp.clamp(min=0).unsqueeze(1) * (1 - j2_scale)
+    # j2_interior goes from near Jmpp (scale~0) to near J_end (scale~1)
+    if isinstance(j_end, torch.Tensor):
+        j_end_tensor = j_end.to(device)
+    else:
+        j_end_tensor = torch.full_like(j_mpp, float(j_end))
+    j2_interior = j_mpp.unsqueeze(1) + (j_end_tensor.unsqueeze(1) - j_mpp.unsqueeze(1)) * j2_scale
     j2_knots = torch.cat(
-        [j_mpp.unsqueeze(1), j2_interior, torch.zeros_like(j_mpp).unsqueeze(1)],
+        [j_mpp.unsqueeze(1), j2_interior, j_end_tensor.unsqueeze(1)],
         dim=1
     )
 
@@ -237,6 +242,7 @@ def reconstruct_curve(
     ctrl1: torch.Tensor,
     ctrl2: torch.Tensor,
     v_grid: torch.Tensor,
+    j_end: float = 0.0,
     clamp_voc: bool = True,
     validate_monotonicity: bool = False
 ) -> torch.Tensor:
@@ -253,7 +259,7 @@ def reconstruct_curve(
         j_curve: (N, M)
     """
     v1_knots, j1_knots, v2_knots, j2_knots = build_knots(
-        anchors, ctrl1, ctrl2, validate_monotonicity=validate_monotonicity
+        anchors, ctrl1, ctrl2, j_end=j_end, validate_monotonicity=validate_monotonicity
     )
     j1 = pchip_interpolate_batch(v1_knots, j1_knots, v_grid)
     j2 = pchip_interpolate_batch(v2_knots, j2_knots, v_grid)
@@ -266,8 +272,12 @@ def reconstruct_curve(
 
     if clamp_voc:
         v_oc_1d = anchors[:, 1]
-        j_curve = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), torch.zeros_like(j_curve), j_curve)
-        j_curve = torch.where(v_grid.unsqueeze(0) < 0, torch.zeros_like(j_curve), j_curve)
+        if isinstance(j_end, torch.Tensor):
+            j_end_tensor = j_end.to(j_curve.device).unsqueeze(1)
+        else:
+            j_end_tensor = torch.full_like(v_oc_1d, float(j_end)).unsqueeze(1)
+        j_curve = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), j_end_tensor, j_curve)
+        j_curve = torch.where(v_grid.unsqueeze(0) < 0, j_end_tensor, j_curve)
 
     # CRITICAL: Replace any NaN values with interpolated fallback to prevent loss explosion
     if torch.isnan(j_curve).any():
@@ -275,7 +285,11 @@ def reconstruct_curve(
         j_sc = anchors[:, 0].unsqueeze(1)
         v_oc = anchors[:, 1].unsqueeze(1)
         v_norm = v_grid.unsqueeze(0) / (v_oc + 1e-6)
-        fallback = j_sc * torch.clamp(1 - v_norm, 0, 1)
+        if isinstance(j_end, torch.Tensor):
+            j_end_tensor = j_end.to(j_curve.device).unsqueeze(1)
+        else:
+            j_end_tensor = torch.full_like(j_sc, float(j_end))
+        fallback = j_sc + (j_end_tensor - j_sc) * torch.clamp(v_norm, 0, 1)
         j_curve = torch.where(torch.isnan(j_curve), fallback, j_curve)
 
     batch_idx = torch.arange(j_curve.shape[0], device=j_curve.device)
@@ -290,10 +304,53 @@ def reconstruct_curve(
         idx_cut = torch.searchsorted(v_grid, v_oc_1d, right=False).clamp(max=v_grid.numel() - 1)
         v_cut = v_grid[idx_cut]
         mask_cut = v_grid.unsqueeze(0) >= v_cut.unsqueeze(1)
-        j_curve = torch.where(mask_cut, torch.zeros_like(j_curve), j_curve)
-        j_curve[batch_idx, idx_cut] = 0.0
+        if isinstance(j_end, torch.Tensor):
+            j_end_tensor = j_end.to(j_curve.device)
+        else:
+            j_end_tensor = torch.full_like(v_oc_1d, float(j_end))
+        j_curve = torch.where(mask_cut, j_end_tensor.unsqueeze(1), j_curve)
+        j_curve[batch_idx, idx_cut] = j_end_tensor
 
     return j_curve
+
+
+def normalize_anchors_by_jsc(anchors: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Normalize anchors for Jsc-based curve normalization.
+
+    Normalized space ([-1, 1] via 2*(J/Jsc)-1):
+      - Jsc -> 1
+      - Jmpp -> 2*(Jmpp/Jsc) - 1
+      - J(Voc) -> -1 (handled via j_end in reconstruction)
+    """
+    anchors_norm = anchors.clone()
+    j_sc = anchors[:, 0].clamp(min=eps)
+    anchors_norm[:, 0] = 1.0
+    anchors_norm[:, 3] = 2.0 * (anchors[:, 3] / j_sc) - 1.0
+    return anchors_norm
+
+
+def reconstruct_curve_normalized(
+    anchors: torch.Tensor,
+    ctrl1: torch.Tensor,
+    ctrl2: torch.Tensor,
+    v_grid: torch.Tensor,
+    clamp_voc: bool = True,
+    validate_monotonicity: bool = False
+) -> torch.Tensor:
+    """
+    Reconstruct curve in normalized space ([-1, 1]) using Jsc normalization.
+    """
+    anchors_norm = normalize_anchors_by_jsc(anchors)
+    return reconstruct_curve(
+        anchors_norm,
+        ctrl1,
+        ctrl2,
+        v_grid,
+        j_end=-1.0,
+        clamp_voc=clamp_voc,
+        validate_monotonicity=validate_monotonicity
+    )
 
 
 def continuity_loss(
@@ -301,13 +358,14 @@ def continuity_loss(
     ctrl1: torch.Tensor,
     ctrl2: torch.Tensor,
     v_grid: torch.Tensor,
+    j_end: float = 0.0,
     validate_monotonicity: bool = False
 ) -> torch.Tensor:
     """
     Enforce C1 continuity at Vmpp using finite differences.
     """
     v1_knots, j1_knots, v2_knots, j2_knots = build_knots(
-        anchors, ctrl1, ctrl2, validate_monotonicity=validate_monotonicity
+        anchors, ctrl1, ctrl2, j_end=j_end, validate_monotonicity=validate_monotonicity
     )
     j1 = pchip_interpolate_batch(v1_knots, j1_knots, v_grid)
     j2 = pchip_interpolate_batch(v2_knots, j2_knots, v_grid)

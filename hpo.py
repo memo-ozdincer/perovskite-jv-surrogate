@@ -15,6 +15,7 @@ from functools import partial
 
 from models.voc_nn import VocNNConfig, VocNN, VocTrainer, SplitSplineNetConfig, UnifiedSplitSplineNet
 from models.jsc_lgbm import JscLGBMConfig, JscLGBM
+from models.voc_lgbm import VocLGBMConfig
 from models.vmpp_lgbm import VmppLGBMConfig, VmppLGBM, JmppLGBM, FFLGBM
 from models.reconstruction import reconstruct_curve, continuity_loss
 
@@ -775,6 +776,26 @@ def run_full_hpo(
     voc_pred_train = voc_pred_train * voc_std + voc_mean
     voc_pred_val = voc_pred_val * voc_std + voc_mean
 
+    # 1b. Voc LGBM (with ceiling feature)
+    print("=" * 60)
+    print("HPO: Voc LGBM")
+    print("=" * 60)
+    X_train_voc = np.hstack([
+        X_train_raw, X_train_physics,
+        np.log10(np.abs(voc_ceiling_train) + 1e-30).reshape(-1, 1)
+    ])
+    X_val_voc = np.hstack([
+        X_val_raw, X_val_physics,
+        np.log10(np.abs(voc_ceiling_val) + 1e-30).reshape(-1, 1)
+    ])
+    y_train_voc = targets_train['Voc'] / (np.abs(voc_ceiling_train) + 1e-30)
+    y_val_voc = targets_val['Voc'] / (np.abs(voc_ceiling_val) + 1e-30)
+
+    voc_lgbm_params, voc_lgbm_study = engine.optimize_lgbm(
+        X_train_voc, y_train_voc, X_val_voc, y_val_voc, 'voc'
+    )
+    results['voc_lgbm'] = {'params': voc_lgbm_params, 'study': voc_lgbm_study}
+
     # 2. Jsc LGBM (with ceiling feature)
     print("=" * 60)
     print("HPO: Jsc LGBM")
@@ -934,6 +955,21 @@ def get_best_configs_from_study(results: dict) -> dict:
             subsample=params.get('subsample', 0.85),  # FIXED: middle of 0.7-0.95
             colsample_bytree=params.get('colsample_bytree', 0.85),
             reg_alpha=params.get('reg_alpha', 0.01),  # FIXED: middle of 1e-4 to 1.0 (log)
+            reg_lambda=params.get('reg_lambda', 0.01),
+        )
+
+    # Voc LGBM - defaults match search space
+    if 'voc_lgbm' in results:
+        params = results['voc_lgbm']['params']
+        configs['voc_lgbm'] = VocLGBMConfig(
+            num_leaves=params.get('num_leaves', 127),
+            max_depth=params.get('max_depth', 10),
+            learning_rate=params.get('learning_rate', 0.03),
+            n_estimators=params.get('n_estimators', 1000),
+            min_child_samples=params.get('min_child_samples', 25),
+            subsample=params.get('subsample', 0.85),
+            colsample_bytree=params.get('colsample_bytree', 0.85),
+            reg_alpha=params.get('reg_alpha', 0.01),
             reg_lambda=params.get('reg_lambda', 0.01),
         )
 

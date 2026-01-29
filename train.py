@@ -35,13 +35,18 @@ from models.vmpp_lgbm import (
     VmppLGBMConfig, VmppLGBM, JmppLGBM, FFLGBM,
     build_vmpp_model, build_jmpp_model, build_ff_model
 )
-from models.reconstruction import reconstruct_curve, continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
+from models.reconstruction import (
+    reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_jsc,
+    continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
+)
+from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
 from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
 from logging_utils import (
     TrainingLogger, ModelComparisonMetrics,
     compute_multicollinearity, suggest_features_to_drop
 )
 from preprocessing import (
+    PVDataPreprocessor,
     normalize_curves_by_isc, denormalize_curves_by_isc,
     validate_curve_normalization
 )
@@ -225,8 +230,10 @@ class ScalarPredictorPipeline:
         self.iv_data = None
         self.targets = None
         self.physics_features = None
+        self.preprocessor = None
         self.models = {}
         self.metrics = {}
+        self.voc_model_type = 'nn'
         self.physics_feature_mask = None
         self.physics_feature_names = get_feature_names()
         self.v_grid = V_GRID.astype(np.float32)
@@ -314,17 +321,55 @@ class ScalarPredictorPipeline:
         # Create numpy arrays for each split
         self.X_raw = self.params_df.values.astype(np.float32)
 
-        self.splits = {}
-        for name, idx in [('train', self.train_idx), ('val', self.val_idx), ('test', self.test_idx)]:
-            self.splits[name] = {
-                'X_raw': self.X_raw[idx],
-                'X_physics': self.physics_features_np[idx],
-                'jsc_ceiling': self.jsc_ceiling[idx],
-                'voc_ceiling': self.voc_ceiling[idx],
-                'targets': {k: v[idx] for k, v in self.targets_np.items()},
-                'curves': self.iv_data[idx],
+        # Fit preprocessing on training parameters and reuse for val/test
+        self.preprocessor = PVDataPreprocessor(colnames=list(COLNAMES))
+        X_train_proc = self.preprocessor.fit_transform_params(self.X_raw[self.train_idx])
+        X_val_proc = self.preprocessor.transform_params(self.X_raw[self.val_idx])
+        X_test_proc = self.preprocessor.transform_params(self.X_raw[self.test_idx])
+
+        # Normalize curves by Isc (per-split, uses true Isc)
+        isc_train, curves_train_norm = self.preprocessor.fit_transform_curves(self.iv_data[self.train_idx])
+        isc_val, curves_val_norm = self.preprocessor.transform_curves(self.iv_data[self.val_idx])
+        isc_test, curves_test_norm = self.preprocessor.transform_curves(self.iv_data[self.test_idx])
+
+        self.splits = {
+            'train': {
+                'X_raw': X_train_proc,
+                'X_raw_unscaled': self.X_raw[self.train_idx],
+                'X_physics': self.physics_features_np[self.train_idx],
+                'jsc_ceiling': self.jsc_ceiling[self.train_idx],
+                'voc_ceiling': self.voc_ceiling[self.train_idx],
+                'targets': {k: v[self.train_idx] for k, v in self.targets_np.items()},
+                'curves': self.iv_data[self.train_idx],
+                'curves_norm': curves_train_norm,
+                'isc_values': isc_train,
+                'v_grid': self.v_grid
+            },
+            'val': {
+                'X_raw': X_val_proc,
+                'X_raw_unscaled': self.X_raw[self.val_idx],
+                'X_physics': self.physics_features_np[self.val_idx],
+                'jsc_ceiling': self.jsc_ceiling[self.val_idx],
+                'voc_ceiling': self.voc_ceiling[self.val_idx],
+                'targets': {k: v[self.val_idx] for k, v in self.targets_np.items()},
+                'curves': self.iv_data[self.val_idx],
+                'curves_norm': curves_val_norm,
+                'isc_values': isc_val,
+                'v_grid': self.v_grid
+            },
+            'test': {
+                'X_raw': X_test_proc,
+                'X_raw_unscaled': self.X_raw[self.test_idx],
+                'X_physics': self.physics_features_np[self.test_idx],
+                'jsc_ceiling': self.jsc_ceiling[self.test_idx],
+                'voc_ceiling': self.voc_ceiling[self.test_idx],
+                'targets': {k: v[self.test_idx] for k, v in self.targets_np.items()},
+                'curves': self.iv_data[self.test_idx],
+                'curves_norm': curves_test_norm,
+                'isc_values': isc_test,
                 'v_grid': self.v_grid
             }
+        }
 
         # Debug + verification
         train_curves = self.splits['train']['curves']
@@ -614,6 +659,33 @@ class ScalarPredictorPipeline:
         # Custom training loop for Voc
         self._train_voc_model(trainer, train_loader, val_loader, voc_config)
 
+        # 1b. Train Voc LGBM
+        print("\n--- Training Voc LGBM ---")
+        voc_lgbm_config = configs.get('voc_lgbm', VocLGBMConfig())
+        self.models['voc_lgbm'] = build_voc_lgbm_model(voc_lgbm_config)
+        self.models['voc_lgbm'].fit(
+            train['X_raw'], train['X_physics'],
+            train['targets']['Voc'], train['voc_ceiling'],
+            val['X_raw'], val['X_physics'],
+            val['targets']['Voc'], val['voc_ceiling']
+        )
+
+        # Compare Voc models on validation and select best
+        voc_pred_val_nn = self._predict_voc_nn(val)
+        voc_pred_val_lgbm = self._predict_voc_lgbm(val)
+        voc_true_val = val['targets']['Voc']
+        rmse_nn = float(np.sqrt(np.mean((voc_pred_val_nn - voc_true_val) ** 2)))
+        rmse_lgbm = float(np.sqrt(np.mean((voc_pred_val_lgbm - voc_true_val) ** 2)))
+
+        self.voc_model_type = 'lgbm' if rmse_lgbm <= rmse_nn else 'nn'
+        self.metrics['voc_model_selection'] = {
+            'rmse_nn': rmse_nn,
+            'rmse_lgbm': rmse_lgbm,
+            'selected': self.voc_model_type
+        }
+        print(f"\nVoc model selection: NN rmse={rmse_nn:.6f}, LGBM rmse={rmse_lgbm:.6f} "
+              f"-> using {self.voc_model_type.upper()}")
+
         # 2. Train Jsc LGBM
         print("\n--- Training Jsc LGBM ---")
         jsc_config = configs.get('jsc_lgbm', JscLGBMConfig())
@@ -736,10 +808,12 @@ class ScalarPredictorPipeline:
         print(f"  Std:  Jsc={self.anchor_std[0,0]:.2f}, Voc={self.anchor_std[0,1]:.4f}, "
               f"Vmpp={self.anchor_std[0,2]:.4f}, Jmpp={self.anchor_std[0,3]:.2f}")
 
-        # Normalize curves by Isc (KNOWN WORKING approach)
-        print("\nNormalizing curves by Isc...")
-        isc_train, curves_train_norm = normalize_curves_by_isc(train['curves'])
-        isc_val, curves_val_norm = normalize_curves_by_isc(val['curves'])
+        # Use precomputed curve normalization (KNOWN WORKING approach)
+        print("\nUsing Isc-normalized curves from preprocessing...")
+        isc_train = train['isc_values']
+        isc_val = val['isc_values']
+        curves_train_norm = train['curves_norm']
+        curves_val_norm = val['curves_norm']
         self.curve_norm_by_isc = True
 
         # Validate normalization
@@ -833,22 +907,20 @@ class ScalarPredictorPipeline:
                 # Model predicts only control points (anchors provided as input)
                 ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
 
-                # Reconstruct curve using predicted anchors (returns absolute scale)
-                pred_curve_abs = reconstruct_curve(
-                    batch_anchors_raw, ctrl1, ctrl2, v_grid,
-                    clamp_voc=True
+                # Reconstruct curve directly in normalized space and scale by predicted Jsc
+                pred_curve_norm = reconstruct_curve_normalized(
+                    batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
                 )
-
-                # Normalize prediction to match target space [-1, 1]
-                pred_curve_norm = 2.0 * (pred_curve_abs / batch_isc.unsqueeze(1)) - 1.0
+                pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_anchors_raw[:, 0])
 
                 # Compute loss in normalized space (better gradients)
                 loss, metrics = curve_loss_fn(
                     pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
                 )
 
-                # Add continuity penalty
-                cont_loss = continuity_loss(batch_anchors_raw, ctrl1, ctrl2, v_grid)
+                # Add continuity penalty in normalized space
+                anchors_norm = normalize_anchors_by_jsc(batch_anchors_raw)
+                cont_loss = continuity_loss(anchors_norm, ctrl1, ctrl2, v_grid, j_end=-1.0)
                 loss = loss + continuity_weight * cont_loss
 
                 if torch.isnan(loss):
@@ -882,12 +954,10 @@ class ScalarPredictorPipeline:
                     batch_isc = batch_isc.to(self.device)
 
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
-                    pred_curve_abs = reconstruct_curve(
+                    pred_curve_norm = reconstruct_curve_normalized(
                         batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
                     )
-
-                    # Normalize prediction for loss computation
-                    pred_curve_norm = 2.0 * (pred_curve_abs / batch_isc.unsqueeze(1)) - 1.0
+                    pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_anchors_raw[:, 0])
 
                     val_loss, _ = curve_loss_fn(
                         pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
@@ -949,8 +1019,8 @@ class ScalarPredictorPipeline:
 
         print(f"\nCurve model training complete. Best val loss: {best_val:.6f}")
 
-    def _predict_voc(self, split: dict) -> np.ndarray:
-        """Predict Voc using the trained Voc NN (no oracle inputs)."""
+    def _predict_voc_nn(self, split: dict) -> np.ndarray:
+        """Predict Voc using the trained Voc NN."""
         X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
         X_norm = (X_full - self.voc_feature_mean) / self.voc_feature_std
         X_tensor = torch.from_numpy(X_norm).float().to(self.device)
@@ -958,6 +1028,18 @@ class ScalarPredictorPipeline:
         with torch.no_grad():
             voc_pred_norm = self.models['voc_nn'](X_tensor).cpu().numpy()
         return voc_pred_norm * self.voc_target_std + self.voc_target_mean
+
+    def _predict_voc_lgbm(self, split: dict) -> np.ndarray:
+        """Predict Voc using the trained Voc LGBM."""
+        return self.models['voc_lgbm'].predict(
+            split['X_raw'], split['X_physics'], split['voc_ceiling']
+        )
+
+    def _predict_voc(self, split: dict) -> np.ndarray:
+        """Predict Voc using the selected Voc model."""
+        if self.voc_model_type == 'lgbm':
+            return self._predict_voc_lgbm(split)
+        return self._predict_voc_nn(split)
 
     def _predict_curve_anchors(self, split: dict) -> np.ndarray:
         """Predict anchors (Jsc, Voc, Vmpp, Jmpp) using trained models."""
@@ -1194,6 +1276,7 @@ class ScalarPredictorPipeline:
             axis=1
         ).astype(np.float32)
         curves_true = split['curves'].astype(np.float32)
+        curves_true_norm = split.get('curves_norm')
 
         # Normalize anchors if using new model
         if use_ctrl_point_model:
@@ -1243,6 +1326,9 @@ class ScalarPredictorPipeline:
         }
 
         start_time = time.time()
+        pred_curves_for_plot = []
+        true_curves_for_plot = []
+        max_plot_samples = 2000
 
         with torch.no_grad():
             for batch in loader:
@@ -1257,7 +1343,10 @@ class ScalarPredictorPipeline:
                     # ControlPointNet: uses predicted anchors
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
                     pred_anchors = batch_anchors  # Predicted anchors
-                    pred_curve = reconstruct_curve(batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+                    pred_curve_norm = reconstruct_curve_normalized(
+                        batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True
+                    )
+                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, pred_anchors[:, 0])
                 else:
                     batch_x, batch_anchors, batch_curves = batch
                     batch_x = batch_x.to(self.device)
@@ -1303,19 +1392,32 @@ class ScalarPredictorPipeline:
                 violations['jmpp_invalid'] += ((pred_anchors[:, 3] <= 0) | (pred_anchors[:, 3] >= pred_anchors[:, 0])).sum().item()
                 violations['j_exceeds_jsc'] += (pred_curve > pred_anchors[:, 0].unsqueeze(1) + 1e-3).sum().item()
 
+                if len(pred_curves_for_plot) < max_plot_samples:
+                    pred_curves_for_plot.append(pred_curve.detach().cpu().numpy())
+                    true_curves_for_plot.append(batch_curves.detach().cpu().numpy())
+
                 # Reconstruction-layer sanity metric:
                 # Compare PCHIP vs piecewise-linear interpolation using the SAME knots.
-                # If this is huge, the spline layer may be causing overshoot/instability.
-                v1k, j1k, v2k, j2k = build_knots(pred_anchors, ctrl1, ctrl2)
-                j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
-                j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
-                mask = v_grid.unsqueeze(0) <= pred_anchors[:, 2].unsqueeze(1)
-                curve_lin = torch.where(mask, j1_lin, j2_lin)
-                if True:
+                # Evaluate in normalized space when using ControlPointNet.
+                if use_ctrl_point_model:
+                    anchors_norm = normalize_anchors_by_jsc(pred_anchors)
+                    v1k, j1k, v2k, j2k = build_knots(anchors_norm, ctrl1, ctrl2, j_end=-1.0)
+                    j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
+                    j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
+                    mask = v_grid.unsqueeze(0) <= anchors_norm[:, 2].unsqueeze(1)
+                    curve_lin = torch.where(mask, j1_lin, j2_lin)
+                    v_oc_1d = anchors_norm[:, 1]
+                    curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), -1.0, curve_lin)
+                    delta = pred_curve_norm - curve_lin
+                else:
+                    v1k, j1k, v2k, j2k = build_knots(pred_anchors, ctrl1, ctrl2)
+                    j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
+                    j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
+                    mask = v_grid.unsqueeze(0) <= pred_anchors[:, 2].unsqueeze(1)
+                    curve_lin = torch.where(mask, j1_lin, j2_lin)
                     v_oc_1d = pred_anchors[:, 1]
                     curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), torch.zeros_like(curve_lin), curve_lin)
-
-                delta = pred_curve - curve_lin
+                    delta = pred_curve - curve_lin
                 if 'pchip_linear_sum_sq' not in locals():
                     pchip_linear_sum_sq = 0.0
                     pchip_linear_sum_cnt = 0
@@ -1371,6 +1473,19 @@ class ScalarPredictorPipeline:
             if k != 'constraint_violations':
                 print(f"  {k}: {v}")
         print(f"  constraint_violations: {results['constraint_violations']}")
+
+        # Plot reconstructed curves (test split only)
+        if split_name == 'test' and pred_curves_for_plot and true_curves_for_plot:
+            pred_curves = np.concatenate(pred_curves_for_plot, axis=0)
+            true_curves = np.concatenate(true_curves_for_plot, axis=0)
+            v_slices = np.tile(self.v_grid, (pred_curves.shape[0], 1))
+            plot_manager = PlotManager(self.output_dir / "plots", n_samples=8)
+            plot_manager.plot_best_worst_random(
+                v_slices=v_slices,
+                i_true=true_curves,
+                i_pred=pred_curves,
+                prefix=f"{split_name}_curve"
+            )
 
         return results
 
@@ -1663,6 +1778,10 @@ class ScalarPredictorPipeline:
         # Save Voc NN
         torch.save(self.models['voc_nn'].state_dict(), models_dir / 'voc_nn.pt')
 
+        # Save Voc LGBM (if trained)
+        if 'voc_lgbm' in self.models:
+            self.models['voc_lgbm'].save(str(models_dir / 'voc_lgbm.txt'))
+
         # Save LGBM models
         self.models['jsc_lgbm'].save(str(models_dir / 'jsc_lgbm.txt'))
         self.models['vmpp_lgbm'].save(str(models_dir / 'vmpp_lgbm.txt'))
@@ -1684,6 +1803,8 @@ class ScalarPredictorPipeline:
         # Save configs
         configs = {
             'voc_nn': self.models['voc_nn'].config.__dict__ if hasattr(self.models['voc_nn'], 'config') else {},
+            'voc_lgbm': self.models['voc_lgbm'].config.__dict__ if 'voc_lgbm' in self.models else {},
+            'voc_model_type': self.voc_model_type,
             'jsc_lgbm': self.models['jsc_lgbm'].config.__dict__,
             'vmpp_lgbm': self.models['vmpp_lgbm'].config.__dict__,
             'ff_lgbm': self.models['ff_lgbm'].config.__dict__,
@@ -1703,7 +1824,7 @@ class ScalarPredictorPipeline:
                 'v_grid': self.v_grid.tolist(),
                 'type': 'control_point_net',
                 'curve_norm_by_isc': bool(self.curve_norm_by_isc),
-                'curve_output_normalized': False
+                'curve_output_normalized': True
             }
 
         if 'cvae' in self.models:
@@ -1715,6 +1836,10 @@ class ScalarPredictorPipeline:
 
         with open(models_dir / 'configs.json', 'w') as f:
             json.dump(configs, f, indent=2, default=str)
+
+        # Save preprocessor for inference
+        if self.preprocessor is not None:
+            self.preprocessor.save(str(models_dir / 'preprocessor.joblib'))
 
         # Save normalization parameters for Voc NN (features AND targets)
         if hasattr(self, 'voc_feature_mean') and hasattr(self, 'voc_feature_std'):

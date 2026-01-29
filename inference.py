@@ -19,8 +19,8 @@ from models.voc_nn import (
 )
 from models.jsc_lgbm import JscLGBMConfig
 from models.vmpp_lgbm import VmppLGBMConfig
-from models.reconstruction import reconstruct_curve
-from preprocessing import denormalize_curves_by_isc
+from models.reconstruction import reconstruct_curve, reconstruct_curve_normalized
+from preprocessing import denormalize_curves_by_isc, PVDataPreprocessor
 
 
 @dataclass
@@ -71,6 +71,8 @@ class ScalarPredictor:
         self.curve_output_normalized = False
         self.curve_model_type = None
         self.v_grid = V_GRID.astype(np.float32)
+        self.preprocessor = None
+        self.voc_model_type = 'nn'
 
         self._load_models()
 
@@ -101,10 +103,15 @@ class ScalarPredictor:
         self.models['voc_nn'].eval()
 
         # Load LGBM models
+        voc_lgbm_path = self.models_dir / 'voc_lgbm.txt'
+        if voc_lgbm_path.exists():
+            self.models['voc_lgbm'] = lgb.Booster(model_file=str(voc_lgbm_path))
         self.models['jsc_lgbm'] = lgb.Booster(model_file=str(self.models_dir / 'jsc_lgbm.txt'))
         self.models['vmpp_lgbm'] = lgb.Booster(model_file=str(self.models_dir / 'vmpp_lgbm.txt'))
         self.models['jmpp_lgbm'] = lgb.Booster(model_file=str(self.models_dir / 'jmpp_lgbm.txt'))
         self.models['ff_lgbm'] = lgb.Booster(model_file=str(self.models_dir / 'ff_lgbm.txt'))
+
+        self.voc_model_type = self.configs.get('voc_model_type', 'nn')
 
         # Load normalization parameters for Voc NN
         normalization_file = self.models_dir / 'normalization.json'
@@ -174,6 +181,11 @@ class ScalarPredictor:
 
         print("All models loaded successfully")
 
+        # Load preprocessor (optional)
+        preprocessor_path = self.models_dir / 'preprocessor.joblib'
+        if preprocessor_path.exists():
+            self.preprocessor = PVDataPreprocessor.load(str(preprocessor_path))
+
     def predict(self, params: np.ndarray) -> PredictionResult:
         """
         Predict all scalar PV parameters from input parameters.
@@ -186,6 +198,12 @@ class ScalarPredictor:
         """
         params = np.atleast_2d(params).astype(np.float32)
         N = params.shape[0]
+
+        # Apply parameter preprocessing if available
+        if self.preprocessor is not None:
+            params_proc = self.preprocessor.transform_params(params)
+        else:
+            params_proc = params
 
         # Convert to tensor for feature computation
         params_tensor = torch.from_numpy(params).to(self.device)
@@ -202,24 +220,27 @@ class ScalarPredictor:
         voc_ceiling = compute_voc_ceiling(params_tensor).cpu().numpy()
 
         # 1. Predict Voc
-        X_full = np.hstack([params, physics_features_np])
+        X_full = np.hstack([params_proc, physics_features_np])
 
-        # Apply normalization (critical for NN predictions)
-        if self.voc_feature_mean is not None and self.voc_feature_std is not None:
-            X_full = (X_full - self.voc_feature_mean) / self.voc_feature_std
+        if self.voc_model_type == 'lgbm' and 'voc_lgbm' in self.models:
+            Voc = self.models['voc_lgbm'].predict(X_full)
+        else:
+            # Apply normalization (critical for NN predictions)
+            if self.voc_feature_mean is not None and self.voc_feature_std is not None:
+                X_full = (X_full - self.voc_feature_mean) / self.voc_feature_std
 
-        X_tensor = torch.from_numpy(X_full).float().to(self.device)
-        voc_ceiling_tensor = torch.from_numpy(voc_ceiling).float().to(self.device)
+            X_tensor = torch.from_numpy(X_full).float().to(self.device)
+            voc_ceiling_tensor = torch.from_numpy(voc_ceiling).float().to(self.device)
 
-        with torch.no_grad():
-            Voc = self.models['voc_nn'](X_tensor, voc_ceiling_tensor).cpu().numpy()
+            with torch.no_grad():
+                Voc = self.models['voc_nn'](X_tensor, voc_ceiling_tensor).cpu().numpy()
 
-        # Denormalize Voc predictions if needed
-        Voc = Voc * self.voc_target_std + self.voc_target_mean
+            # Denormalize Voc predictions if needed
+            Voc = Voc * self.voc_target_std + self.voc_target_mean
 
         # 2. Predict Jsc
         X_jsc = np.hstack([
-            params, physics_features_np,
+            params_proc, physics_features_np,
             np.log10(jsc_ceiling + 1e-30).reshape(-1, 1)
         ])
         jsc_efficiency = self.models['jsc_lgbm'].predict(X_jsc)
@@ -227,7 +248,7 @@ class ScalarPredictor:
 
         # 3. Predict Vmpp
         X_vmpp = np.hstack([
-            params, physics_features_np,
+            params_proc, physics_features_np,
             Voc.reshape(-1, 1),
             np.log10(Voc + 1e-30).reshape(-1, 1)
         ])
@@ -236,7 +257,7 @@ class ScalarPredictor:
 
         # 4. Predict Jmpp
         X_jmpp = np.hstack([
-            params, physics_features_np,
+            params_proc, physics_features_np,
             Jsc.reshape(-1, 1),
             np.log10(np.abs(Jsc) + 1e-30).reshape(-1, 1),
             Vmpp.reshape(-1, 1),
@@ -247,7 +268,7 @@ class ScalarPredictor:
 
         # 5. Predict FF
         X_ff = np.hstack([
-            params, physics_features_np,
+            params_proc, physics_features_np,
             Voc.reshape(-1, 1),
             np.log10(Voc + 1e-30).reshape(-1, 1),
             Jsc.reshape(-1, 1),
@@ -273,6 +294,10 @@ class ScalarPredictor:
     def _prepare_curve_inputs(self, params: np.ndarray) -> torch.Tensor:
         """Prepare normalized inputs for curve model."""
         params = np.atleast_2d(params).astype(np.float32)
+        if self.preprocessor is not None:
+            params_proc = self.preprocessor.transform_params(params)
+        else:
+            params_proc = params
         params_tensor = torch.from_numpy(params).to(self.device)
 
         physics_features = compute_all_physics_features(params_tensor)
@@ -281,7 +306,7 @@ class ScalarPredictor:
         if self.physics_feature_mask is not None:
             physics_features_np = physics_features_np[:, self.physics_feature_mask]
 
-        X_full = np.hstack([params, physics_features_np]).astype(np.float32)
+        X_full = np.hstack([params_proc, physics_features_np]).astype(np.float32)
 
         if self.curve_feature_mean is not None and self.curve_feature_std is not None:
             X_full = (X_full - self.curve_feature_mean) / self.curve_feature_std
@@ -327,7 +352,9 @@ class ScalarPredictor:
                 curves = []
                 for _ in range(n_samples):
                     ctrl1, ctrl2 = model(x, anchors_norm_tensor)
-                    curve = reconstruct_curve(anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                    curve = reconstruct_curve_normalized(
+                        anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True
+                    )
                     if self.curve_norm_by_isc and self.curve_output_normalized:
                         curve = denormalize_curves_by_isc(curve, anchors_raw_tensor[:, 0])
                     curves.append(curve)
@@ -340,7 +367,9 @@ class ScalarPredictor:
 
             with torch.no_grad():
                 ctrl1, ctrl2 = model(x, anchors_norm_tensor)
-                curve = reconstruct_curve(anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                curve = reconstruct_curve_normalized(
+                    anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True
+                )
                 if self.curve_norm_by_isc and self.curve_output_normalized:
                     curve = denormalize_curves_by_isc(curve, anchors_raw_tensor[:, 0])
             return self.v_grid, curve.cpu().numpy(), None
