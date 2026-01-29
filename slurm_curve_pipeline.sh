@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
-#SBATCH --time=05:00:00
+#SBATCH --time=30:00:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_recon_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_recon_%j.err
 #SBATCH --account=aip-aspuru
@@ -84,8 +84,8 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION - Adjust these for your run
 # ============================================================================
-HPO_TRIALS_NN=5           # Number of HPO trials for NN and curve model
-HPO_TRIALS_LGBM=5        # Number of HPO trials for LGBM
+HPO_TRIALS_NN=300           # Number of HPO trials for NN and curve model
+HPO_TRIALS_LGBM=50        # Number of HPO trials for LGBM
 HPO_TIMEOUT=7200           # 2 hours per model
 CONTINUITY_WEIGHT=0.1      # Try 0.1, 0.5, or 1.0 (may be overridden by curve HPO)
 CTRL_POINTS=4              # Simplified from 6 (may be overridden by curve HPO)
