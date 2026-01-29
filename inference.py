@@ -12,10 +12,15 @@ import lightgbm as lgb
 
 from config import COLNAMES, V_GRID
 from features import compute_all_physics_features, compute_jsc_ceiling, compute_voc_ceiling
-from models.voc_nn import VocNN, VocNNConfig, SplitSplineNetConfig, UnifiedSplitSplineNet
+from models.voc_nn import (
+    VocNN, VocNNConfig,
+    SplitSplineNetConfig, UnifiedSplitSplineNet,
+    ControlPointNetConfig, ControlPointNet
+)
 from models.jsc_lgbm import JscLGBMConfig
 from models.vmpp_lgbm import VmppLGBMConfig
 from models.reconstruction import reconstruct_curve
+from preprocessing import denormalize_curves_by_isc
 
 
 @dataclass
@@ -60,6 +65,11 @@ class ScalarPredictor:
         self.physics_feature_mask = None
         self.curve_feature_mean = None
         self.curve_feature_std = None
+        self.anchor_mean = None
+        self.anchor_std = None
+        self.curve_norm_by_isc = False
+        self.curve_output_normalized = False
+        self.curve_model_type = None
         self.v_grid = V_GRID.astype(np.float32)
 
         self._load_models()
@@ -107,6 +117,11 @@ class ScalarPredictor:
                 self.voc_target_std = float(norm_params.get('voc_target_std', 1.0))
                 self.curve_feature_mean = np.array(norm_params.get('curve_feature_mean')) if norm_params.get('curve_feature_mean') is not None else None
                 self.curve_feature_std = np.array(norm_params.get('curve_feature_std')) if norm_params.get('curve_feature_std') is not None else None
+                if norm_params.get('anchor_mean') is not None:
+                    self.anchor_mean = np.array(norm_params.get('anchor_mean'))
+                if norm_params.get('anchor_std') is not None:
+                    self.anchor_std = np.array(norm_params.get('anchor_std'))
+                self.curve_norm_by_isc = bool(norm_params.get('curve_norm_by_isc', False))
                 if 'physics_feature_mask' in norm_params:
                     mask_indices = norm_params['physics_feature_mask']
                     self.physics_feature_mask = np.array(mask_indices, dtype=int)
@@ -119,11 +134,30 @@ class ScalarPredictor:
             self.voc_target_std = 1.0
 
         # Load curve model (optional)
-        curve_model_path = self.models_dir / 'curve_model.pt'
-        if curve_model_path.exists():
-            curve_config_dict = self.configs.get('curve_model', {})
-            self.v_grid = np.array(curve_config_dict.get('v_grid', V_GRID), dtype=np.float32)
+        curve_config_dict = self.configs.get('curve_model', {})
+        self.v_grid = np.array(curve_config_dict.get('v_grid', V_GRID), dtype=np.float32)
+        self.curve_output_normalized = bool(curve_config_dict.get('curve_output_normalized', False))
 
+        curve_model_path = self.models_dir / 'curve_model.pt'
+        ctrl_point_model_path = self.models_dir / 'ctrl_point_model.pt'
+        curve_model_type = curve_config_dict.get('type')
+
+        if curve_model_type == 'control_point_net' or ctrl_point_model_path.exists():
+            ctrl_config = ControlPointNetConfig(
+                input_dim=curve_config_dict.get('input_dim', 102),
+                anchor_dim=curve_config_dict.get('anchor_dim', 4),
+                hidden_dims=curve_config_dict.get('hidden_dims', [256, 128, 64]),
+                dropout=curve_config_dict.get('dropout', 0.15),
+                activation=curve_config_dict.get('activation', 'silu'),
+                ctrl_points=curve_config_dict.get('ctrl_points', 4),
+            )
+            self.models['curve_model'] = ControlPointNet(ctrl_config).to(self.device)
+            self.models['curve_model'].load_state_dict(
+                torch.load(ctrl_point_model_path, map_location=self.device)
+            )
+            self.models['curve_model'].eval()
+            self.curve_model_type = 'control_point_net'
+        elif curve_model_path.exists():
             curve_config = SplitSplineNetConfig(
                 input_dim=curve_config_dict.get('input_dim', 102),
                 hidden_dims=curve_config_dict.get('hidden_dims', [512, 256, 128]),
@@ -136,6 +170,7 @@ class ScalarPredictor:
                 torch.load(curve_model_path, map_location=self.device)
             )
             self.models['curve_model'].eval()
+            self.curve_model_type = 'unified_split_spline'
 
         print("All models loaded successfully")
 
@@ -275,6 +310,41 @@ class ScalarPredictor:
 
         model = self.models['curve_model']
 
+        if self.curve_model_type == 'control_point_net':
+            preds = self.predict(params)
+            anchors_raw = np.stack([preds.Jsc, preds.Voc, preds.Vmpp, preds.Jmpp], axis=1).astype(np.float32)
+
+            if self.anchor_mean is None or self.anchor_std is None:
+                raise ValueError("Missing anchor_mean/anchor_std for control-point curve inference.")
+
+            anchors_norm = (anchors_raw - self.anchor_mean) / self.anchor_std
+            anchors_norm_tensor = torch.from_numpy(anchors_norm).float().to(self.device)
+            anchors_raw_tensor = torch.from_numpy(anchors_raw).float().to(self.device)
+
+            if return_uncertainty:
+                was_training = model.training
+                model.train()
+                curves = []
+                for _ in range(n_samples):
+                    ctrl1, ctrl2 = model(x, anchors_norm_tensor)
+                    curve = reconstruct_curve(anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                    if self.curve_norm_by_isc and self.curve_output_normalized:
+                        curve = denormalize_curves_by_isc(curve, anchors_raw_tensor[:, 0])
+                    curves.append(curve)
+                stacked = torch.stack(curves)
+                mean = stacked.mean(dim=0)
+                std = stacked.std(dim=0)
+                if not was_training:
+                    model.eval()
+                return self.v_grid, mean.cpu().numpy(), std.cpu().numpy()
+
+            with torch.no_grad():
+                ctrl1, ctrl2 = model(x, anchors_norm_tensor)
+                curve = reconstruct_curve(anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                if self.curve_norm_by_isc and self.curve_output_normalized:
+                    curve = denormalize_curves_by_isc(curve, anchors_raw_tensor[:, 0])
+            return self.v_grid, curve.cpu().numpy(), None
+
         if return_uncertainty:
             was_training = model.training
             model.train()
@@ -282,6 +352,8 @@ class ScalarPredictor:
             for _ in range(n_samples):
                 anchors, ctrl1, ctrl2 = model(x)
                 curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                if self.curve_norm_by_isc and self.curve_output_normalized:
+                    curve = denormalize_curves_by_isc(curve, anchors[:, 0])
                 curves.append(curve)
             stacked = torch.stack(curves)
             mean = stacked.mean(dim=0)
@@ -293,6 +365,8 @@ class ScalarPredictor:
         with torch.no_grad():
             anchors, ctrl1, ctrl2 = model(x)
             curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+            if self.curve_norm_by_isc and self.curve_output_normalized:
+                curve = denormalize_curves_by_isc(curve, anchors[:, 0])
         return self.v_grid, curve.cpu().numpy(), None
 
     def predict_from_dataframe(self, df) -> PredictionResult:

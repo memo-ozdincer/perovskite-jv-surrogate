@@ -230,6 +230,7 @@ class ScalarPredictorPipeline:
         self.physics_feature_mask = None
         self.physics_feature_names = get_feature_names()
         self.v_grid = V_GRID.astype(np.float32)
+        self.curve_norm_by_isc = False
 
         # Initialize structured logger
         self.logger = TrainingLogger(self.output_dir, verbose=verbose_logging)
@@ -719,6 +720,7 @@ class ScalarPredictorPipeline:
         print("\nNormalizing curves by Isc...")
         isc_train, curves_train_norm = normalize_curves_by_isc(train['curves'])
         isc_val, curves_val_norm = normalize_curves_by_isc(val['curves'])
+        self.curve_norm_by_isc = True
 
         # Validate normalization
         validate_curve_normalization(train['curves'], curves_train_norm, isc_train, n_samples=3)
@@ -903,6 +905,8 @@ class ScalarPredictorPipeline:
         self.models['ctrl_point_model'] = model
         # For backward compatibility, also store config info
         self.models['ctrl_point_config'] = config
+        # Expose as curve_model for evaluation/saving flows
+        self.models['curve_model'] = model
 
         print(f"\nCurve model training complete. Best val loss: {best_val:.6f}")
 
@@ -1579,9 +1583,13 @@ class ScalarPredictorPipeline:
         self.models['jmpp_lgbm'].save(str(models_dir / 'jmpp_lgbm.txt'))
         self.models['ff_lgbm'].save(str(models_dir / 'ff_lgbm.txt'))
 
-        # Save curve model (if trained)
+        # Save curve model (legacy unified split-spline)
         if 'curve_model' in self.models:
             torch.save(self.models['curve_model'].state_dict(), models_dir / 'curve_model.pt')
+
+        # Save control-point-only curve model
+        if 'ctrl_point_model' in self.models:
+            torch.save(self.models['ctrl_point_model'].state_dict(), models_dir / 'ctrl_point_model.pt')
 
         # Save CVAE (if trained)
         if 'cvae' in self.models:
@@ -1598,7 +1606,18 @@ class ScalarPredictorPipeline:
         if 'curve_model' in self.models:
             configs['curve_model'] = {
                 **(self.models['curve_model'].config.__dict__ if hasattr(self.models['curve_model'], 'config') else {}),
-                'v_grid': self.v_grid.tolist()
+                'v_grid': self.v_grid.tolist(),
+                'type': 'unified_split_spline'
+            }
+
+        if 'ctrl_point_model' in self.models:
+            ctrl_config = self.models.get('ctrl_point_config')
+            configs['curve_model'] = {
+                **(ctrl_config.__dict__ if ctrl_config is not None else {}),
+                'v_grid': self.v_grid.tolist(),
+                'type': 'control_point_net',
+                'curve_norm_by_isc': bool(self.curve_norm_by_isc),
+                'curve_output_normalized': False
             }
 
         if 'cvae' in self.models:
@@ -1627,6 +1646,10 @@ class ScalarPredictorPipeline:
                 normalization_params['cvae_feature_std'] = self.cvae_feature_std.tolist()
             if self.physics_feature_mask is not None:
                 normalization_params['physics_feature_mask'] = np.where(self.physics_feature_mask)[0].tolist()
+            if hasattr(self, 'anchor_mean') and hasattr(self, 'anchor_std'):
+                normalization_params['anchor_mean'] = self.anchor_mean.tolist()
+                normalization_params['anchor_std'] = self.anchor_std.tolist()
+            normalization_params['curve_norm_by_isc'] = bool(self.curve_norm_by_isc)
             with open(models_dir / 'normalization.json', 'w') as f:
                 json.dump(normalization_params, f)
             print("Saved normalization parameters for Voc NN (features + targets)")
