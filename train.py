@@ -117,7 +117,9 @@ class CurveLoss(nn.Module):
     Simple weighted curve reconstruction loss.
     Used when anchors come from pretrained models (no anchor loss needed).
 
-    Computes MSE on the full curve with optional region weighting.
+    Computes RELATIVE MSE on the full curve with optional region weighting.
+    Using relative error ensures the loss is scale-invariant and compatible
+    with continuity loss (which operates in normalized space).
     """
 
     def __init__(self, mpp_weight: float = 2.0):
@@ -135,8 +137,14 @@ class CurveLoss(nn.Module):
         if torch.isnan(pred_curve).any():
             pred_curve = torch.where(torch.isnan(pred_curve), true_curve, pred_curve)
 
-        # Per-point squared error
-        sq_err = (pred_curve - true_curve) ** 2
+        # Use RELATIVE squared error: ((pred - true) / (true + eps))^2
+        # This normalizes by the magnitude of J, making loss scale-invariant
+        # and keeping it in O(1) range compatible with continuity loss
+        eps = 1e-6
+        # Use Jsc (first point) as reference scale for each curve
+        jsc_ref = true_curve[:, 0:1].clamp(min=eps)  # (N, 1)
+        rel_err = (pred_curve - true_curve) / jsc_ref
+        sq_err = rel_err ** 2
 
         # Weight points near MPP more heavily (this is where the "knee" is)
         vmpp_expanded = vmpp.unsqueeze(1)
@@ -146,14 +154,18 @@ class CurveLoss(nn.Module):
         weighted_sq_err = sq_err * mpp_weights
         loss = weighted_sq_err.mean()
 
-        # Region-wise metrics for logging
+        # Region-wise metrics for logging (in relative terms)
         mask_r1 = v_grid.unsqueeze(0) <= vmpp_expanded
         mse_r1 = (sq_err * mask_r1).sum() / mask_r1.sum().clamp(min=1)
         mse_r2 = (sq_err * ~mask_r1).sum() / (~mask_r1).sum().clamp(min=1)
 
+        # Also compute absolute MSE for reference
+        abs_sq_err = (pred_curve - true_curve) ** 2
+
         metrics = {
             'loss_curve': loss.item(),
-            'mse_full': sq_err.mean().item(),
+            'mse_full_rel': sq_err.mean().item(),
+            'mse_full_abs': abs_sq_err.mean().item(),
             'mse_region1': mse_r1.item(),
             'mse_region2': mse_r2.item(),
         }
