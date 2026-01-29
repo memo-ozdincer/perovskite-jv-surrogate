@@ -36,7 +36,7 @@ from models.vmpp_lgbm import (
     build_vmpp_model, build_jmpp_model, build_ff_model
 )
 from models.reconstruction import (
-    reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_jsc,
+    reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_isc,
     continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
 )
 from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
@@ -907,20 +907,25 @@ class ScalarPredictorPipeline:
                 # Model predicts only control points (anchors provided as input)
                 ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
 
-                # Reconstruct curve directly in normalized space and scale by predicted Jsc
+                # CRITICAL FIX: Reconstruct using TRUE Isc for normalization
+                # This ensures reconstruction is in the SAME normalized space as target curves
+                # (targets are normalized by true Isc, not predicted Jsc)
                 pred_curve_norm = reconstruct_curve_normalized(
-                    batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
+                    batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True,
+                    isc=batch_isc  # Use TRUE Isc, not predicted Jsc
                 )
-                pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_anchors_raw[:, 0])
+                # Denormalize using TRUE Isc for absolute curve (for metrics only)
+                pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_isc)
 
                 # Compute loss in normalized space (better gradients)
                 loss, metrics = curve_loss_fn(
                     pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
                 )
 
-                # Add continuity penalty in normalized space
-                anchors_norm = normalize_anchors_by_jsc(batch_anchors_raw)
-                cont_loss = continuity_loss(anchors_norm, ctrl1, ctrl2, v_grid, j_end=-1.0)
+                # Add continuity penalty in normalized space using TRUE Isc
+                cont_loss = continuity_loss(
+                    batch_anchors_raw, ctrl1, ctrl2, v_grid, j_end=-1.0, isc=batch_isc
+                )
                 loss = loss + continuity_weight * cont_loss
 
                 if torch.isnan(loss):
@@ -954,10 +959,12 @@ class ScalarPredictorPipeline:
                     batch_isc = batch_isc.to(self.device)
 
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
+                    # Use TRUE Isc for reconstruction normalization (matches target space)
                     pred_curve_norm = reconstruct_curve_normalized(
-                        batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
+                        batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True,
+                        isc=batch_isc
                     )
-                    pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_anchors_raw[:, 0])
+                    pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_isc)
 
                     val_loss, _ = curve_loss_fn(
                         pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
@@ -1053,7 +1060,79 @@ class ScalarPredictorPipeline:
         jmpp_pred = self.models['jmpp_lgbm'].predict(
             split['X_raw'], split['X_physics'], jsc_pred, vmpp_pred
         )
-        return np.stack([jsc_pred, voc_pred, vmpp_pred, jmpp_pred], axis=1).astype(np.float32)
+        anchors = np.stack([jsc_pred, voc_pred, vmpp_pred, jmpp_pred], axis=1).astype(np.float32)
+
+        # Validate and fix anchor constraints
+        anchors = self._validate_and_fix_anchors(anchors, split)
+        return anchors
+
+    def _validate_and_fix_anchors(
+        self,
+        anchors: np.ndarray,
+        split: dict,
+        warn_threshold: float = 0.3,
+        fix_constraints: bool = True
+    ) -> np.ndarray:
+        """
+        Validate predicted anchors and fix physics constraint violations.
+
+        Args:
+            anchors: (N, 4) [Jsc, Voc, Vmpp, Jmpp] predicted anchors
+            split: Data split dict containing targets for comparison
+            warn_threshold: Relative error threshold for warnings (default 30%)
+            fix_constraints: Whether to fix constraint violations
+
+        Returns:
+            anchors: (N, 4) Validated/fixed anchors
+        """
+        jsc, voc, vmpp, jmpp = anchors[:, 0], anchors[:, 1], anchors[:, 2], anchors[:, 3]
+        targets = split.get('targets', {})
+
+        # Check for large deviations from true values (for diagnostics)
+        if targets:
+            jsc_true = targets.get('Jsc')
+            voc_true = targets.get('Voc')
+            if jsc_true is not None:
+                jsc_err = np.abs(jsc - jsc_true) / (np.abs(jsc_true) + 1e-6)
+                n_jsc_bad = (jsc_err > warn_threshold).sum()
+                if n_jsc_bad > 0:
+                    print(f"  [Anchor Warning] {n_jsc_bad} samples have Jsc error > {warn_threshold*100:.0f}%")
+            if voc_true is not None:
+                voc_err = np.abs(voc - voc_true) / (np.abs(voc_true) + 1e-6)
+                n_voc_bad = (voc_err > warn_threshold).sum()
+                if n_voc_bad > 0:
+                    print(f"  [Anchor Warning] {n_voc_bad} samples have Voc error > {warn_threshold*100:.0f}%")
+
+        if not fix_constraints:
+            return anchors
+
+        # Fix physics constraints
+        anchors = anchors.copy()
+        eps = 1e-4
+
+        # 1. Jsc must be positive
+        anchors[:, 0] = np.maximum(anchors[:, 0], eps)
+
+        # 2. Voc must be positive and reasonable (< 2V for solar cells)
+        anchors[:, 1] = np.clip(anchors[:, 1], eps, 2.0)
+
+        # 3. Vmpp must be in (0, Voc)
+        anchors[:, 2] = np.clip(anchors[:, 2], eps, anchors[:, 1] - eps)
+
+        # 4. Jmpp must be in (0, Jsc)
+        anchors[:, 3] = np.clip(anchors[:, 3], eps, anchors[:, 0] - eps)
+
+        # Count how many were fixed
+        n_fixed = (
+            (jsc <= eps).sum() +
+            (voc <= eps).sum() + (voc > 2.0).sum() +
+            (vmpp <= eps).sum() + (vmpp >= voc).sum() +
+            (jmpp <= eps).sum() + (jmpp >= jsc).sum()
+        )
+        if n_fixed > 0:
+            print(f"  [Anchor Fix] Fixed {n_fixed} constraint violations")
+
+        return anchors
 
     def _predict_scalar_chain(self, split: dict) -> dict:
         """Predict scalar chain outputs using only model predictions."""
@@ -1278,6 +1357,12 @@ class ScalarPredictorPipeline:
         curves_true = split['curves'].astype(np.float32)
         curves_true_norm = split.get('curves_norm')
 
+        # Get TRUE Isc values for proper normalization
+        isc_values = split.get('isc_values')
+        if isc_values is None:
+            # Fallback: use curves[:, 0] as Isc
+            isc_values = curves_true[:, 0]
+
         # Normalize anchors if using new model
         if use_ctrl_point_model:
             anchors_pred = self._predict_curve_anchors(split)
@@ -1287,14 +1372,16 @@ class ScalarPredictorPipeline:
                 torch.from_numpy(anchors_norm.astype(np.float32)),
                 torch.from_numpy(anchors_pred),
                 torch.from_numpy(curves_true),
-                torch.from_numpy(anchors_true)
+                torch.from_numpy(anchors_true),
+                torch.from_numpy(isc_values.astype(np.float32))  # Add TRUE Isc
             )
             model = self.models['ctrl_point_model']
         else:
             ds = torch.utils.data.TensorDataset(
                 torch.from_numpy(X_full),
                 torch.from_numpy(anchors_true),
-                torch.from_numpy(curves_true)
+                torch.from_numpy(curves_true),
+                torch.from_numpy(isc_values.astype(np.float32))  # Add TRUE Isc
             )
             model = self.models['curve_model']
 
@@ -1333,25 +1420,28 @@ class ScalarPredictorPipeline:
         with torch.no_grad():
             for batch in loader:
                 if use_ctrl_point_model:
-                    batch_x, batch_anchors_norm, batch_anchors, batch_curves, batch_anchors_true = batch
+                    batch_x, batch_anchors_norm, batch_anchors, batch_curves, batch_anchors_true, batch_isc = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors_norm = batch_anchors_norm.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
                     batch_anchors_true = batch_anchors_true.to(self.device)
+                    batch_isc = batch_isc.to(self.device)
 
-                    # ControlPointNet: uses predicted anchors
+                    # ControlPointNet: uses predicted anchors but TRUE Isc for normalization
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
                     pred_anchors = batch_anchors  # Predicted anchors
                     pred_curve_norm = reconstruct_curve_normalized(
-                        batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True
+                        batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True,
+                        isc=batch_isc  # Use TRUE Isc for proper normalization
                     )
-                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, pred_anchors[:, 0])
+                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_isc)
                 else:
-                    batch_x, batch_anchors, batch_curves = batch
+                    batch_x, batch_anchors, batch_curves, batch_isc = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
+                    batch_isc = batch_isc.to(self.device)
                     batch_anchors_true = batch_anchors
 
                     # Legacy model: predicts anchors + control points
@@ -1400,13 +1490,16 @@ class ScalarPredictorPipeline:
                 # Compare PCHIP vs piecewise-linear interpolation using the SAME knots.
                 # Evaluate in normalized space when using ControlPointNet.
                 if use_ctrl_point_model:
-                    anchors_norm = normalize_anchors_by_jsc(pred_anchors)
+                    # Use TRUE Isc for normalization to match reconstruction
+                    anchors_norm = normalize_anchors_by_isc(pred_anchors, batch_isc)
                     v1k, j1k, v2k, j2k = build_knots(anchors_norm, ctrl1, ctrl2, j_end=-1.0)
                     j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
                     j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
-                    mask = v_grid.unsqueeze(0) <= anchors_norm[:, 2].unsqueeze(1)
+                    # Use absolute Vmpp for masking (it's not normalized)
+                    mask = v_grid.unsqueeze(0) <= pred_anchors[:, 2].unsqueeze(1)
                     curve_lin = torch.where(mask, j1_lin, j2_lin)
-                    v_oc_1d = anchors_norm[:, 1]
+                    # Use absolute Voc for clamping (it's not normalized)
+                    v_oc_1d = pred_anchors[:, 1]
                     curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), -1.0, curve_lin)
                     delta = pred_curve_norm - curve_lin
                 else:

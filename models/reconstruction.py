@@ -330,24 +330,79 @@ def normalize_anchors_by_jsc(anchors: torch.Tensor, eps: float = 1e-6) -> torch.
     return anchors_norm
 
 
+def normalize_anchors_by_isc(
+    anchors: torch.Tensor,
+    isc: torch.Tensor,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Normalize anchors using TRUE Isc values (not predicted Jsc).
+
+    This ensures reconstruction is in the SAME normalized space as the target curves
+    which are normalized by their true Isc values.
+
+    Args:
+        anchors: (N, 4) [Jsc, Voc, Vmpp, Jmpp] - predicted or true anchors
+        isc: (N,) TRUE Isc values from raw curves (curves[:, 0])
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        anchors_norm: (N, 4) with J values in [-1, 1] space matching target normalization
+            - Jsc_norm = 2*(Jsc/Isc) - 1  (NOT forced to 1.0!)
+            - Jmpp_norm = 2*(Jmpp/Isc) - 1
+            - Voc, Vmpp unchanged (absolute V space)
+    """
+    anchors_norm = anchors.clone()
+    isc_safe = isc.clamp(min=eps)
+
+    # Normalize J values by TRUE Isc to match target curve normalization
+    # Formula: J_norm = 2*(J/Isc) - 1, same as target curves
+    anchors_norm[:, 0] = 2.0 * (anchors[:, 0] / isc_safe) - 1.0  # Jsc_norm
+    anchors_norm[:, 3] = 2.0 * (anchors[:, 3] / isc_safe) - 1.0  # Jmpp_norm
+
+    return anchors_norm
+
+
 def reconstruct_curve_normalized(
     anchors: torch.Tensor,
     ctrl1: torch.Tensor,
     ctrl2: torch.Tensor,
     v_grid: torch.Tensor,
     clamp_voc: bool = True,
-    validate_monotonicity: bool = False
+    validate_monotonicity: bool = False,
+    isc: torch.Tensor = None
 ) -> torch.Tensor:
     """
-    Reconstruct curve in normalized space ([-1, 1]) using Jsc normalization.
+    Reconstruct curve in normalized space ([-1, 1]).
+
+    Args:
+        anchors: (N, 4) [Jsc, Voc, Vmpp, Jmpp] in absolute units
+        ctrl1, ctrl2: Control points from network (sigmoid outputs in [0, 1])
+        v_grid: Voltage grid for evaluation
+        clamp_voc: Whether to clamp curve beyond Voc
+        validate_monotonicity: Whether to check knot monotonicity
+        isc: (N,) TRUE Isc values. If provided, normalizes anchors by Isc
+             to match target curve normalization. If None, uses Jsc (legacy behavior).
+
+    Returns:
+        j_curve: (N, M) reconstructed curve in [-1, 1] normalized space
     """
-    anchors_norm = normalize_anchors_by_jsc(anchors)
+    if isc is not None:
+        # Use TRUE Isc for normalization - matches target curve space
+        anchors_norm = normalize_anchors_by_isc(anchors, isc)
+        # j_end should also be normalized: J=0 at Voc -> norm = 2*(0/Isc) - 1 = -1
+        j_end = -1.0
+    else:
+        # Legacy: normalize by predicted Jsc (may not match target space!)
+        anchors_norm = normalize_anchors_by_jsc(anchors)
+        j_end = -1.0
+
     return reconstruct_curve(
         anchors_norm,
         ctrl1,
         ctrl2,
         v_grid,
-        j_end=-1.0,
+        j_end=j_end,
         clamp_voc=clamp_voc,
         validate_monotonicity=validate_monotonicity
     )
@@ -359,17 +414,39 @@ def continuity_loss(
     ctrl2: torch.Tensor,
     v_grid: torch.Tensor,
     j_end: float = 0.0,
-    validate_monotonicity: bool = False
+    validate_monotonicity: bool = False,
+    isc: torch.Tensor = None
 ) -> torch.Tensor:
     """
     Enforce C1 continuity at Vmpp using finite differences.
+
+    Args:
+        anchors: (N, 4) [Jsc, Voc, Vmpp, Jmpp] in absolute units
+        ctrl1, ctrl2: Control points from network
+        v_grid: Voltage grid
+        j_end: J value at Voc (use -1.0 for normalized space)
+        validate_monotonicity: Whether to check knot monotonicity
+        isc: (N,) TRUE Isc values. If provided, normalizes anchors by Isc.
+             If None, uses anchors directly (assumes already normalized or legacy mode).
+
+    Returns:
+        Continuity loss (value match + derivative match at Vmpp)
     """
+    # Normalize anchors if isc provided
+    if isc is not None:
+        anchors_for_knots = normalize_anchors_by_isc(anchors, isc)
+        j_end_use = -1.0  # Normalized space: J=0 -> -1
+    else:
+        anchors_for_knots = anchors
+        j_end_use = j_end
+
     v1_knots, j1_knots, v2_knots, j2_knots = build_knots(
-        anchors, ctrl1, ctrl2, j_end=j_end, validate_monotonicity=validate_monotonicity
+        anchors_for_knots, ctrl1, ctrl2, j_end=j_end_use, validate_monotonicity=validate_monotonicity
     )
     j1 = pchip_interpolate_batch(v1_knots, j1_knots, v_grid)
     j2 = pchip_interpolate_batch(v2_knots, j2_knots, v_grid)
 
+    # Use original Vmpp (absolute V) for finding index - this is correct
     v_mpp = anchors[:, 2]
     idx = torch.argmin((v_grid.unsqueeze(0) - v_mpp.unsqueeze(1)).abs(), dim=1)
 
