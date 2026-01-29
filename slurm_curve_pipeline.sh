@@ -84,7 +84,7 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION - Adjust these for your run
 # ============================================================================
-HPO_TRIALS_NN=5           # Number of HPO trials for NN and curve model
+HPO_TRIALS_NN=50           # Number of HPO trials for NN and curve model
 HPO_TRIALS_LGBM=100        # Number of HPO trials for LGBM
 HPO_TIMEOUT=7200           # 2 hours per model
 CONTINUITY_WEIGHT=0.1      # Try 0.1, 0.5, or 1.0 (may be overridden by curve HPO)

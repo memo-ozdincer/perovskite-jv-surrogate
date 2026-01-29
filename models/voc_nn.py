@@ -213,22 +213,29 @@ class VocNN(nn.Module):
         Forward pass that also computes input-output Jacobian.
         Used for Jacobian regularization during training.
         """
-        x.requires_grad_(True)
+        # IMPORTANT:
+        # - Jacobian regularization is extremely sensitive under AMP (fp16/bf16).
+        # - If computed in reduced precision, it can overflow -> inf grads.
+        # - With GradScaler, that silently SKIPS optimizer steps -> "instant plateau".
+        # We therefore compute the Jacobian in fp32 and normalize by input_dim.
+        x = x.float().requires_grad_(True)
         out = self.forward(x, voc_ceiling)
+        out_for_grad = out.float()
 
         # Compute Jacobian norm efficiently via vector-Jacobian product
         # We use random projection for efficiency (Hutchinson's trace estimator)
-        v = torch.randn_like(out)
+        v = torch.randn_like(out_for_grad)
         jacobian_vector = torch.autograd.grad(
-            outputs=out,
+            outputs=out_for_grad,
             inputs=x,
             grad_outputs=v,
             create_graph=True,
             retain_graph=True
         )[0]
 
-        # Frobenius norm approximation
-        jacobian_norm = (jacobian_vector ** 2).sum(dim=1).mean()
+        # Frobenius norm approximation (mean-square per input dimension)
+        # Scaling makes jacobian_weight less brittle across feature counts.
+        jacobian_norm = (jacobian_vector ** 2).sum(dim=1).mean() / max(1, x.shape[1])
 
         return out, jacobian_norm
 
@@ -313,9 +320,21 @@ class VocTrainer:
             self.optimizer.zero_grad()
 
             if self.config.use_amp:
+                # AMP-safe training:
+                # - forward (prediction) in autocast for speed
+                # - Jacobian in full precision to avoid overflow / skipped steps
                 with autocast():
-                    pred, jac_norm = self.model.forward_with_jacobian(x, ceiling)
-                    loss, loss_dict = self.compute_loss(pred, target, jac_norm, ceiling)
+                    pred = self.model(x, ceiling)
+
+                with autocast(enabled=False):
+                    _, jac_norm = self.model.forward_with_jacobian(x, ceiling)
+
+                loss, loss_dict = self.compute_loss(
+                    pred.float(),
+                    target.float(),
+                    jac_norm,
+                    ceiling.float() if ceiling is not None else None
+                )
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)

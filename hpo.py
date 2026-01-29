@@ -57,17 +57,24 @@ def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
     - Lower learning rates for stability
     """
 
-    # Architecture - SIMPLE and focused
-    # 2-3 layers are usually sufficient for this problem
+    # Architecture - keep it simple, but allow enough capacity
+    # (older best runs often needed a wider first layer).
     n_layers = trial.suggest_int('n_layers', 2, 3)
     hidden_dims = []
     for i in range(n_layers):
         # Tapering architecture: wide -> narrow
         if i == 0:
-            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256])
+            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256, 512])
         else:
-            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128])
+            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256])
         hidden_dims.append(dim)
+
+    # Jacobian regularization is helpful, but can easily over-regularize.
+    # Also: log-uniform cannot include 0, so we use a categorical grid.
+    jacobian_weight = trial.suggest_categorical(
+        'jacobian_weight',
+        [0.0, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
+    )
 
     return VocNNConfig(
         input_dim=input_dim,
@@ -81,9 +88,9 @@ def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
         # Activation - GELU is usually best for smooth problems
         activation=trial.suggest_categorical('activation', ['gelu', 'silu']),
 
-        # Physics losses - narrower range, known to work
-        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-3, 0.05, log=True),
-        physics_weight=trial.suggest_float('physics_weight', 0.01, 0.1, log=True),
+        # Regularizers
+        jacobian_weight=jacobian_weight,
+        physics_weight=trial.suggest_float('physics_weight', 0.0, 0.1),
 
         # Optimizer - LOWER learning rates for stability
         lr=trial.suggest_float('lr', 5e-5, 1e-3, log=True),
