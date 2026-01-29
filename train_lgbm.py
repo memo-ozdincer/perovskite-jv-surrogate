@@ -304,6 +304,16 @@ class ScalarPredictorPipeline:
             val['targets']['Jsc'], val['jsc_ceiling']
         )
 
+        # Precompute upstream predictions for downstream training (no oracle inputs)
+        voc_pred_train = self._predict_voc(train)
+        voc_pred_val = self._predict_voc(val)
+        jsc_pred_train = self.models['jsc_lgbm'].predict(
+            train['X_raw'], train['X_physics'], train['jsc_ceiling']
+        )
+        jsc_pred_val = self.models['jsc_lgbm'].predict(
+            val['X_raw'], val['X_physics'], val['jsc_ceiling']
+        )
+
         # 3. Train Vmpp LGBM
         print("\n--- Training Vmpp LGBM ---")
         vmpp_config = configs.get('vmpp_lgbm', VmppLGBMConfig())
@@ -311,9 +321,16 @@ class ScalarPredictorPipeline:
 
         self.models['vmpp_lgbm'].fit(
             train['X_raw'], train['X_physics'],
-            train['targets']['Vmpp'], train['targets']['Voc'],
+            train['targets']['Vmpp'], voc_pred_train,
             val['X_raw'], val['X_physics'],
-            val['targets']['Vmpp'], val['targets']['Voc']
+            val['targets']['Vmpp'], voc_pred_val
+        )
+
+        vmpp_pred_train = self.models['vmpp_lgbm'].predict(
+            train['X_raw'], train['X_physics'], voc_pred_train
+        )
+        vmpp_pred_val = self.models['vmpp_lgbm'].predict(
+            val['X_raw'], val['X_physics'], voc_pred_val
         )
 
         # 4. Train Jmpp LGBM
@@ -322,9 +339,9 @@ class ScalarPredictorPipeline:
 
         self.models['jmpp_lgbm'].fit(
             train['X_raw'], train['X_physics'],
-            train['targets']['Jmpp'], train['targets']['Jsc'], train['targets']['Vmpp'],
+            train['targets']['Jmpp'], jsc_pred_train, vmpp_pred_train,
             val['X_raw'], val['X_physics'],
-            val['targets']['Jmpp'], val['targets']['Jsc'], val['targets']['Vmpp']
+            val['targets']['Jmpp'], jsc_pred_val, vmpp_pred_val
         )
 
         # 5. Train FF LGBM
@@ -334,9 +351,9 @@ class ScalarPredictorPipeline:
 
         self.models['ff_lgbm'].fit(
             train['X_raw'], train['X_physics'],
-            train['targets']['FF'], train['targets']['Voc'], train['targets']['Jsc'],
+            train['targets']['FF'], voc_pred_train, jsc_pred_train,
             val['X_raw'], val['X_physics'],
-            val['targets']['FF'], val['targets']['Voc'], val['targets']['Jsc']
+            val['targets']['FF'], voc_pred_val, jsc_pred_val
         )
 
         # 6. Train unified curve model (optional)
@@ -443,18 +460,46 @@ class ScalarPredictorPipeline:
 
         self.models['curve_model'] = model
 
+    def _predict_voc(self, split: dict) -> np.ndarray:
+        """Predict Voc using the trained Voc NN (no oracle inputs)."""
+        X_full = np.hstack([split['X_raw'], split['X_physics']])
+        X_norm = (X_full - self.voc_feature_mean) / self.voc_feature_std
+        X_tensor = torch.from_numpy(X_norm).float().to(self.device)
+        self.models['voc_nn'].eval()
+        with torch.no_grad():
+            voc_pred_norm = self.models['voc_nn'](X_tensor).cpu().numpy()
+        return voc_pred_norm * self.voc_target_std + self.voc_target_mean
+
+    def _predict_scalar_chain(self, split: dict) -> dict:
+        """Predict scalar chain outputs using only model predictions."""
+        voc_pred = self._predict_voc(split)
+        jsc_pred = self.models['jsc_lgbm'].predict(
+            split['X_raw'], split['X_physics'], split['jsc_ceiling']
+        )
+        vmpp_pred = self.models['vmpp_lgbm'].predict(
+            split['X_raw'], split['X_physics'], voc_pred
+        )
+        jmpp_pred = self.models['jmpp_lgbm'].predict(
+            split['X_raw'], split['X_physics'], jsc_pred, vmpp_pred
+        )
+        ff_pred = self.models['ff_lgbm'].predict(
+            split['X_raw'], split['X_physics'], voc_pred, jsc_pred
+        )
+        return {
+            'Voc': voc_pred,
+            'Jsc': jsc_pred,
+            'Vmpp': vmpp_pred,
+            'Jmpp': jmpp_pred,
+            'FF': ff_pred
+        }
+
     def _predict_curve_anchors(self, split: dict) -> np.ndarray:
         """Predict anchors using LGBM heads (and Voc NN) for curve training."""
         X_raw = split['X_raw']
         X_physics = split['X_physics']
 
         # Voc NN (normalized)
-        X_full = np.hstack([X_raw, X_physics])
-        X_norm = (X_full - self.voc_feature_mean) / self.voc_feature_std
-        X_tensor = torch.from_numpy(X_norm).float().to(self.device)
-        with torch.no_grad():
-            voc_pred_norm = self.models['voc_nn'](X_tensor).cpu().numpy()
-        voc_pred = voc_pred_norm * self.voc_target_std + self.voc_target_mean
+        voc_pred = self._predict_voc(split)
 
         # LGBM anchors
         jsc_pred = self.models['jsc_lgbm'].predict(X_raw, X_physics, split['jsc_ceiling'])
@@ -528,47 +573,16 @@ class ScalarPredictorPipeline:
 
         test = self.splits['test']
 
-        # Voc NN - CRITICAL: Normalize inputs AND denormalize outputs
-        X_test_full = np.hstack([test['X_raw'], test['X_physics']])
-        X_test_normalized = (X_test_full - self.voc_feature_mean) / self.voc_feature_std
-        X_test_tensor = torch.from_numpy(X_test_normalized).float().to(self.device)
+        preds = self._predict_scalar_chain(test)
 
-        self.models['voc_nn'].eval()
-        with torch.no_grad():
-            voc_pred_normalized = self.models['voc_nn'](X_test_tensor).cpu().numpy()
-            # Denormalize predictions back to original scale
-            voc_pred = voc_pred_normalized * self.voc_target_std + self.voc_target_mean
-
-        self.metrics['voc'] = self._compute_metrics(test['targets']['Voc'], voc_pred, 'Voc')
-
-        # Jsc LGBM
-        jsc_pred = self.models['jsc_lgbm'].predict(
-            test['X_raw'], test['X_physics'], test['jsc_ceiling']
-        )
-        self.metrics['jsc'] = self._compute_metrics(test['targets']['Jsc'], jsc_pred, 'Jsc')
-
-        # Vmpp LGBM (using true Voc for evaluation)
-        vmpp_pred = self.models['vmpp_lgbm'].predict(
-            test['X_raw'], test['X_physics'], test['targets']['Voc']
-        )
-        self.metrics['vmpp'] = self._compute_metrics(test['targets']['Vmpp'], vmpp_pred, 'Vmpp')
-
-        # Jmpp LGBM
-        jmpp_pred = self.models['jmpp_lgbm'].predict(
-            test['X_raw'], test['X_physics'],
-            test['targets']['Jsc'], test['targets']['Vmpp']
-        )
-        self.metrics['jmpp'] = self._compute_metrics(test['targets']['Jmpp'], jmpp_pred, 'Jmpp')
-
-        # FF LGBM
-        ff_pred = self.models['ff_lgbm'].predict(
-            test['X_raw'], test['X_physics'],
-            test['targets']['Voc'], test['targets']['Jsc']
-        )
-        self.metrics['ff'] = self._compute_metrics(test['targets']['FF'], ff_pred, 'FF')
+        self.metrics['voc'] = self._compute_metrics(test['targets']['Voc'], preds['Voc'], 'Voc')
+        self.metrics['jsc'] = self._compute_metrics(test['targets']['Jsc'], preds['Jsc'], 'Jsc')
+        self.metrics['vmpp'] = self._compute_metrics(test['targets']['Vmpp'], preds['Vmpp'], 'Vmpp')
+        self.metrics['jmpp'] = self._compute_metrics(test['targets']['Jmpp'], preds['Jmpp'], 'Jmpp')
+        self.metrics['ff'] = self._compute_metrics(test['targets']['FF'], preds['FF'], 'FF')
 
         # Derived: PCE and Pmpp
-        pmpp_pred = vmpp_pred * jmpp_pred
+        pmpp_pred = preds['Vmpp'] * preds['Jmpp']
         pce_pred = pmpp_pred / 1000.0  # Assuming 1000 W/m² illumination
 
         self.metrics['pmpp'] = self._compute_metrics(test['targets']['Pmpp'], pmpp_pred, 'Pmpp')

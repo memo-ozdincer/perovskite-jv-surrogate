@@ -485,16 +485,9 @@ class ScalarPredictorPipeline:
         X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
         X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
 
-        anchors_train = np.stack(
-            [train['targets']['Jsc'], train['targets']['Voc'],
-             train['targets']['Vmpp'], train['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
-        anchors_val = np.stack(
-            [val['targets']['Jsc'], val['targets']['Voc'],
-             val['targets']['Vmpp'], val['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
+        # Predict anchors using trained scalar models (no oracle inputs)
+        anchors_train = self._predict_curve_anchors(train)
+        anchors_val = self._predict_curve_anchors(val)
 
         curves_train = train['curves'].astype(np.float32)
         curves_val = val['curves'].astype(np.float32)
@@ -625,6 +618,16 @@ class ScalarPredictorPipeline:
             val['targets']['Jsc'], val['jsc_ceiling']
         )
 
+        # Precompute upstream predictions for downstream training (no oracle inputs)
+        voc_pred_train = self._predict_voc(train)
+        voc_pred_val = self._predict_voc(val)
+        jsc_pred_train = self.models['jsc_lgbm'].predict(
+            train['X_raw'], train['X_physics'], train['jsc_ceiling']
+        )
+        jsc_pred_val = self.models['jsc_lgbm'].predict(
+            val['X_raw'], val['X_physics'], val['jsc_ceiling']
+        )
+
         # 3. Train Vmpp LGBM
         print("\n--- Training Vmpp LGBM ---")
         vmpp_config = configs.get('vmpp_lgbm', VmppLGBMConfig())
@@ -632,9 +635,16 @@ class ScalarPredictorPipeline:
 
         self.models['vmpp_lgbm'].fit(
             train['X_raw'], train['X_physics'],
-            train['targets']['Vmpp'], train['targets']['Voc'],
+            train['targets']['Vmpp'], voc_pred_train,
             val['X_raw'], val['X_physics'],
-            val['targets']['Vmpp'], val['targets']['Voc']
+            val['targets']['Vmpp'], voc_pred_val
+        )
+
+        vmpp_pred_train = self.models['vmpp_lgbm'].predict(
+            train['X_raw'], train['X_physics'], voc_pred_train
+        )
+        vmpp_pred_val = self.models['vmpp_lgbm'].predict(
+            val['X_raw'], val['X_physics'], voc_pred_val
         )
 
         # 4. Train Jmpp LGBM
@@ -643,9 +653,9 @@ class ScalarPredictorPipeline:
 
         self.models['jmpp_lgbm'].fit(
             train['X_raw'], train['X_physics'],
-            train['targets']['Jmpp'], train['targets']['Jsc'], train['targets']['Vmpp'],
+            train['targets']['Jmpp'], jsc_pred_train, vmpp_pred_train,
             val['X_raw'], val['X_physics'],
-            val['targets']['Jmpp'], val['targets']['Jsc'], val['targets']['Vmpp']
+            val['targets']['Jmpp'], jsc_pred_val, vmpp_pred_val
         )
 
         # 5. Train FF LGBM
@@ -655,14 +665,16 @@ class ScalarPredictorPipeline:
 
         self.models['ff_lgbm'].fit(
             train['X_raw'], train['X_physics'],
-            train['targets']['FF'], train['targets']['Voc'], train['targets']['Jsc'],
+            train['targets']['FF'], voc_pred_train, jsc_pred_train,
             val['X_raw'], val['X_physics'],
-            val['targets']['FF'], val['targets']['Voc'], val['targets']['Jsc']
+            val['targets']['FF'], voc_pred_val, jsc_pred_val
         )
 
         # 6. Train unified curve model (optional)
         if self.run_curve_model:
             print("\n--- Training Unified Split-Spline Curve Model ---")
+            if self.run_curve_hpo:
+                self.run_curve_hyperparameter_optimization()
             self.train_curve_model()
 
         # 7. Train CVAE baseline (optional)
@@ -700,17 +712,9 @@ class ScalarPredictorPipeline:
         X_train_norm = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
         X_val_norm = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
 
-        # Get TRUE anchors (ground truth for training)
-        anchors_train = np.stack(
-            [train['targets']['Jsc'], train['targets']['Voc'],
-             train['targets']['Vmpp'], train['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
-        anchors_val = np.stack(
-            [val['targets']['Jsc'], val['targets']['Voc'],
-             val['targets']['Vmpp'], val['targets']['Jmpp']],
-            axis=1
-        ).astype(np.float32)
+        # Predict anchors using scalar models (no oracle inputs)
+        anchors_train = self._predict_curve_anchors(train)
+        anchors_val = self._predict_curve_anchors(val)
 
         # ISSUE 3 FIX: Normalize anchors for stable training
         self.anchor_mean = anchors_train.mean(axis=0, keepdims=True)
@@ -803,7 +807,7 @@ class ScalarPredictorPipeline:
         print(f"  ctrl_points: {config.ctrl_points}")
         print(f"  hidden_dims: {config.hidden_dims}")
         print(f"  continuity_weight: {continuity_weight}")
-        print(f"  Using ground truth anchors (not re-learning them)")
+        print(f"  Using predicted anchors (no oracle inputs)")
 
         for epoch in range(150):
             model.train()
@@ -821,7 +825,7 @@ class ScalarPredictorPipeline:
                 # Model predicts only control points (anchors provided as input)
                 ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
 
-                # Reconstruct curve using TRUE anchors (returns absolute scale)
+                # Reconstruct curve using predicted anchors (returns absolute scale)
                 pred_curve_abs = reconstruct_curve(
                     batch_anchors_raw, ctrl1, ctrl2, v_grid,
                     clamp_voc=True
@@ -936,6 +940,53 @@ class ScalarPredictorPipeline:
         self.models['curve_model'] = model
 
         print(f"\nCurve model training complete. Best val loss: {best_val:.6f}")
+
+    def _predict_voc(self, split: dict) -> np.ndarray:
+        """Predict Voc using the trained Voc NN (no oracle inputs)."""
+        X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
+        X_norm = (X_full - self.voc_feature_mean) / self.voc_feature_std
+        X_tensor = torch.from_numpy(X_norm).float().to(self.device)
+        self.models['voc_nn'].eval()
+        with torch.no_grad():
+            voc_pred_norm = self.models['voc_nn'](X_tensor).cpu().numpy()
+        return voc_pred_norm * self.voc_target_std + self.voc_target_mean
+
+    def _predict_curve_anchors(self, split: dict) -> np.ndarray:
+        """Predict anchors (Jsc, Voc, Vmpp, Jmpp) using trained models."""
+        voc_pred = self._predict_voc(split)
+        jsc_pred = self.models['jsc_lgbm'].predict(
+            split['X_raw'], split['X_physics'], split['jsc_ceiling']
+        )
+        vmpp_pred = self.models['vmpp_lgbm'].predict(
+            split['X_raw'], split['X_physics'], voc_pred
+        )
+        jmpp_pred = self.models['jmpp_lgbm'].predict(
+            split['X_raw'], split['X_physics'], jsc_pred, vmpp_pred
+        )
+        return np.stack([jsc_pred, voc_pred, vmpp_pred, jmpp_pred], axis=1).astype(np.float32)
+
+    def _predict_scalar_chain(self, split: dict) -> dict:
+        """Predict scalar chain outputs using only model predictions."""
+        voc_pred = self._predict_voc(split)
+        jsc_pred = self.models['jsc_lgbm'].predict(
+            split['X_raw'], split['X_physics'], split['jsc_ceiling']
+        )
+        vmpp_pred = self.models['vmpp_lgbm'].predict(
+            split['X_raw'], split['X_physics'], voc_pred
+        )
+        jmpp_pred = self.models['jmpp_lgbm'].predict(
+            split['X_raw'], split['X_physics'], jsc_pred, vmpp_pred
+        )
+        ff_pred = self.models['ff_lgbm'].predict(
+            split['X_raw'], split['X_physics'], voc_pred, jsc_pred
+        )
+        return {
+            'Voc': voc_pred,
+            'Jsc': jsc_pred,
+            'Vmpp': vmpp_pred,
+            'Jmpp': jmpp_pred,
+            'FF': ff_pred
+        }
 
     def train_curve_model_legacy(self):
         """
@@ -1113,7 +1164,7 @@ class ScalarPredictorPipeline:
         Evaluate the curve model with full + region-wise metrics.
 
         Supports both:
-        - New ControlPointNet (uses true anchors, only predicts control points)
+        - New ControlPointNet (uses predicted anchors, only predicts control points)
         - Legacy UnifiedSplitSplineNet (predicts anchors + control points)
         """
         import time
@@ -1138,12 +1189,14 @@ class ScalarPredictorPipeline:
 
         # Normalize anchors if using new model
         if use_ctrl_point_model:
-            anchors_norm = (anchors_true - self.anchor_mean) / self.anchor_std
+            anchors_pred = self._predict_curve_anchors(split)
+            anchors_norm = (anchors_pred - self.anchor_mean) / self.anchor_std
             ds = torch.utils.data.TensorDataset(
                 torch.from_numpy(X_full),
                 torch.from_numpy(anchors_norm.astype(np.float32)),
-                torch.from_numpy(anchors_true),
-                torch.from_numpy(curves_true)
+                torch.from_numpy(anchors_pred),
+                torch.from_numpy(curves_true),
+                torch.from_numpy(anchors_true)
             )
             model = self.models['ctrl_point_model']
         else:
@@ -1186,21 +1239,23 @@ class ScalarPredictorPipeline:
         with torch.no_grad():
             for batch in loader:
                 if use_ctrl_point_model:
-                    batch_x, batch_anchors_norm, batch_anchors, batch_curves = batch
+                    batch_x, batch_anchors_norm, batch_anchors, batch_curves, batch_anchors_true = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors_norm = batch_anchors_norm.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
+                    batch_anchors_true = batch_anchors_true.to(self.device)
 
-                    # ControlPointNet: uses true anchors
+                    # ControlPointNet: uses predicted anchors
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
-                    pred_anchors = batch_anchors  # True anchors, no prediction
+                    pred_anchors = batch_anchors  # Predicted anchors
                     pred_curve = reconstruct_curve(batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
                 else:
                     batch_x, batch_anchors, batch_curves = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
+                    batch_anchors_true = batch_anchors
 
                     # Legacy model: predicts anchors + control points
                     pred_anchors, ctrl1, ctrl2 = model(batch_x)
@@ -1218,17 +1273,17 @@ class ScalarPredictorPipeline:
                 sum_sq_r2 += (err * mask_r2).sum().item()
                 sum_cnt_r2 += mask_r2.sum().item()
 
-                # Anchor MAE (only meaningful for legacy model)
-                jsc_mae += torch.abs(pred_anchors[:, 0] - batch_anchors[:, 0]).sum().item()
-                voc_mae += torch.abs(pred_anchors[:, 1] - batch_anchors[:, 1]).sum().item()
-                vmpp_mae += torch.abs(pred_anchors[:, 2] - batch_anchors[:, 2]).sum().item()
-                jmpp_mae += torch.abs(pred_anchors[:, 3] - batch_anchors[:, 3]).sum().item()
+                # Anchor MAE (always vs true anchors for reporting)
+                jsc_mae += torch.abs(pred_anchors[:, 0] - batch_anchors_true[:, 0]).sum().item()
+                voc_mae += torch.abs(pred_anchors[:, 1] - batch_anchors_true[:, 1]).sum().item()
+                vmpp_mae += torch.abs(pred_anchors[:, 2] - batch_anchors_true[:, 2]).sum().item()
+                jmpp_mae += torch.abs(pred_anchors[:, 3] - batch_anchors_true[:, 3]).sum().item()
 
                 ff_pred = (pred_anchors[:, 2] * pred_anchors[:, 3]) / (
                     pred_anchors[:, 0] * pred_anchors[:, 1] + 1e-12
                 )
-                ff_true = (batch_anchors[:, 2] * batch_anchors[:, 3]) / (
-                    batch_anchors[:, 0] * batch_anchors[:, 1] + 1e-12
+                ff_true = (batch_anchors_true[:, 2] * batch_anchors_true[:, 3]) / (
+                    batch_anchors_true[:, 0] * batch_anchors_true[:, 1] + 1e-12
                 )
                 ff_mape_sum += torch.abs((ff_pred - ff_true) / (ff_true + 1e-12)).sum().item()
                 ff_cnt += ff_true.numel()
@@ -1533,47 +1588,17 @@ class ScalarPredictorPipeline:
 
         test = self.splits['test']
 
-        # Voc NN - CRITICAL: Normalize inputs AND denormalize outputs
-        X_test_full = np.hstack([test['X_raw'], test['X_physics']])
-        X_test_normalized = (X_test_full - self.voc_feature_mean) / self.voc_feature_std
-        X_test_tensor = torch.from_numpy(X_test_normalized).float().to(self.device)
+        # Predict scalar chain (no oracle inputs)
+        preds = self._predict_scalar_chain(test)
 
-        self.models['voc_nn'].eval()
-        with torch.no_grad():
-            voc_pred_normalized = self.models['voc_nn'](X_test_tensor).cpu().numpy()
-            # Denormalize predictions back to original scale
-            voc_pred = voc_pred_normalized * self.voc_target_std + self.voc_target_mean
-
-        self.metrics['voc'] = self._compute_metrics(test['targets']['Voc'], voc_pred, 'Voc')
-
-        # Jsc LGBM
-        jsc_pred = self.models['jsc_lgbm'].predict(
-            test['X_raw'], test['X_physics'], test['jsc_ceiling']
-        )
-        self.metrics['jsc'] = self._compute_metrics(test['targets']['Jsc'], jsc_pred, 'Jsc')
-
-        # Vmpp LGBM (using true Voc for evaluation)
-        vmpp_pred = self.models['vmpp_lgbm'].predict(
-            test['X_raw'], test['X_physics'], test['targets']['Voc']
-        )
-        self.metrics['vmpp'] = self._compute_metrics(test['targets']['Vmpp'], vmpp_pred, 'Vmpp')
-
-        # Jmpp LGBM
-        jmpp_pred = self.models['jmpp_lgbm'].predict(
-            test['X_raw'], test['X_physics'],
-            test['targets']['Jsc'], test['targets']['Vmpp']
-        )
-        self.metrics['jmpp'] = self._compute_metrics(test['targets']['Jmpp'], jmpp_pred, 'Jmpp')
-
-        # FF LGBM
-        ff_pred = self.models['ff_lgbm'].predict(
-            test['X_raw'], test['X_physics'],
-            test['targets']['Voc'], test['targets']['Jsc']
-        )
-        self.metrics['ff'] = self._compute_metrics(test['targets']['FF'], ff_pred, 'FF')
+        self.metrics['voc'] = self._compute_metrics(test['targets']['Voc'], preds['Voc'], 'Voc')
+        self.metrics['jsc'] = self._compute_metrics(test['targets']['Jsc'], preds['Jsc'], 'Jsc')
+        self.metrics['vmpp'] = self._compute_metrics(test['targets']['Vmpp'], preds['Vmpp'], 'Vmpp')
+        self.metrics['jmpp'] = self._compute_metrics(test['targets']['Jmpp'], preds['Jmpp'], 'Jmpp')
+        self.metrics['ff'] = self._compute_metrics(test['targets']['FF'], preds['FF'], 'FF')
 
         # Derived: PCE and Pmpp
-        pmpp_pred = vmpp_pred * jmpp_pred
+        pmpp_pred = preds['Vmpp'] * preds['Jmpp']
         pce_pred = pmpp_pred / 1000.0  # Assuming 1000 W/m² illumination
 
         self.metrics['pmpp'] = self._compute_metrics(test['targets']['Pmpp'], pmpp_pred, 'Pmpp')
@@ -1727,10 +1752,6 @@ class ScalarPredictorPipeline:
             self.best_configs = get_best_configs_from_study(loaded_results)
         elif self.run_hpo:
             self.run_hyperparameter_optimization()
-
-        # Run curve HPO if requested (can be done with or without scalar HPO)
-        if self.run_curve_hpo and self.run_curve_model:
-            self.run_curve_hyperparameter_optimization()
 
         self.train_final_models()
         self.evaluate()

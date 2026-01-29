@@ -651,6 +651,57 @@ def run_full_hpo(
     X_train_full = (X_train_full - feature_mean) / feature_std
     X_val_full = (X_val_full - feature_mean) / feature_std
 
+    def _train_voc_for_features(
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        config: VocNNConfig,
+        device: torch.device
+    ) -> tuple[VocNN, float, float]:
+        """Train a VocNN model to generate predicted Voc features."""
+        # Normalize targets
+        y_mean = y_train.mean()
+        y_std = y_train.std() + 1e-8
+        y_train_norm = (y_train - y_mean) / y_std
+        y_val_norm = (y_val - y_mean) / y_std
+
+        model = VocNN(config).to(device)
+        trainer = VocTrainer(model, config, device)
+
+        train_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_train).float(),
+            torch.from_numpy(y_train_norm).float()
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val).float(),
+            torch.from_numpy(y_val_norm).float()
+        )
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=4096, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_ds, batch_size=4096)
+        trainer.fit(train_loader, val_loader)
+
+        return model, y_mean, y_std
+
+    def _train_jsc_for_features(
+        X_raw: np.ndarray,
+        X_physics: np.ndarray,
+        y_jsc: np.ndarray,
+        jsc_ceiling: np.ndarray,
+        X_raw_val: np.ndarray,
+        X_physics_val: np.ndarray,
+        y_jsc_val: np.ndarray,
+        jsc_ceiling_val: np.ndarray,
+        config: JscLGBMConfig
+    ) -> JscLGBM:
+        """Train a Jsc LGBM model to generate predicted Jsc features."""
+        model = JscLGBM(config)
+        model.fit(
+            X_raw, X_physics, y_jsc, jsc_ceiling,
+            X_raw_val, X_physics_val, y_jsc_val, jsc_ceiling_val
+        )
+        return model
+
     # 1. Voc Neural Network
     print("=" * 60)
     print("HPO: Voc Neural Network")
@@ -662,6 +713,21 @@ def run_full_hpo(
         device
     )
     results['voc_nn'] = {'params': voc_params, 'study': voc_study}
+
+    # Train Voc NN to generate predicted Voc for downstream HPO
+    voc_config = get_best_configs_from_study({'voc_nn': {'params': voc_params}})['voc_nn']
+    voc_config.input_dim = X_train_full.shape[1]
+    voc_model, voc_mean, voc_std = _train_voc_for_features(
+        X_train_full, targets_train['Voc'],
+        X_val_full, targets_val['Voc'],
+        voc_config, device
+    )
+    voc_model.eval()
+    with torch.no_grad():
+        voc_pred_train = voc_model(torch.from_numpy(X_train_full).float().to(device)).cpu().numpy()
+        voc_pred_val = voc_model(torch.from_numpy(X_val_full).float().to(device)).cpu().numpy()
+    voc_pred_train = voc_pred_train * voc_std + voc_mean
+    voc_pred_val = voc_pred_val * voc_std + voc_mean
 
     # 2. Jsc LGBM (with ceiling feature)
     print("=" * 60)
@@ -685,28 +751,48 @@ def run_full_hpo(
     )
     results['jsc_lgbm'] = {'params': jsc_params, 'study': jsc_study}
 
+    # Train Jsc LGBM to generate predicted Jsc for downstream HPO
+    jsc_config = get_best_configs_from_study({'jsc_lgbm': {'params': jsc_params}})['jsc_lgbm']
+    jsc_model = _train_jsc_for_features(
+        X_train_raw, X_train_physics, targets_train['Jsc'], jsc_ceiling_train,
+        X_val_raw, X_val_physics, targets_val['Jsc'], jsc_ceiling_val,
+        jsc_config
+    )
+    jsc_pred_train = jsc_model.predict(X_train_raw, X_train_physics, jsc_ceiling_train)
+    jsc_pred_val = jsc_model.predict(X_val_raw, X_val_physics, jsc_ceiling_val)
+
     # 3. Vmpp LGBM (with Voc feature)
     print("=" * 60)
     print("HPO: Vmpp LGBM")
     print("=" * 60)
     X_train_vmpp = np.hstack([
         X_train_raw, X_train_physics,
-        targets_train['Voc'].reshape(-1, 1),
-        np.log10(targets_train['Voc'] + 1e-30).reshape(-1, 1)
+        voc_pred_train.reshape(-1, 1),
+        np.log10(voc_pred_train + 1e-30).reshape(-1, 1)
     ])
     X_val_vmpp = np.hstack([
         X_val_raw, X_val_physics,
-        targets_val['Voc'].reshape(-1, 1),
-        np.log10(targets_val['Voc'] + 1e-30).reshape(-1, 1)
+        voc_pred_val.reshape(-1, 1),
+        np.log10(voc_pred_val + 1e-30).reshape(-1, 1)
     ])
     # Target as Vmpp/Voc ratio
-    y_train_vmpp = targets_train['Vmpp'] / (targets_train['Voc'] + 1e-30)
-    y_val_vmpp = targets_val['Vmpp'] / (targets_val['Voc'] + 1e-30)
+    y_train_vmpp = targets_train['Vmpp'] / (voc_pred_train + 1e-30)
+    y_val_vmpp = targets_val['Vmpp'] / (voc_pred_val + 1e-30)
 
     vmpp_params, vmpp_study = engine.optimize_lgbm(
         X_train_vmpp, y_train_vmpp, X_val_vmpp, y_val_vmpp, 'vmpp'
     )
     results['vmpp_lgbm'] = {'params': vmpp_params, 'study': vmpp_study}
+
+    # Train Vmpp LGBM to generate predicted Vmpp for downstream HPO
+    vmpp_config = get_best_configs_from_study({'vmpp_lgbm': {'params': vmpp_params}})['vmpp_lgbm']
+    vmpp_model = VmppLGBM(vmpp_config)
+    vmpp_model.fit(
+        X_train_raw, X_train_physics, targets_train['Vmpp'], voc_pred_train,
+        X_val_raw, X_val_physics, targets_val['Vmpp'], voc_pred_val
+    )
+    vmpp_pred_train = vmpp_model.predict(X_train_raw, X_train_physics, voc_pred_train)
+    vmpp_pred_val = vmpp_model.predict(X_val_raw, X_val_physics, voc_pred_val)
 
     # 4. Jmpp LGBM (was missing - now added)
     print("=" * 60)
@@ -714,21 +800,21 @@ def run_full_hpo(
     print("=" * 60)
     X_train_jmpp = np.hstack([
         X_train_raw, X_train_physics,
-        targets_train['Jsc'].reshape(-1, 1),
-        np.log10(np.abs(targets_train['Jsc']) + 1e-30).reshape(-1, 1),
-        targets_train['Vmpp'].reshape(-1, 1),
-        np.log10(targets_train['Vmpp'] + 1e-30).reshape(-1, 1)
+        jsc_pred_train.reshape(-1, 1),
+        np.log10(np.abs(jsc_pred_train) + 1e-30).reshape(-1, 1),
+        vmpp_pred_train.reshape(-1, 1),
+        np.log10(vmpp_pred_train + 1e-30).reshape(-1, 1)
     ])
     X_val_jmpp = np.hstack([
         X_val_raw, X_val_physics,
-        targets_val['Jsc'].reshape(-1, 1),
-        np.log10(np.abs(targets_val['Jsc']) + 1e-30).reshape(-1, 1),
-        targets_val['Vmpp'].reshape(-1, 1),
-        np.log10(targets_val['Vmpp'] + 1e-30).reshape(-1, 1)
+        jsc_pred_val.reshape(-1, 1),
+        np.log10(np.abs(jsc_pred_val) + 1e-30).reshape(-1, 1),
+        vmpp_pred_val.reshape(-1, 1),
+        np.log10(vmpp_pred_val + 1e-30).reshape(-1, 1)
     ])
     # Target as Jmpp/Jsc ratio
-    y_train_jmpp = targets_train['Jmpp'] / (targets_train['Jsc'] + 1e-30)
-    y_val_jmpp = targets_val['Jmpp'] / (targets_val['Jsc'] + 1e-30)
+    y_train_jmpp = targets_train['Jmpp'] / (jsc_pred_train + 1e-30)
+    y_val_jmpp = targets_val['Jmpp'] / (jsc_pred_val + 1e-30)
 
     jmpp_params, jmpp_study = engine.optimize_lgbm(
         X_train_jmpp, y_train_jmpp, X_val_jmpp, y_val_jmpp, 'jmpp'
@@ -741,15 +827,15 @@ def run_full_hpo(
     print("=" * 60)
     X_train_ff = np.hstack([
         X_train_raw, X_train_physics,
-        targets_train['Voc'].reshape(-1, 1),
-        targets_train['Jsc'].reshape(-1, 1),
-        (targets_train['Voc'] * targets_train['Jsc']).reshape(-1, 1)
+        voc_pred_train.reshape(-1, 1),
+        jsc_pred_train.reshape(-1, 1),
+        (voc_pred_train * jsc_pred_train).reshape(-1, 1)
     ])
     X_val_ff = np.hstack([
         X_val_raw, X_val_physics,
-        targets_val['Voc'].reshape(-1, 1),
-        targets_val['Jsc'].reshape(-1, 1),
-        (targets_val['Voc'] * targets_val['Jsc']).reshape(-1, 1)
+        voc_pred_val.reshape(-1, 1),
+        jsc_pred_val.reshape(-1, 1),
+        (voc_pred_val * jsc_pred_val).reshape(-1, 1)
     ])
 
     ff_params, ff_study = engine.optimize_lgbm(
