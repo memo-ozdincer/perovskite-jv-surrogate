@@ -1,32 +1,35 @@
 #!/bin/bash
-#SBATCH --job-name=curve_no_hpo
+#SBATCH --job-name=direct_curve
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --gpus-per-node=1
 #SBATCH --time=4:00:00
-#SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_no_hpo_%j.out
-#SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_no_hpo_%j.err
+#SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_no_hpo_%j.out
+#SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_no_hpo_%j.err
 #SBATCH --account=aip-aspuru
 
 # ============================================================================
-# Curve Reconstruction Pipeline - NO HPO (Fast Training)
+# Direct Curve Pipeline - NO HPO (Fast Training)
 # ============================================================================
-# Uses default/fixed hyperparameters for quick iteration:
-# - Skips HPO entirely (saves ~3 hours)
-# - Uses sensible default configs
-# - Good for debugging and testing changes
+# Uses simplified direct curve model (no Vmpp split):
+# - Takes Jsc from pretrained LGBM (accurate: R²=0.965)
+# - Predicts Voc + control points jointly
+# - Single-region PCHIP interpolation
+# - Avoids cascade errors from Voc/Vmpp/Jmpp predictions
+#
+# NO HPO - uses default hyperparameters for fast iteration
 # ============================================================================
 #
 # USAGE:
-#   sbatch slurm_no_hpo.sh
+#   sbatch slurm_direct_no_hpo.sh
 #
-#   # Or with direct curve model:
-#   sbatch slurm_no_hpo.sh --direct-curve
+#   # Or load HPO results from a previous run:
+#   sbatch slurm_direct_no_hpo.sh /path/to/hpo_results.json
 #
 # OUTPUT:
-#   - $OUT_DIR/metrics.json     : Final test metrics
-#   - $OUT_DIR/models/          : Trained model weights
+#   - $OUT_DIR/metrics.json         : Final test metrics
+#   - $OUT_DIR/models/              : Trained model weights
 #
 # ============================================================================
 
@@ -66,35 +69,32 @@ echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if tor
 echo ""
 
 # Output directory with timestamp
-OUT_DIR="$WORK_DIR/outputs_no_hpo_$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$WORK_DIR/outputs_direct_$(date +%Y%m%d_%H%M%S)"
 
-echo "Running NO-HPO Pipeline..."
+echo "Running Direct Curve Pipeline (NO HPO)..."
 echo "Output directory: $OUT_DIR"
 
 # ============================================================================
-# CONFIGURATION - Fixed hyperparameters (no HPO)
+# CONFIGURATION
 # ============================================================================
-CONTINUITY_WEIGHT=0.1
 CTRL_POINTS=6
 
-# Parse command line arguments
-USE_DIRECT_CURVE=""
-for arg in "$@"; do
-    if [ "$arg" == "--direct-curve" ]; then
-        USE_DIRECT_CURVE="--direct-curve"
-        echo "Using DIRECT curve model (no scalar predictor dependencies)"
-    fi
-done
+# Check for HPO file argument
+LOAD_HPO_FLAG=""
+if [ -n "$1" ] && [ -f "$1" ]; then
+    LOAD_HPO_FLAG="--load-hpo \"$1\""
+    echo "Loading HPO results from: $1"
+fi
 
 echo ""
 echo "Configuration (FIXED - no HPO):"
-echo "  CONTINUITY_WEIGHT: $CONTINUITY_WEIGHT"
 echo "  CTRL_POINTS: $CTRL_POINTS"
-echo "  DIRECT_CURVE: ${USE_DIRECT_CURVE:-'(no - using split-spline)'}"
+echo "  MODEL: Direct Curve (no Vmpp split)"
+echo "  LOAD_HPO: ${LOAD_HPO_FLAG:-'(none - using defaults)'}"
 echo ""
 
 # ============================================================================
-# BUILD COMMAND - Skip HPO entirely with --no-hpo flag
+# BUILD COMMAND
 # ============================================================================
 CMD="python train.py \
     --params \"$WORK_DIR/LHS_parameters_m.txt\" \
@@ -102,14 +102,14 @@ CMD="python train.py \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
+    --direct-curve \
     --drop-weak-features \
     --no-hpo \
-    --continuity-weight $CONTINUITY_WEIGHT \
     --ctrl-points $CTRL_POINTS"
 
-# Add direct curve flag if specified
-if [ -n "$USE_DIRECT_CURVE" ]; then
-    CMD="$CMD $USE_DIRECT_CURVE"
+# Add load HPO flag if provided
+if [ -n "$LOAD_HPO_FLAG" ]; then
+    CMD="$CMD $LOAD_HPO_FLAG"
 fi
 
 echo "Running command:"
@@ -122,13 +122,6 @@ eval $CMD
 # ============================================================================
 # OUTPUT FILES
 # ============================================================================
-# The following files will be generated:
-# - $OUT_DIR/training_summary.json    : Overall training summary
-# - $OUT_DIR/multitask_losses.csv     : Per-epoch sigma values
-# - $OUT_DIR/constraint_violations.csv: Per-epoch constraint violations
-# - $OUT_DIR/metrics.json             : Final test metrics
-# - $OUT_DIR/models/                  : Trained model weights
-
 echo ""
 echo "==========================================="
 echo "End time: $(date)"

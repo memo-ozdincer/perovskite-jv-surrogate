@@ -1,32 +1,31 @@
 #!/bin/bash
-#SBATCH --job-name=curve_no_hpo
+#SBATCH --job-name=direct_curve_hpo
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
-#SBATCH --time=4:00:00
-#SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_no_hpo_%j.out
-#SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_no_hpo_%j.err
+#SBATCH --time=20:00:00
+#SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.out
+#SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.err
 #SBATCH --account=aip-aspuru
 
 # ============================================================================
-# Curve Reconstruction Pipeline - NO HPO (Fast Training)
+# Direct Curve Pipeline - WITH HPO
 # ============================================================================
-# Uses default/fixed hyperparameters for quick iteration:
-# - Skips HPO entirely (saves ~3 hours)
-# - Uses sensible default configs
-# - Good for debugging and testing changes
+# Uses simplified direct curve model (no Vmpp split):
+# - Takes Jsc from pretrained LGBM (accurate: R²=0.965)
+# - Predicts Voc + control points jointly
+# - Single-region PCHIP interpolation
+# - Avoids cascade errors from Voc/Vmpp/Jmpp predictions
 # ============================================================================
 #
 # USAGE:
-#   sbatch slurm_no_hpo.sh
-#
-#   # Or with direct curve model:
-#   sbatch slurm_no_hpo.sh --direct-curve
+#   sbatch slurm_direct_hpo.sh
 #
 # OUTPUT:
-#   - $OUT_DIR/metrics.json     : Final test metrics
-#   - $OUT_DIR/models/          : Trained model weights
+#   - $OUT_DIR/hpo_results.json     : HPO results (for scalar models)
+#   - $OUT_DIR/metrics.json         : Final test metrics
+#   - $OUT_DIR/models/              : Trained model weights
 #
 # ============================================================================
 
@@ -66,35 +65,29 @@ echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if tor
 echo ""
 
 # Output directory with timestamp
-OUT_DIR="$WORK_DIR/outputs_no_hpo_$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$WORK_DIR/outputs_direct_hpo_$(date +%Y%m%d_%H%M%S)"
 
-echo "Running NO-HPO Pipeline..."
+echo "Running Direct Curve Pipeline WITH HPO..."
 echo "Output directory: $OUT_DIR"
 
 # ============================================================================
-# CONFIGURATION - Fixed hyperparameters (no HPO)
+# CONFIGURATION
 # ============================================================================
-CONTINUITY_WEIGHT=0.1
-CTRL_POINTS=6
-
-# Parse command line arguments
-USE_DIRECT_CURVE=""
-for arg in "$@"; do
-    if [ "$arg" == "--direct-curve" ]; then
-        USE_DIRECT_CURVE="--direct-curve"
-        echo "Using DIRECT curve model (no scalar predictor dependencies)"
-    fi
-done
+HPO_TRIALS_NN=100         # HPO trials for Jsc LGBM (Voc NN still runs for comparison)
+HPO_TRIALS_LGBM=100       # HPO trials for LightGBM models
+HPO_TIMEOUT=7200          # 2 hours per model
+CTRL_POINTS=6             # Control points for direct curve model
 
 echo ""
-echo "Configuration (FIXED - no HPO):"
-echo "  CONTINUITY_WEIGHT: $CONTINUITY_WEIGHT"
+echo "Configuration:"
+echo "  HPO_TRIALS_NN: $HPO_TRIALS_NN"
+echo "  HPO_TRIALS_LGBM: $HPO_TRIALS_LGBM"
 echo "  CTRL_POINTS: $CTRL_POINTS"
-echo "  DIRECT_CURVE: ${USE_DIRECT_CURVE:-'(no - using split-spline)'}"
+echo "  MODEL: Direct Curve (no Vmpp split)"
 echo ""
 
 # ============================================================================
-# BUILD COMMAND - Skip HPO entirely with --no-hpo flag
+# BUILD COMMAND
 # ============================================================================
 CMD="python train.py \
     --params \"$WORK_DIR/LHS_parameters_m.txt\" \
@@ -102,15 +95,13 @@ CMD="python train.py \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
+    --direct-curve \
     --drop-weak-features \
-    --no-hpo \
-    --continuity-weight $CONTINUITY_WEIGHT \
+    --drop-multicollinear \
+    --hpo-trials-nn $HPO_TRIALS_NN \
+    --hpo-trials-lgbm $HPO_TRIALS_LGBM \
+    --hpo-timeout $HPO_TIMEOUT \
     --ctrl-points $CTRL_POINTS"
-
-# Add direct curve flag if specified
-if [ -n "$USE_DIRECT_CURVE" ]; then
-    CMD="$CMD $USE_DIRECT_CURVE"
-fi
 
 echo "Running command:"
 echo "$CMD"
@@ -122,19 +113,16 @@ eval $CMD
 # ============================================================================
 # OUTPUT FILES
 # ============================================================================
-# The following files will be generated:
-# - $OUT_DIR/training_summary.json    : Overall training summary
-# - $OUT_DIR/multitask_losses.csv     : Per-epoch sigma values
-# - $OUT_DIR/constraint_violations.csv: Per-epoch constraint violations
-# - $OUT_DIR/metrics.json             : Final test metrics
-# - $OUT_DIR/models/                  : Trained model weights
-
 echo ""
 echo "==========================================="
 echo "End time: $(date)"
 echo "==========================================="
 echo ""
 echo "Key output files:"
+echo "  - $OUT_DIR/hpo_results.json (REUSE FOR FUTURE RUNS)"
 echo "  - $OUT_DIR/training_summary.json"
 echo "  - $OUT_DIR/metrics.json"
 echo "  - $OUT_DIR/models/"
+echo ""
+echo "To skip HPO in future runs:"
+echo "  Use slurm_direct_no_hpo.sh or pass --load-hpo $OUT_DIR/hpo_results.json"
