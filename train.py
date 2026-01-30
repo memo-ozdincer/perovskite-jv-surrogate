@@ -39,6 +39,11 @@ from models.reconstruction import (
     reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_jsc,
     continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
 )
+from models.direct_curve import (
+    DirectCurveNetWithJsc, DirectCurveNetWithJscConfig,
+    DirectCurveLossWithJsc, reconstruct_curve_direct_normalized,
+    extract_voc_from_curve
+)
 from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
 from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
 from logging_utils import (
@@ -209,7 +214,8 @@ class ScalarPredictorPipeline:
         ctrl_points: int = 4,  # Reduced from 6 for simplicity
         use_hard_clamp_training: bool = True,  # Fix train-test mismatch
         log_constraint_violations: bool = True,
-        verbose_logging: bool = True
+        verbose_logging: bool = True,
+        use_direct_curve: bool = False  # Use simplified direct curve model
     ):
         self.params_file = params_file
         self.iv_file = iv_file
@@ -236,6 +242,7 @@ class ScalarPredictorPipeline:
         self.use_hard_clamp_training = use_hard_clamp_training
         self.log_constraint_violations = log_constraint_violations
         self.verbose_logging = verbose_logging
+        self.use_direct_curve = use_direct_curve
 
         # Will be populated during pipeline
         self.params_df = None
@@ -762,12 +769,16 @@ class ScalarPredictorPipeline:
             val['targets']['FF'], voc_pred_val, jsc_pred_val
         )
 
-        # 6. Train unified curve model (optional)
+        # 6. Train curve model (optional)
         if self.run_curve_model:
-            print("\n--- Training Unified Split-Spline Curve Model ---")
-            if self.run_curve_hpo:
-                self.run_curve_hyperparameter_optimization()
-            self.train_curve_model()
+            if self.use_direct_curve:
+                print("\n--- Training Direct Curve Model (No Vmpp Split) ---")
+                self.train_direct_curve_model()
+            else:
+                print("\n--- Training Unified Split-Spline Curve Model ---")
+                if self.run_curve_hpo:
+                    self.run_curve_hyperparameter_optimization()
+                self.train_curve_model()
 
         # 7. Train CVAE baseline (optional)
         if self.train_cvae:
@@ -1034,6 +1045,210 @@ class ScalarPredictorPipeline:
         self.models['curve_model'] = model
 
         print(f"\nCurve model training complete. Best val loss: {best_val:.6f}")
+
+    def train_direct_curve_model(self):
+        """
+        Train simplified direct curve model (no Vmpp split).
+
+        KEY DIFFERENCES from split-spline:
+        1. Uses Jsc from pretrained LGBM (accurate: R²=0.965)
+        2. Predicts only Voc and control points (no Vmpp/Jmpp dependence)
+        3. Single-region PCHIP from (0, Jsc) to (Voc, 0)
+        4. Simpler architecture, fewer cascade errors
+        """
+        print("\n" + "=" * 60)
+        print("Training Direct Curve Model (Simplified - No Vmpp Split)")
+        print("=" * 60)
+
+        train = self.splits['train']
+        val = self.splits['val']
+
+        # Prepare inputs
+        X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
+        X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
+
+        # Robust feature scaling
+        self.curve_feature_mean = np.median(X_train_full, axis=0, keepdims=True)
+        q75 = np.percentile(X_train_full, 75, axis=0, keepdims=True)
+        q25 = np.percentile(X_train_full, 25, axis=0, keepdims=True)
+        self.curve_feature_std = (q75 - q25)
+        self.curve_feature_std[self.curve_feature_std < 1e-8] = 1.0
+        X_train_norm = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
+        X_val_norm = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
+
+        # Get Jsc from pretrained LGBM (accurate predictor)
+        jsc_train = self.models['jsc_lgbm'].predict(
+            train['X_raw'], train['X_physics'], train['jsc_ceiling']
+        )
+        jsc_val = self.models['jsc_lgbm'].predict(
+            val['X_raw'], val['X_physics'], val['jsc_ceiling']
+        )
+
+        # Get true Voc for loss computation
+        voc_train = train['targets']['Voc']
+        voc_val = val['targets']['Voc']
+
+        # Extract true Voc from curves (where J crosses zero)
+        v_grid_np = self.v_grid
+        curves_train = train['curves']
+        curves_val = val['curves']
+
+        # Use normalized curves
+        curves_train_norm = train['curves_norm']
+        curves_val_norm = val['curves_norm']
+
+        print(f"\nUsing Jsc from pretrained LGBM")
+        print(f"  Train Jsc range: [{jsc_train.min():.2f}, {jsc_train.max():.2f}]")
+        print(f"  Train Voc range: [{voc_train.min():.4f}, {voc_train.max():.4f}]")
+
+        # Create datasets
+        train_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_train_norm.astype(np.float32)),
+            torch.from_numpy(jsc_train.astype(np.float32)),
+            torch.from_numpy(voc_train.astype(np.float32)),
+            torch.from_numpy(curves_train_norm.astype(np.float32)),
+            torch.from_numpy(curves_train.astype(np.float32))  # Raw for reference
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val_norm.astype(np.float32)),
+            torch.from_numpy(jsc_val.astype(np.float32)),
+            torch.from_numpy(voc_val.astype(np.float32)),
+            torch.from_numpy(curves_val_norm.astype(np.float32)),
+            torch.from_numpy(curves_val.astype(np.float32))
+        )
+
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
+
+        # Create model
+        config = DirectCurveNetWithJscConfig(
+            input_dim=X_train_norm.shape[1],
+            hidden_dims=[256, 128, 64],
+            dropout=0.15,
+            activation='silu',
+            ctrl_points=self.ctrl_points
+        )
+
+        model = DirectCurveNetWithJsc(config).to(self.device)
+        loss_fn = DirectCurveLossWithJsc(weight_voc=5.0, weight_smooth=0.1)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+
+        v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
+
+        best_val = float('inf')
+        best_state = None
+        patience = 20
+        patience_counter = 0
+
+        print(f"\nTraining DirectCurveNetWithJsc with:")
+        print(f"  ctrl_points: {config.ctrl_points}")
+        print(f"  hidden_dims: {config.hidden_dims}")
+        print(f"  Using Jsc from LGBM (no Vmpp/Jmpp)")
+
+        for epoch in range(150):
+            model.train()
+            epoch_losses = []
+
+            for batch_x, batch_jsc, batch_voc, batch_curves_norm, batch_curves_raw in train_loader:
+                batch_x = batch_x.to(self.device)
+                batch_jsc = batch_jsc.to(self.device)
+                batch_voc = batch_voc.to(self.device)
+                batch_curves_norm = batch_curves_norm.to(self.device)
+
+                optimizer.zero_grad()
+
+                # Model predicts Voc and control points
+                pred_voc, ctrl = model(batch_x, batch_jsc)
+
+                # Reconstruct curve in normalized space
+                pred_curve_norm = reconstruct_curve_direct_normalized(
+                    batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
+                )
+
+                # Compute loss in normalized space
+                loss, metrics = loss_fn(
+                    pred_curve_norm, batch_curves_norm,
+                    pred_voc, batch_voc, v_grid
+                )
+
+                if torch.isnan(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_losses.append(loss.item())
+
+            scheduler.step()
+
+            # Validation
+            model.eval()
+            val_losses = []
+            sum_sq_full = 0.0
+            sum_cnt = 0
+            voc_mae_sum = 0.0
+            voc_cnt = 0
+
+            with torch.no_grad():
+                for batch_x, batch_jsc, batch_voc, batch_curves_norm, batch_curves_raw in val_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_jsc = batch_jsc.to(self.device)
+                    batch_voc = batch_voc.to(self.device)
+                    batch_curves_norm = batch_curves_norm.to(self.device)
+                    batch_curves_raw = batch_curves_raw.to(self.device)
+
+                    pred_voc, ctrl = model(batch_x, batch_jsc)
+                    pred_curve_norm = reconstruct_curve_direct_normalized(
+                        batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
+                    )
+
+                    val_loss, _ = loss_fn(
+                        pred_curve_norm, batch_curves_norm,
+                        pred_voc, batch_voc, v_grid
+                    )
+                    val_losses.append(val_loss.item())
+
+                    # Compute MSE in normalized space
+                    err = (pred_curve_norm - batch_curves_norm) ** 2
+                    sum_sq_full += err.sum().item()
+                    sum_cnt += err.numel()
+
+                    # Voc MAE
+                    voc_mae_sum += (pred_voc - batch_voc).abs().sum().item()
+                    voc_cnt += batch_voc.numel()
+
+            avg_val = float(np.mean(val_losses))
+
+            if epoch % 10 == 0:
+                mse_norm = sum_sq_full / max(1, sum_cnt)
+                voc_mae = voc_mae_sum / max(1, voc_cnt)
+                print(
+                    f"Epoch {epoch}: train={np.mean(epoch_losses):.6f}, "
+                    f"val={avg_val:.6f}, mse_norm={mse_norm:.6f}, "
+                    f"voc_mae={voc_mae:.4f}, lr={scheduler.get_last_lr()[0]:.2e}"
+                )
+
+            if avg_val < best_val:
+                best_val = avg_val
+                patience_counter = 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # Store the model
+        self.models['direct_curve_model'] = model
+        self.models['direct_curve_config'] = config
+        self.models['curve_model'] = model  # For compatibility
+
+        print(f"\nDirect curve model training complete. Best val loss: {best_val:.6f}")
 
     def _predict_voc_nn(self, split: dict) -> np.ndarray:
         """Predict Voc using the trained Voc NN."""
@@ -2044,6 +2259,8 @@ def main():
                         help='Disable constraint violation logging')
     parser.add_argument('--quiet', action='store_true',
                         help='Reduce logging verbosity')
+    parser.add_argument('--direct-curve', action='store_true',
+                        help='Use direct curve model (no Vmpp split, predicts Voc + shape)')
 
     args = parser.parse_args()
 
@@ -2076,7 +2293,8 @@ def main():
         ctrl_points=args.ctrl_points,
         use_hard_clamp_training=not args.soft_clamp_training,
         log_constraint_violations=not args.no_constraint_logging,
-        verbose_logging=not args.quiet
+        verbose_logging=not args.quiet,
+        use_direct_curve=args.direct_curve
     )
 
     metrics = pipeline.run()

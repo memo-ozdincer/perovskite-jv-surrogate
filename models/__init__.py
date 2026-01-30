@@ -12,6 +12,13 @@ from .vmpp_lgbm import (
 )
 from .reconstruction import reconstruct_curve, continuity_loss
 from .cvae import ConditionalVAE, cvae_loss
+from .direct_curve import (
+    DirectCurveNet, DirectCurveNetConfig,
+    DirectCurveNetWithJsc, DirectCurveNetWithJscConfig,
+    DirectCurveLoss, DirectCurveLossWithJsc,
+    reconstruct_curve_direct, reconstruct_curve_direct_normalized,
+    extract_voc_from_curve
+)
 
 __all__ = [
     'VocNN', 'VocNNConfig', 'VocTrainer', 'build_voc_model',
@@ -21,4 +28,10 @@ __all__ = [
     'build_vmpp_model', 'build_jmpp_model', 'build_ff_model',
     'reconstruct_curve', 'continuity_loss',
     'ConditionalVAE', 'cvae_loss',
+    # Direct curve prediction (simplified, no Vmpp split)
+    'DirectCurveNet', 'DirectCurveNetConfig',
+    'DirectCurveNetWithJsc', 'DirectCurveNetWithJscConfig',
+    'DirectCurveLoss', 'DirectCurveLossWithJsc',
+    'reconstruct_curve_direct', 'reconstruct_curve_direct_normalized',
+    'extract_voc_from_curve',
 ]
