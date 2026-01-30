@@ -89,10 +89,13 @@ def get_param_transformer(colnames: list[str] = None) -> ColumnTransformer:
         colnames: List of column names (default: from config.COLNAMES)
 
     Returns:
-        ColumnTransformer ready for fitting
+        ColumnTransformer ready for fitting (uses column INDICES for numpy compatibility)
     """
     if colnames is None:
         colnames = list(COLNAMES)
+
+    # Create name-to-index mapping for numpy array compatibility
+    col_to_idx = {name: idx for idx, name in enumerate(colnames)}
 
     # Define parameter groups (matching reference implementation)
     param_defs = {
@@ -110,9 +113,9 @@ def get_param_transformer(colnames: list[str] = None) -> ColumnTransformer:
     transformers = []
 
     for group, cols in param_defs.items():
-        # Get columns that actually exist in the data
-        actual_cols = [c for c in cols if c in colnames]
-        if not actual_cols:
+        # Get column INDICES that actually exist in the data
+        actual_indices = [col_to_idx[c] for c in cols if c in col_to_idx]
+        if not actual_indices:
             continue
 
         # Build pipeline for this group
@@ -125,7 +128,8 @@ def get_param_transformer(colnames: list[str] = None) -> ColumnTransformer:
         if group == 'material_properties':
             steps.insert(0, ('log1p', FunctionTransformer(func=np.log1p, inverse_func=np.expm1)))
 
-        transformers.append((group, Pipeline(steps), actual_cols))
+        # Use indices instead of column names for numpy array compatibility
+        transformers.append((group, Pipeline(steps), actual_indices))
 
     return ColumnTransformer(transformers, remainder='passthrough')
 
