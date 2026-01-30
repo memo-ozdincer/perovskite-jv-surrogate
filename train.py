@@ -1556,18 +1556,20 @@ class ScalarPredictorPipeline:
         """
         Evaluate the curve model with full + region-wise metrics.
 
-        Supports both:
-        - New ControlPointNet (uses predicted anchors, only predicts control points)
+        Supports:
+        - DirectCurveNetWithJsc (uses Jsc from LGBM, predicts Voc + control points)
+        - ControlPointNet (uses predicted anchors, only predicts control points)
         - Legacy UnifiedSplitSplineNet (predicts anchors + control points)
         """
         import time
 
         # Check which model type we have
+        use_direct_curve_model = 'direct_curve_model' in self.models
         use_ctrl_point_model = 'ctrl_point_model' in self.models
-        use_legacy_model = 'curve_model' in self.models
+        use_legacy_model = 'curve_model' in self.models and not use_direct_curve_model
 
-        if not use_ctrl_point_model and not use_legacy_model:
-            raise ValueError("No curve model trained. Run train_curve_model() first.")
+        if not use_direct_curve_model and not use_ctrl_point_model and not use_legacy_model:
+            raise ValueError("No curve model trained. Run train_curve_model() or train_direct_curve_model() first.")
 
         split = self.splits[split_name]
         X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
@@ -1581,8 +1583,29 @@ class ScalarPredictorPipeline:
         curves_true = split['curves'].astype(np.float32)
         curves_true_norm = split.get('curves_norm')
 
-        # Normalize anchors if using new model
-        if use_ctrl_point_model:
+        # Prepare data based on model type
+        if use_direct_curve_model:
+            # DirectCurveNetWithJsc: needs Jsc from LGBM
+            jsc_pred = self.models['jsc_lgbm'].predict(
+                split['X_raw'], split['X_physics'], split['jsc_ceiling']
+            )
+            voc_true = split['targets']['Voc'].astype(np.float32)
+            curves_true_norm = split.get('curves_norm')
+            if curves_true_norm is None:
+                # Fallback: normalize manually
+                isc = curves_true[:, 0:1]
+                isc_safe = np.where(np.abs(isc) < 1e-9, 1.0, isc)
+                curves_true_norm = 2.0 * (curves_true / isc_safe) - 1.0
+            ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(X_full),
+                torch.from_numpy(jsc_pred.astype(np.float32)),
+                torch.from_numpy(voc_true),
+                torch.from_numpy(curves_true),
+                torch.from_numpy(curves_true_norm.astype(np.float32)),
+                torch.from_numpy(anchors_true)
+            )
+            model = self.models['direct_curve_model']
+        elif use_ctrl_point_model:
             anchors_pred = self._predict_curve_anchors(split)
             anchors_norm = (anchors_pred - self.anchor_mean) / self.anchor_std
             ds = torch.utils.data.TensorDataset(
@@ -1635,7 +1658,35 @@ class ScalarPredictorPipeline:
 
         with torch.no_grad():
             for batch in loader:
-                if use_ctrl_point_model:
+                if use_direct_curve_model:
+                    # DirectCurveNetWithJsc: uses Jsc from LGBM, predicts Voc + ctrl
+                    batch_x, batch_jsc, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
+                    batch_x = batch_x.to(self.device)
+                    batch_jsc = batch_jsc.to(self.device)
+                    batch_voc_true = batch_voc_true.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
+                    batch_curves_norm = batch_curves_norm.to(self.device)
+                    batch_anchors_true = batch_anchors_true.to(self.device)
+
+                    # Model predicts Voc and control points
+                    pred_voc, ctrl = model(batch_x, batch_jsc)
+
+                    # Reconstruct curve in normalized space, then denormalize
+                    pred_curve_norm = reconstruct_curve_direct_normalized(
+                        batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
+                    )
+                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_jsc)
+
+                    # Create pseudo-anchors for metric computation
+                    # Vmpp and Jmpp are estimated from the curve
+                    power = pred_curve * v_grid.unsqueeze(0)
+                    mpp_idx = power.argmax(dim=1)
+                    batch_idx = torch.arange(pred_curve.shape[0], device=self.device)
+                    pred_vmpp = v_grid[mpp_idx]
+                    pred_jmpp = pred_curve[batch_idx, mpp_idx]
+                    pred_anchors = torch.stack([batch_jsc, pred_voc, pred_vmpp, pred_jmpp], dim=1)
+
+                elif use_ctrl_point_model:
                     batch_x, batch_anchors_norm, batch_anchors, batch_curves, batch_anchors_true = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors_norm = batch_anchors_norm.to(self.device)

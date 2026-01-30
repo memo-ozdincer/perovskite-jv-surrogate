@@ -73,7 +73,7 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-HPO_TRIALS_NN=100         # HPO trials for Jsc LGBM (Voc NN still runs for comparison)
+HPO_TRIALS_NN=5        # HPO trials for Jsc LGBM (Voc NN still runs for comparison)
 HPO_TRIALS_LGBM=100       # HPO trials for LightGBM models
 HPO_TIMEOUT=7200          # 2 hours per model
 CTRL_POINTS=6             # Control points for direct curve model
