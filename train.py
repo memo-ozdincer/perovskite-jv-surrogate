@@ -1752,8 +1752,17 @@ class ScalarPredictorPipeline:
 
                 # Reconstruction-layer sanity metric:
                 # Compare PCHIP vs piecewise-linear interpolation using the SAME knots.
-                # Evaluate in normalized space when using ControlPointNet.
-                if use_ctrl_point_model:
+                # Skip for direct curve model (no split-spline architecture)
+                if 'pchip_linear_sum_sq' not in locals():
+                    pchip_linear_sum_sq = 0.0
+                    pchip_linear_sum_cnt = 0
+                    pchip_linear_max_abs = 0.0
+
+                if use_direct_curve_model:
+                    # Direct curve uses single-region PCHIP, skip split-spline comparison
+                    pass
+                elif use_ctrl_point_model:
+                    # Evaluate in normalized space when using ControlPointNet
                     anchors_norm = normalize_anchors_by_jsc(pred_anchors)
                     v1k, j1k, v2k, j2k = build_knots(anchors_norm, ctrl1, ctrl2, j_end=-1.0)
                     j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
@@ -1763,7 +1772,11 @@ class ScalarPredictorPipeline:
                     v_oc_1d = anchors_norm[:, 1]
                     curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), -1.0, curve_lin)
                     delta = pred_curve_norm - curve_lin
+                    pchip_linear_sum_sq += (delta ** 2).sum().item()
+                    pchip_linear_sum_cnt += delta.numel()
+                    pchip_linear_max_abs = max(pchip_linear_max_abs, delta.abs().max().item())
                 else:
+                    # Legacy model
                     v1k, j1k, v2k, j2k = build_knots(pred_anchors, ctrl1, ctrl2)
                     j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
                     j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
@@ -1772,13 +1785,9 @@ class ScalarPredictorPipeline:
                     v_oc_1d = pred_anchors[:, 1]
                     curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), torch.zeros_like(curve_lin), curve_lin)
                     delta = pred_curve - curve_lin
-                if 'pchip_linear_sum_sq' not in locals():
-                    pchip_linear_sum_sq = 0.0
-                    pchip_linear_sum_cnt = 0
-                    pchip_linear_max_abs = 0.0
-                pchip_linear_sum_sq += (delta ** 2).sum().item()
-                pchip_linear_sum_cnt += delta.numel()
-                pchip_linear_max_abs = max(pchip_linear_max_abs, delta.abs().max().item())
+                    pchip_linear_sum_sq += (delta ** 2).sum().item()
+                    pchip_linear_sum_cnt += delta.numel()
+                    pchip_linear_max_abs = max(pchip_linear_max_abs, delta.abs().max().item())
 
         elapsed_time = time.time() - start_time
         n_samples = max(1, len(split['X_raw']))
@@ -1802,8 +1811,9 @@ class ScalarPredictorPipeline:
         }
 
         # Log to structured logger for comparison table
+        model_name = 'Direct-Curve' if use_direct_curve_model else 'Split-Spline'
         comparison_metrics = ModelComparisonMetrics(
-            model_name='Split-Spline',
+            model_name=model_name,
             mse_full_curve=results['mse_full_curve'],
             mse_region1=results['mse_region1'],
             mse_region2=results['mse_region2'],
