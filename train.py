@@ -528,7 +528,8 @@ class ScalarPredictorPipeline:
             voc_ceiling_train=train['voc_ceiling'],
             voc_ceiling_val=val['voc_ceiling'],
             device=self.device,
-            hpo_config=self.hpo_config
+            hpo_config=self.hpo_config,
+            direct_curve_only=self.use_direct_curve  # Only run Jsc LGBM HPO for direct curve mode
         )
 
         # Extract best configs

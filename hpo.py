@@ -672,10 +672,15 @@ def run_full_hpo(
     voc_ceiling_train: np.ndarray,
     voc_ceiling_val: np.ndarray,
     device: torch.device,
-    hpo_config: HPOConfig = None
+    hpo_config: HPOConfig = None,
+    direct_curve_only: bool = False
 ) -> dict:
     """
     Run full HPO pipeline for all models.
+
+    Args:
+        direct_curve_only: If True, only run Jsc LGBM HPO (for direct curve model).
+                          Skips Voc NN, Vmpp LGBM, Jmpp LGBM, FF LGBM.
 
     Returns dict with best params for each model.
     """
@@ -748,32 +753,39 @@ def run_full_hpo(
         )
         return model
 
-    # 1. Voc Neural Network
-    print("=" * 60)
-    print("HPO: Voc Neural Network")
-    print("=" * 60)
-    voc_params, voc_study = engine.optimize_voc_nn(
-        X_train_full, targets_train['Voc'],
-        X_val_full, targets_val['Voc'],
-        voc_ceiling_train, voc_ceiling_val,
-        device
-    )
-    results['voc_nn'] = {'params': voc_params, 'study': voc_study}
+    # 1. Voc Neural Network (skip for direct curve mode)
+    if not direct_curve_only:
+        print("=" * 60)
+        print("HPO: Voc Neural Network")
+        print("=" * 60)
+        voc_params, voc_study = engine.optimize_voc_nn(
+            X_train_full, targets_train['Voc'],
+            X_val_full, targets_val['Voc'],
+            voc_ceiling_train, voc_ceiling_val,
+            device
+        )
+        results['voc_nn'] = {'params': voc_params, 'study': voc_study}
 
-    # Train Voc NN to generate predicted Voc for downstream HPO
-    voc_config = get_best_configs_from_study({'voc_nn': {'params': voc_params}})['voc_nn']
-    voc_config.input_dim = X_train_full.shape[1]
-    voc_model, voc_mean, voc_std = _train_voc_for_features(
-        X_train_full, targets_train['Voc'],
-        X_val_full, targets_val['Voc'],
-        voc_config, device
-    )
-    voc_model.eval()
-    with torch.no_grad():
-        voc_pred_train = voc_model(torch.from_numpy(X_train_full).float().to(device)).cpu().numpy()
-        voc_pred_val = voc_model(torch.from_numpy(X_val_full).float().to(device)).cpu().numpy()
-    voc_pred_train = voc_pred_train * voc_std + voc_mean
-    voc_pred_val = voc_pred_val * voc_std + voc_mean
+        # Train Voc NN to generate predicted Voc for downstream HPO
+        voc_config = get_best_configs_from_study({'voc_nn': {'params': voc_params}})['voc_nn']
+        voc_config.input_dim = X_train_full.shape[1]
+        voc_model, voc_mean, voc_std = _train_voc_for_features(
+            X_train_full, targets_train['Voc'],
+            X_val_full, targets_val['Voc'],
+            voc_config, device
+        )
+        voc_model.eval()
+        with torch.no_grad():
+            voc_pred_train = voc_model(torch.from_numpy(X_train_full).float().to(device)).cpu().numpy()
+            voc_pred_val = voc_model(torch.from_numpy(X_val_full).float().to(device)).cpu().numpy()
+        voc_pred_train = voc_pred_train * voc_std + voc_mean
+        voc_pred_val = voc_pred_val * voc_std + voc_mean
+    else:
+        print("=" * 60)
+        print("Skipping Voc NN HPO (direct curve mode)")
+        print("=" * 60)
+        voc_pred_train = None
+        voc_pred_val = None
 
     # 2. Jsc LGBM (with ceiling feature)
     print("=" * 60)
@@ -806,6 +818,13 @@ def run_full_hpo(
     )
     jsc_pred_train = jsc_model.predict(X_train_raw, X_train_physics, jsc_ceiling_train)
     jsc_pred_val = jsc_model.predict(X_val_raw, X_val_physics, jsc_ceiling_val)
+
+    # For direct curve mode, we only need Jsc LGBM - skip the rest
+    if direct_curve_only:
+        print("=" * 60)
+        print("Skipping Vmpp, Jmpp, FF LGBM HPO (direct curve mode)")
+        print("=" * 60)
+        return results
 
     # 3. Vmpp LGBM (with Voc feature)
     print("=" * 60)
