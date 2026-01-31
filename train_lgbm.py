@@ -704,10 +704,10 @@ class ScalarPredictorPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description='Train scalar PV predictors')
-    parser.add_argument('--params', type=str, default=DEFAULT_PARAMS_FILE,
-                        help='Path to parameters file')
-    parser.add_argument('--iv', type=str, default=DEFAULT_IV_FILE,
-                        help='Path to IV curves file')
+    parser.add_argument('--params', type=str, nargs='+', default=[DEFAULT_PARAMS_FILE],
+                        help='Path(s) to parameters file(s) - can specify multiple for concatenation')
+    parser.add_argument('--iv', type=str, nargs='+', default=[DEFAULT_IV_FILE],
+                        help='Path(s) to IV curves file(s) - must match number of params files')
     parser.add_argument('--output', type=str, default='outputs',
                         help='Output directory')
     parser.add_argument('--device', type=str, default='cuda',

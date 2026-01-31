@@ -52,8 +52,8 @@ echo ""
 # Run training with optimized HPO
 # Simplified architecture requires fewer trials
 python train.py \
-    --params $WORK_DIR/LHS_parameters_m.txt \
-    --iv $WORK_DIR/IV_m.txt \
+    --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
+    --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
     --output $WORK_DIR/outputs_$(date +%Y%m%d_%H%M%S) \
     --device cuda \
     --hpo-trials-nn 100 \

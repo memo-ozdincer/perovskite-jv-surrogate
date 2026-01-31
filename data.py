@@ -128,25 +128,63 @@ def clamp_iv_curves_at_voc(iv_curves: torch.Tensor, v_grid: torch.Tensor) -> tor
 # DATA LOADING
 # ============================================================================
 
-def load_raw_data(params_file: str, iv_file: str) -> tuple[pd.DataFrame, np.ndarray]:
-    """Load raw parameter and IV data from disk."""
-    params_df = pd.read_csv(params_file, header=None, names=COLNAMES)
-    iv_data = np.loadtxt(iv_file, delimiter=',', dtype=np.float32)
-
-    # Basic shape validation to prevent downstream crashes
-    if iv_data.ndim == 1:
-        iv_data = iv_data.reshape(1, -1)
-
-    expected_cols = len(V_GRID)
-    if iv_data.shape[1] != expected_cols:
+def load_raw_data(params_file: str | list[str], iv_file: str | list[str]) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Load raw parameter and IV data from disk.
+    
+    Args:
+        params_file: Path to parameters file or list of paths
+        iv_file: Path to IV curves file or list of paths
+        
+    Returns:
+        params_df: Concatenated parameter DataFrame
+        iv_data: Concatenated IV curves array
+    """
+    # Convert single files to lists for uniform handling
+    if isinstance(params_file, str):
+        params_file = [params_file]
+    if isinstance(iv_file, str):
+        iv_file = [iv_file]
+    
+    if len(params_file) != len(iv_file):
         raise ValueError(
-            f"IV data has {iv_data.shape[1]} columns, expected {expected_cols} points matching V_GRID"
+            f"Number of params files ({len(params_file)}) must match IV files ({len(iv_file)})"
         )
-    if len(params_df) != iv_data.shape[0]:
-        raise ValueError(
-            f"Params rows ({len(params_df)}) do not match IV rows ({iv_data.shape[0]})"
-        )
+    
+    # Load all datasets
+    all_params = []
+    all_iv = []
+    
+    for pfile, ifile in zip(params_file, iv_file):
+        print(f"Loading: {pfile} and {ifile}")
+        params_df = pd.read_csv(pfile, header=None, names=COLNAMES)
+        iv_data = np.loadtxt(ifile, delimiter=',', dtype=np.float32)
+        
+        # Basic shape validation
+        if iv_data.ndim == 1:
+            iv_data = iv_data.reshape(1, -1)
+        
+        expected_cols = len(V_GRID)
+        if iv_data.shape[1] != expected_cols:
+            raise ValueError(
+                f"IV data in {ifile} has {iv_data.shape[1]} columns, expected {expected_cols} points matching V_GRID"
+            )
+        if len(params_df) != iv_data.shape[0]:
+            raise ValueError(
+                f"Params rows ({len(params_df)}) in {pfile} do not match IV rows ({iv_data.shape[0]}) in {ifile}"
+            )
+        
+        all_params.append(params_df)
+        all_iv.append(iv_data)
+        print(f"  Loaded {len(params_df)} samples")
+    
+    # Concatenate all datasets
+    params_df = pd.concat(all_params, ignore_index=True)
+    iv_data = np.vstack(all_iv)
+    
+    print(f"Total samples after concatenation: {len(params_df)}")
 
+    # Clamp IV curves at Voc
     v_grid = torch.from_numpy(V_GRID.astype(np.float32))
     iv_tensor = torch.from_numpy(iv_data.astype(np.float32))
     iv_tensor = clamp_iv_curves_at_voc(iv_tensor, v_grid)

@@ -46,6 +46,12 @@ from models.direct_curve import (
     reconstruct_curve_direct_normalized, reconstruct_curve_shape,
     extract_voc_from_curve
 )
+from models.direct_curve_v2 import (
+    DirectCurveNetV2, DirectCurveNetV2Config,
+    DirectCurveNetV2WithVoc,
+    DirectCurveLossV2, DirectCurveLossV2WithVoc,
+    get_params_for_reconstruction, normalize_params_for_loss
+)
 from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
 from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
 from logging_utils import (
@@ -217,7 +223,8 @@ class ScalarPredictorPipeline:
         use_hard_clamp_training: bool = True,  # Fix train-test mismatch
         log_constraint_violations: bool = True,
         verbose_logging: bool = True,
-        use_direct_curve: bool = False  # Use simplified direct curve model
+        use_direct_curve: bool = False,  # Use simplified direct curve model
+        use_direct_curve_v2: bool = False  # Use V2 direct curve (high-accuracy)
     ):
         self.params_file = params_file
         self.iv_file = iv_file
@@ -245,6 +252,7 @@ class ScalarPredictorPipeline:
         self.log_constraint_violations = log_constraint_violations
         self.verbose_logging = verbose_logging
         self.use_direct_curve = use_direct_curve
+        self.use_direct_curve_v2 = use_direct_curve_v2
 
         # Will be populated during pipeline
         self.params_df = None
@@ -774,7 +782,10 @@ class ScalarPredictorPipeline:
 
         # 6. Train curve model (optional)
         if self.run_curve_model:
-            if self.use_direct_curve:
+            if self.use_direct_curve_v2:
+                print("\n--- Training DirectCurveNetV2 (High-Accuracy) ---")
+                self.train_direct_curve_model_v2()
+            elif self.use_direct_curve:
                 print("\n--- Training Direct Curve Model (No Vmpp Split) ---")
                 self.train_direct_curve_model()
             else:
@@ -1263,6 +1274,248 @@ class ScalarPredictorPipeline:
         self.models['direct_curve_uses_shape_net'] = True  # Flag for evaluation
 
         print(f"\nDirect curve model (shape-only) training complete. Best val loss: {best_val:.6f}")
+
+    def train_direct_curve_model_v2(self):
+        """
+        Train DirectCurveNetV2 - High-accuracy direct curve prediction.
+
+        KEY IMPROVEMENTS (inspired by Zbinden et al. 2026 and Toprak 2025):
+        1. Direct 45-point prediction (no control point bottleneck)
+        2. Hard monotonicity via cumulative decrements
+        3. Optional parameter reconstruction loss (latent loss like Zbinden)
+        4. Region-weighted loss with emphasis on knee region
+        5. Endpoint constraints (Jsc at V=0, ~0 at Voc)
+
+        This should achieve >99% accuracy by removing the information
+        bottleneck of control points + PCHIP interpolation.
+        """
+        print("\n" + "=" * 60)
+        print("Training DirectCurveNetV2 (High-Accuracy Direct Prediction)")
+        print("=" * 60)
+
+        train = self.splits['train']
+        val = self.splits['val']
+
+        # Prepare inputs
+        X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
+        X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
+
+        # Robust feature scaling
+        self.curve_feature_mean = np.median(X_train_full, axis=0, keepdims=True)
+        q75 = np.percentile(X_train_full, 75, axis=0, keepdims=True)
+        q25 = np.percentile(X_train_full, 25, axis=0, keepdims=True)
+        self.curve_feature_std = (q75 - q25)
+        self.curve_feature_std[self.curve_feature_std < 1e-8] = 1.0
+        X_train_norm = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
+        X_val_norm = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
+
+        # Get Jsc from pretrained LGBM
+        jsc_train = self.models['jsc_lgbm'].predict(
+            train['X_raw'], train['X_physics'], train['jsc_ceiling']
+        )
+        jsc_val = self.models['jsc_lgbm'].predict(
+            val['X_raw'], val['X_physics'], val['jsc_ceiling']
+        )
+
+        # Get Voc from pretrained model
+        voc_train_pred = self._predict_voc(train)
+        voc_val_pred = self._predict_voc(val)
+
+        # True values for loss computation
+        voc_train_true = train['targets']['Voc']
+        voc_val_true = val['targets']['Voc']
+        jsc_train_true = train['targets']['Jsc']
+        jsc_val_true = val['targets']['Jsc']
+
+        # Raw curves for training (absolute space)
+        curves_train = train['curves'].astype(np.float32)
+        curves_val = val['curves'].astype(np.float32)
+
+        # Extract key parameters for latent loss (like Zbinden)
+        # Indices: [mue_P, muh_P, Gavg, Aug, Brad, SRV_E]
+        param_indices = [3, 4, 15, 16, 17, 30]
+        params_train_raw = train['X_raw_unscaled'][:, param_indices].astype(np.float32)
+        params_val_raw = val['X_raw_unscaled'][:, param_indices].astype(np.float32)
+
+        # Log-normalize parameters for loss
+        params_train_log = np.log10(np.clip(params_train_raw, 1e-30, None))
+        params_val_log = np.log10(np.clip(params_val_raw, 1e-30, None))
+
+        # Normalize to [0, 1] per parameter
+        self.param_min = params_train_log.min(axis=0, keepdims=True)
+        self.param_max = params_train_log.max(axis=0, keepdims=True)
+        params_train_norm = (params_train_log - self.param_min) / (self.param_max - self.param_min + 1e-8)
+        params_val_norm = (params_val_log - self.param_min) / (self.param_max - self.param_min + 1e-8)
+
+        print(f"\nUsing pretrained models for endpoints:")
+        print(f"  Jsc from LGBM - range: [{jsc_train.min():.2f}, {jsc_train.max():.2f}]")
+        print(f"  Voc from {self.voc_model_type.upper()} - range: [{voc_train_pred.min():.4f}, {voc_train_pred.max():.4f}]")
+        print(f"  Parameter reconstruction enabled (6 key physics params)")
+
+        # Create datasets
+        train_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_train_norm.astype(np.float32)),
+            torch.from_numpy(jsc_train.astype(np.float32)),
+            torch.from_numpy(voc_train_pred.astype(np.float32)),
+            torch.from_numpy(voc_train_true.astype(np.float32)),
+            torch.from_numpy(jsc_train_true.astype(np.float32)),
+            torch.from_numpy(curves_train),
+            torch.from_numpy(params_train_norm.astype(np.float32))
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val_norm.astype(np.float32)),
+            torch.from_numpy(jsc_val.astype(np.float32)),
+            torch.from_numpy(voc_val_pred.astype(np.float32)),
+            torch.from_numpy(voc_val_true.astype(np.float32)),
+            torch.from_numpy(jsc_val_true.astype(np.float32)),
+            torch.from_numpy(curves_val),
+            torch.from_numpy(params_val_norm.astype(np.float32))
+        )
+
+        train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
+
+        # Create V2 model with parameter reconstruction
+        config = DirectCurveNetV2Config(
+            input_dim=X_train_norm.shape[1],
+            n_curve_points=len(self.v_grid),
+            hidden_dims=[512, 256, 256],
+            use_conv_decoder=False,  # MLP decoder is more stable
+            dropout=0.1,
+            activation='silu',
+            use_param_reconstruction=True,
+            n_params_to_reconstruct=len(param_indices),
+            param_hidden_dim=128
+        )
+
+        model = DirectCurveNetV2(config).to(self.device)
+        loss_fn = DirectCurveLossV2(
+            lambda_params=0.5,  # Weight for parameter reconstruction (Zbinden's key insight)
+            lambda_smooth=0.1,
+            lambda_endpoint=1.0,
+            knee_weight=2.0,
+            knee_position=0.75
+        )
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=50, T_mult=2, eta_min=1e-6
+        )
+
+        v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
+
+        best_val = float('inf')
+        best_state = None
+        patience = 30
+        patience_counter = 0
+
+        print(f"\nTraining DirectCurveNetV2 with:")
+        print(f"  hidden_dims: {config.hidden_dims}")
+        print(f"  n_curve_points: {config.n_curve_points}")
+        print(f"  use_param_reconstruction: {config.use_param_reconstruction}")
+        print(f"  lambda_params: {loss_fn.lambda_params}")
+
+        for epoch in range(300):
+            model.train()
+            epoch_losses = []
+            epoch_curve_mse = []
+
+            for batch_data in train_loader:
+                batch_x = batch_data[0].to(self.device)
+                batch_jsc_pred = batch_data[1].to(self.device)
+                batch_voc_pred = batch_data[2].to(self.device)
+                batch_voc_true = batch_data[3].to(self.device)
+                batch_jsc_true = batch_data[4].to(self.device)
+                batch_curves = batch_data[5].to(self.device)
+                batch_params = batch_data[6].to(self.device)
+
+                optimizer.zero_grad()
+
+                # Forward pass with parameter reconstruction
+                pred_curve, pred_voc, pred_params = model(
+                    batch_x, batch_jsc_pred, v_grid, return_params=True
+                )
+
+                # Compute loss with all components
+                loss, metrics = loss_fn(
+                    pred_curve, batch_curves,
+                    pred_voc, batch_voc_true,
+                    batch_jsc_true, v_grid,
+                    pred_params, batch_params
+                )
+
+                if torch.isnan(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+                epoch_curve_mse.append(metrics['mse_curve_abs'])
+
+            scheduler.step()
+
+            # Validation
+            model.eval()
+            val_losses = []
+            val_curve_mse = []
+
+            with torch.no_grad():
+                for batch_data in val_loader:
+                    batch_x = batch_data[0].to(self.device)
+                    batch_jsc_pred = batch_data[1].to(self.device)
+                    batch_voc_pred = batch_data[2].to(self.device)
+                    batch_voc_true = batch_data[3].to(self.device)
+                    batch_jsc_true = batch_data[4].to(self.device)
+                    batch_curves = batch_data[5].to(self.device)
+                    batch_params = batch_data[6].to(self.device)
+
+                    pred_curve, pred_voc, pred_params = model(
+                        batch_x, batch_jsc_pred, v_grid, return_params=True
+                    )
+
+                    val_loss, metrics = loss_fn(
+                        pred_curve, batch_curves,
+                        pred_voc, batch_voc_true,
+                        batch_jsc_true, v_grid,
+                        pred_params, batch_params
+                    )
+                    val_losses.append(val_loss.item())
+                    val_curve_mse.append(metrics['mse_curve_abs'])
+
+            avg_val = float(np.mean(val_losses))
+            avg_val_mse = float(np.mean(val_curve_mse))
+
+            if epoch % 10 == 0:
+                avg_train_mse = float(np.mean(epoch_curve_mse))
+                print(
+                    f"Epoch {epoch}: train_loss={np.mean(epoch_losses):.6f}, "
+                    f"val_loss={avg_val:.6f}, train_mse={avg_train_mse:.6f}, "
+                    f"val_mse={avg_val_mse:.6f}, lr={scheduler.get_last_lr()[0]:.2e}"
+                )
+
+            if avg_val < best_val:
+                best_val = avg_val
+                patience_counter = 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        # Store the model
+        self.models['direct_curve_v2_model'] = model
+        self.models['direct_curve_v2_config'] = config
+        self.models['curve_model'] = model  # For compatibility
+        self.models['direct_curve_v2_param_min'] = self.param_min
+        self.models['direct_curve_v2_param_max'] = self.param_max
+
+        print(f"\nDirectCurveNetV2 training complete. Best val loss: {best_val:.6f}")
 
     def _predict_voc_nn(self, split: dict) -> np.ndarray:
         """Predict Voc using the trained Voc NN."""
@@ -2329,10 +2582,10 @@ class ScalarPredictorPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description='Train scalar PV predictors')
-    parser.add_argument('--params', type=str, default=DEFAULT_PARAMS_FILE,
-                        help='Path to parameters file')
-    parser.add_argument('--iv', type=str, default=DEFAULT_IV_FILE,
-                        help='Path to IV curves file')
+    parser.add_argument('--params', type=str, nargs='+', default=[DEFAULT_PARAMS_FILE],
+                        help='Path(s) to parameters file(s) - can specify multiple for concatenation')
+    parser.add_argument('--iv', type=str, nargs='+', default=[DEFAULT_IV_FILE],
+                        help='Path(s) to IV curves file(s) - must match number of params files')
     parser.add_argument('--output', type=str, default='outputs',
                         help='Output directory')
     parser.add_argument('--device', type=str, default='cuda',
@@ -2375,6 +2628,8 @@ def main():
                         help='Reduce logging verbosity')
     parser.add_argument('--direct-curve', action='store_true',
                         help='Use direct curve model (no Vmpp split, predicts Voc + shape)')
+    parser.add_argument('--direct-curve-v2', action='store_true',
+                        help='Use DirectCurveNetV2 (high-accuracy, direct 45-point prediction with latent loss)')
 
     args = parser.parse_args()
 
@@ -2408,7 +2663,8 @@ def main():
         use_hard_clamp_training=not args.soft_clamp_training,
         log_constraint_violations=not args.no_constraint_logging,
         verbose_logging=not args.quiet,
-        use_direct_curve=args.direct_curve
+        use_direct_curve=args.direct_curve,
+        use_direct_curve_v2=args.direct_curve_v2
     )
 
     metrics = pipeline.run()

@@ -54,8 +54,8 @@ echo ""
 # Option 1: Data validation only (fastest - checks for inf/nan)
 # echo "Running data validation..."
 # python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
+#     --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
+#     --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
 #     --device cuda \
 #     --check-data-only \
 #     --verbose
@@ -63,8 +63,8 @@ echo ""
 # Option 2: Quick test with subset (1000 samples, all models)
 # echo "Running quick test with 1000 samples..."
 # python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
+#     --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
+#     --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
 #     --device cuda \
 #     --n-samples 1000 \
 #     --all \
@@ -74,8 +74,8 @@ echo ""
 # Option 3: Single model test (Voc NN)
 # echo "Training Voc NN..."
 # python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
+#     --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
+#     --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
 #     --device cuda \
 #     --model voc_nn \
 #     --epochs 20
@@ -83,8 +83,8 @@ echo ""
 # Option 4: Single model test (Jsc LGBM)
 echo "Training Jsc LGBM..."
 python debug_train.py \
-    --params $WORK_DIR/LHS_parameters_m.txt \
-    --iv $WORK_DIR/IV_m.txt \
+    --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
+    --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
     --device cuda \
     --model jsc_lgbm \
     --n-estimators 200
@@ -92,8 +92,8 @@ python debug_train.py \
 # Option 5: Full debug run (all models, full data, minimal epochs)
 echo "Running full debug (all models, minimal epochs)..."
 python debug_train.py \
-    --params $WORK_DIR/LHS_parameters_m.txt \
-    --iv $WORK_DIR/IV_m.txt \
+    --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
+    --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
     --device cuda \
     --all \
     --epochs 20 \

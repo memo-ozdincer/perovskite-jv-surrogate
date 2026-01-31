@@ -97,8 +97,8 @@ echo ""
 # BUILD COMMAND - Skip HPO entirely with --no-hpo flag
 # ============================================================================
 CMD="python train.py \
-    --params \"$WORK_DIR/LHS_parameters_m.txt\" \
-    --iv \"$WORK_DIR/IV_m.txt\" \
+    --params \"$WORK_DIR/LHS_parameters_m.txt\" \"$WORK_DIR/LHS_parameters_m_300k.txt\" \
+    --iv \"$WORK_DIR/IV_m.txt\" \"$WORK_DIR/IV_m_300k.txt\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
