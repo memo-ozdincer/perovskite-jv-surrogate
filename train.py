@@ -1831,11 +1831,12 @@ class ScalarPredictorPipeline:
         import time
 
         # Check which model type we have
+        use_direct_curve_v2_model = 'direct_curve_v2_model' in self.models
         use_direct_curve_model = 'direct_curve_model' in self.models
         use_ctrl_point_model = 'ctrl_point_model' in self.models
-        use_legacy_model = 'curve_model' in self.models and not use_direct_curve_model
+        use_legacy_model = 'curve_model' in self.models and not use_direct_curve_model and not use_direct_curve_v2_model
 
-        if not use_direct_curve_model and not use_ctrl_point_model and not use_legacy_model:
+        if not use_direct_curve_model and not use_ctrl_point_model and not use_legacy_model and not use_direct_curve_v2_model:
             raise ValueError("No curve model trained. Run train_curve_model() or train_direct_curve_model() first.")
 
         split = self.splits[split_name]
@@ -1853,7 +1854,22 @@ class ScalarPredictorPipeline:
         # Prepare data based on model type
         use_shape_net = self.models.get('direct_curve_uses_shape_net', False)
 
-        if use_direct_curve_model:
+        if use_direct_curve_v2_model:
+            # Get Jsc from LGBM
+            jsc_pred = self.models['jsc_lgbm'].predict(
+                split['X_raw'], split['X_physics'], split['jsc_ceiling']
+            )
+            voc_true = split['targets']['Voc'].astype(np.float32)
+            
+            ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(X_full),
+                torch.from_numpy(jsc_pred.astype(np.float32)),
+                torch.from_numpy(voc_true),
+                torch.from_numpy(curves_true),
+                torch.from_numpy(anchors_true)
+            )
+            model = self.models['direct_curve_v2_model']
+        elif use_direct_curve_model:
             # Get Jsc from LGBM
             jsc_pred = self.models['jsc_lgbm'].predict(
                 split['X_raw'], split['X_physics'], split['jsc_ceiling']
@@ -1941,7 +1957,24 @@ class ScalarPredictorPipeline:
 
         with torch.no_grad():
             for batch in loader:
-                if use_direct_curve_model:
+                if use_direct_curve_v2_model:
+                    batch_x, batch_jsc, batch_voc_true, batch_curves, batch_anchors_true = batch
+                    batch_x = batch_x.to(self.device)
+                    batch_jsc = batch_jsc.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
+                    
+                    # DirectCurveNetV2 forward pass
+                    pred_curve, pred_voc, _ = model(batch_x, batch_jsc, v_grid, return_params=False)
+                    
+                    # Create pseudo-anchors
+                    power = pred_curve * v_grid.unsqueeze(0)
+                    mpp_idx = power.argmax(dim=1)
+                    batch_idx = torch.arange(pred_curve.shape[0], device=self.device)
+                    pred_vmpp = v_grid[mpp_idx]
+                    pred_jmpp = pred_curve[batch_idx, mpp_idx]
+                    pred_anchors = torch.stack([batch_jsc, pred_voc, pred_vmpp, pred_jmpp], dim=1)
+
+                elif use_direct_curve_model:
                     if use_shape_net:
                         # DirectCurveShapeNet: uses Jsc AND Voc from pretrained models
                         batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
