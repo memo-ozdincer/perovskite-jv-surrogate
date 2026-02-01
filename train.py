@@ -1962,7 +1962,8 @@ class ScalarPredictorPipeline:
                     batch_x = batch_x.to(self.device)
                     batch_jsc = batch_jsc.to(self.device)
                     batch_curves = batch_curves.to(self.device)
-                    
+                    batch_anchors_true = batch_anchors_true.to(self.device)
+
                     # DirectCurveNetV2 forward pass
                     pred_curve, pred_voc, _ = model(batch_x, batch_jsc, v_grid, return_params=False)
                     
