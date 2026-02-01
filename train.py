@@ -2098,8 +2098,8 @@ class ScalarPredictorPipeline:
                     pchip_linear_sum_cnt = 0
                     pchip_linear_max_abs = 0.0
 
-                if use_direct_curve_model:
-                    # Direct curve uses single-region PCHIP, skip split-spline comparison
+                if use_direct_curve_v2_model or use_direct_curve_model:
+                    # Direct curve models (V2 and legacy) don't use control points, skip split-spline comparison
                     pass
                 elif use_ctrl_point_model:
                     # Evaluate in normalized space when using ControlPointNet
