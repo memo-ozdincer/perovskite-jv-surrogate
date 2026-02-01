@@ -24,6 +24,9 @@
 #   # Or with direct curve model:
 #   sbatch slurm_no_hpo.sh --direct-curve
 #
+#   # Or with DirectCurveNetV2 (high-accuracy):
+#   sbatch slurm_no_hpo.sh --direct-curve-v2
+#
 # OUTPUT:
 #   - $OUT_DIR/metrics.json     : Final test metrics
 #   - $OUT_DIR/models/          : Trained model weights
@@ -79,8 +82,12 @@ CTRL_POINTS=6
 
 # Parse command line arguments
 USE_DIRECT_CURVE=""
+USE_DIRECT_CURVE_V2=""
 for arg in "$@"; do
-    if [ "$arg" == "--direct-curve" ]; then
+    if [ "$arg" == "--direct-curve-v2" ]; then
+        USE_DIRECT_CURVE_V2="--direct-curve-v2"
+        echo "Using DirectCurveNetV2 model (high-accuracy, 45-point direct prediction)"
+    elif [ "$arg" == "--direct-curve" ]; then
         USE_DIRECT_CURVE="--direct-curve"
         echo "Using DIRECT curve model (no scalar predictor dependencies)"
     fi
@@ -90,7 +97,13 @@ echo ""
 echo "Configuration (FIXED - no HPO):"
 echo "  CONTINUITY_WEIGHT: $CONTINUITY_WEIGHT"
 echo "  CTRL_POINTS: $CTRL_POINTS"
-echo "  DIRECT_CURVE: ${USE_DIRECT_CURVE:-'(no - using split-spline)'}"
+if [ -n "$USE_DIRECT_CURVE_V2" ]; then
+    echo "  MODEL: DirectCurveNetV2 (high-accuracy, direct 45-point prediction)"
+elif [ -n "$USE_DIRECT_CURVE" ]; then
+    echo "  MODEL: DirectCurve (basic)"
+else
+    echo "  MODEL: Split-spline (default)"
+fi
 echo ""
 
 # ============================================================================
@@ -103,13 +116,18 @@ CMD="python train.py \
     --device cuda \
     --train-curves \
     --drop-weak-features \
-    --no-hpo \
-    --continuity-weight $CONTINUITY_WEIGHT \
-    --ctrl-points $CTRL_POINTS"
+    --no-hpo"
 
-# Add direct curve flag if specified
-if [ -n "$USE_DIRECT_CURVE" ]; then
+# Add model-specific flags
+if [ -n "$USE_DIRECT_CURVE_V2" ]; then
+    # DirectCurveNetV2: no continuity/ctrl-points params needed
+    CMD="$CMD $USE_DIRECT_CURVE_V2 --drop-multicollinear"
+elif [ -n "$USE_DIRECT_CURVE" ]; then
+    # Basic direct curve model
     CMD="$CMD $USE_DIRECT_CURVE"
+else
+    # Split-spline model: needs continuity weight and control points
+    CMD="$CMD --continuity-weight $CONTINUITY_WEIGHT --ctrl-points $CTRL_POINTS"
 fi
 
 echo "Running command:"
