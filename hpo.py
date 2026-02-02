@@ -17,6 +17,10 @@ from models.voc_nn import VocNNConfig, VocNN, VocTrainer, SplitSplineNetConfig, 
 from models.jsc_lgbm import JscLGBMConfig, JscLGBM
 from models.vmpp_lgbm import VmppLGBMConfig, VmppLGBM, JmppLGBM, FFLGBM
 from models.reconstruction import reconstruct_curve, continuity_loss
+from models.direct_curve import (
+    DirectCurveShapeNet, DirectCurveShapeNetConfig, DirectCurveShapeLoss,
+    reconstruct_curve_shape
+)
 
 
 @dataclass
@@ -505,6 +509,187 @@ class CurveObjective:
 
 
 # ============================================================================
+# DIRECT CURVE SHAPE HPO (NEW v2.0)
+# ============================================================================
+
+def sample_direct_curve_shape_config(trial: optuna.Trial, input_dim: int) -> DirectCurveShapeNetConfig:
+    """
+    Sample hyperparameters for DirectCurveShapeNet.
+
+    This is the shape-only curve model that uses pretrained Jsc/Voc.
+    Key hyperparameters to tune:
+    - Architecture (hidden_dims, dropout)
+    - Control points for shape flexibility
+    - Residual connections
+    """
+    # Architecture - allow varying depth and width
+    n_layers = trial.suggest_int('n_layers', 2, 5)
+    hidden_dims = []
+    for i in range(n_layers):
+        if i == 0:
+            dim = trial.suggest_categorical(f'hidden_{i}', [256, 384, 512, 768])
+        elif i == 1:
+            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256, 384, 512])
+        else:
+            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256])
+        hidden_dims.append(dim)
+
+    return DirectCurveShapeNetConfig(
+        input_dim=input_dim,
+        hidden_dims=hidden_dims,
+        dropout=trial.suggest_float('dropout', 0.05, 0.3),
+        activation=trial.suggest_categorical('activation', ['silu', 'gelu', 'relu']),
+        ctrl_points=trial.suggest_int('ctrl_points', 6, 12),  # More control points = more shape flexibility
+        use_residual=trial.suggest_categorical('use_residual', [True, False])
+    )
+
+
+class DirectCurveShapeObjective:
+    """
+    Optuna objective for DirectCurveShapeNet (shape-only curve model).
+
+    This model predicts curve shape using pretrained Jsc/Voc endpoints.
+    """
+
+    def __init__(
+        self,
+        X_train: np.ndarray,
+        jsc_train: np.ndarray,
+        voc_train: np.ndarray,
+        curves_train: np.ndarray,
+        X_val: np.ndarray,
+        jsc_val: np.ndarray,
+        voc_val: np.ndarray,
+        curves_val: np.ndarray,
+        v_grid: np.ndarray,
+        device: torch.device,
+        batch_size: int = 2048,
+        max_epochs: int = 100,
+        patience: int = 20
+    ):
+        self.X_train = torch.from_numpy(X_train).float()
+        self.X_val = torch.from_numpy(X_val).float()
+        self.jsc_train = torch.from_numpy(jsc_train).float()
+        self.jsc_val = torch.from_numpy(jsc_val).float()
+        self.voc_train = torch.from_numpy(voc_train).float()
+        self.voc_val = torch.from_numpy(voc_val).float()
+        self.curves_train = torch.from_numpy(curves_train).float()
+        self.curves_val = torch.from_numpy(curves_val).float()
+        self.v_grid = torch.from_numpy(v_grid).float()
+        self.device = device
+        self.batch_size = batch_size
+        self.input_dim = X_train.shape[1]
+        self.max_epochs = max_epochs
+        self.patience = patience
+
+    def __call__(self, trial: optuna.Trial) -> float:
+        config = sample_direct_curve_shape_config(trial, self.input_dim)
+
+        # Training hyperparameters
+        lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-7, 1e-3, log=True)
+
+        # Loss hyperparameters
+        weight_smooth = trial.suggest_float('weight_smooth', 0.01, 0.2, log=True)
+        weight_mono = trial.suggest_float('weight_mono', 0.5, 2.0)
+        knee_weight = trial.suggest_float('knee_weight', 1.0, 4.0)
+        huber_delta = trial.suggest_float('huber_delta', 0.05, 0.3)
+
+        model = DirectCurveShapeNet(config).to(self.device)
+        loss_fn = DirectCurveShapeLoss(
+            weight_smooth=weight_smooth,
+            weight_mono=weight_mono,
+            knee_weight=knee_weight,
+            loss_type='huber',
+            huber_delta=huber_delta,
+            sample_weight_power=0.5
+        )
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=20, T_mult=2, eta_min=1e-7
+        )
+
+        train_ds = torch.utils.data.TensorDataset(
+            self.X_train, self.jsc_train, self.voc_train, self.curves_train
+        )
+        val_ds = torch.utils.data.TensorDataset(
+            self.X_val, self.jsc_val, self.voc_val, self.curves_val
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=self.batch_size, shuffle=True
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=self.batch_size, shuffle=False
+        )
+
+        v_grid = self.v_grid.to(self.device)
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+
+        for epoch in range(self.max_epochs):
+            # Train
+            model.train()
+            for batch_x, batch_jsc, batch_voc, batch_curves in train_loader:
+                batch_x = batch_x.to(self.device)
+                batch_jsc = batch_jsc.to(self.device)
+                batch_voc = batch_voc.to(self.device)
+                batch_curves = batch_curves.to(self.device)
+
+                optimizer.zero_grad()
+                ctrl = model(batch_x, batch_jsc, batch_voc)
+                pred_curve = reconstruct_curve_shape(batch_voc, ctrl, v_grid, clamp_voc=True)
+
+                loss, _ = loss_fn(pred_curve, batch_curves, batch_voc, v_grid)
+
+                if torch.isnan(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            scheduler.step()
+
+            # Validate
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for batch_x, batch_jsc, batch_voc, batch_curves in val_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_jsc = batch_jsc.to(self.device)
+                    batch_voc = batch_voc.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
+
+                    ctrl = model(batch_x, batch_jsc, batch_voc)
+                    pred_curve = reconstruct_curve_shape(batch_voc, ctrl, v_grid, clamp_voc=True)
+
+                    # Use MSE for validation metric (consistent across trials)
+                    val_loss = torch.nn.functional.mse_loss(pred_curve, batch_curves)
+                    val_losses.append(val_loss.item())
+
+            avg_val_loss = float(np.mean(val_losses))
+
+            # Report for pruning
+            trial.report(avg_val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+            # Early stopping
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    break
+
+        return best_val_loss
+
+
+# ============================================================================
 # DISTRIBUTED HPO ENGINE
 # ============================================================================
 
@@ -663,6 +848,43 @@ class DistributedHPO:
         )
 
         study = self.create_study('curve_model', sampler='tpe')
+
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            timeout=self.config.timeout_per_model,
+            n_jobs=1,  # GPU model
+            show_progress_bar=True,
+            gc_after_trial=True
+        )
+
+        return study.best_params, study
+
+    def optimize_direct_curve_shape(
+        self,
+        X_train: np.ndarray,
+        jsc_train: np.ndarray,
+        voc_train: np.ndarray,
+        curves_train: np.ndarray,
+        X_val: np.ndarray,
+        jsc_val: np.ndarray,
+        voc_val: np.ndarray,
+        curves_val: np.ndarray,
+        v_grid: np.ndarray,
+        device: torch.device,
+        n_trials: int = None
+    ) -> tuple[dict, optuna.Study]:
+        """Run HPO for DirectCurveShapeNet (shape-only curve model)."""
+
+        n_trials = n_trials or self.config.n_trials_nn
+
+        objective = DirectCurveShapeObjective(
+            X_train, jsc_train, voc_train, curves_train,
+            X_val, jsc_val, voc_val, curves_val,
+            v_grid, device
+        )
+
+        study = self.create_study('direct_curve_shape', sampler='tpe')
 
         study.optimize(
             objective,
@@ -1090,5 +1312,71 @@ def run_curve_hpo(
             'feature_std': feature_std.tolist()
         }
     }
+
+    return results
+
+
+def run_direct_curve_shape_hpo(
+    X_train: np.ndarray,
+    jsc_train: np.ndarray,
+    voc_train: np.ndarray,
+    curves_train: np.ndarray,
+    X_val: np.ndarray,
+    jsc_val: np.ndarray,
+    voc_val: np.ndarray,
+    curves_val: np.ndarray,
+    v_grid: np.ndarray,
+    device: torch.device,
+    hpo_config: HPOConfig = None,
+    n_trials: int = None
+) -> dict:
+    """
+    Run HPO for DirectCurveShapeNet (shape-only curve model).
+
+    This is used for the --direct-curve mode where Jsc and Voc come from
+    pretrained models and only the curve shape is learned.
+
+    Args:
+        X_train: Normalized feature array for training
+        jsc_train: Predicted Jsc values from pretrained LGBM
+        voc_train: Predicted Voc values from pretrained NN
+        curves_train: Normalized target curves
+        X_val, jsc_val, voc_val, curves_val: Validation data
+        v_grid: Voltage grid
+        device: torch device
+        hpo_config: HPO configuration
+        n_trials: Override number of trials
+
+    Returns:
+        dict with best params and study results
+    """
+    hpo_config = hpo_config or HPOConfig()
+    engine = DistributedHPO(hpo_config)
+
+    print("=" * 60)
+    print("HPO: DirectCurveShapeNet (Shape-Only Model)")
+    print("=" * 60)
+
+    n_trials = n_trials or hpo_config.n_trials_nn
+
+    shape_params, shape_study = engine.optimize_direct_curve_shape(
+        X_train, jsc_train, voc_train, curves_train,
+        X_val, jsc_val, voc_val, curves_val,
+        v_grid, device, n_trials
+    )
+
+    results = {
+        'direct_curve_shape': {
+            'params': shape_params,
+            'study': shape_study,
+            'best_value': shape_study.best_value,
+            'n_trials': len(shape_study.trials)
+        }
+    }
+
+    # Print summary
+    print(f"\nBest DirectCurveShapeNet params (val_loss={shape_study.best_value:.6f}):")
+    for k, v in shape_params.items():
+        print(f"  {k}: {v}")
 
     return results

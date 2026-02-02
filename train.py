@@ -47,7 +47,7 @@ from models.direct_curve import (
     extract_voc_from_curve
 )
 from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
-from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
+from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo, run_direct_curve_shape_hpo
 from logging_utils import (
     TrainingLogger, ModelComparisonMetrics,
     compute_multicollinearity, suggest_features_to_drop
@@ -1181,26 +1181,88 @@ class ScalarPredictorPipeline:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        # Create shape-only model (larger network, more control points)
-        # Use at least 8 control points for better shape capture
-        n_ctrl_points = max(self.ctrl_points, 8)
-        config = DirectCurveShapeNetConfig(
-            input_dim=X_train_norm.shape[1],
-            hidden_dims=[512, 256, 128],  # Larger network
-            dropout=0.1,
-            activation='silu',
-            ctrl_points=n_ctrl_points,
-            use_residual=True
-        )
+        # ====================================================================
+        # HPO FOR DIRECTCURVESHAPENET (NEW v2.0)
+        # ====================================================================
+        if self.run_curve_hpo:
+            print("\n" + "=" * 60)
+            print("Running HPO for DirectCurveShapeNet")
+            print("=" * 60)
+
+            hpo_results = run_direct_curve_shape_hpo(
+                X_train=X_train_norm,
+                jsc_train=jsc_train,
+                voc_train=voc_train_pred,
+                curves_train=curves_train_norm,
+                X_val=X_val_norm,
+                jsc_val=jsc_val,
+                voc_val=voc_val_pred,
+                curves_val=curves_val_norm,
+                v_grid=self.v_grid,
+                device=self.device,
+                hpo_config=self.hpo_config,
+                n_trials=self.hpo_config.n_trials_nn
+            )
+
+            # Extract best params
+            best_params = hpo_results['direct_curve_shape']['params']
+            print(f"\nUsing HPO-optimized config:")
+            for k, v in best_params.items():
+                print(f"  {k}: {v}")
+
+            # Build hidden_dims from HPO params
+            n_layers = best_params.get('n_layers', 3)
+            hidden_dims = [best_params.get(f'hidden_{i}', 256) for i in range(n_layers)]
+
+            config = DirectCurveShapeNetConfig(
+                input_dim=X_train_norm.shape[1],
+                hidden_dims=hidden_dims,
+                dropout=best_params.get('dropout', 0.1),
+                activation=best_params.get('activation', 'silu'),
+                ctrl_points=best_params.get('ctrl_points', 8),
+                use_residual=best_params.get('use_residual', True)
+            )
+
+            # Use HPO-optimized loss params
+            loss_fn = DirectCurveShapeLoss(
+                weight_smooth=best_params.get('weight_smooth', 0.05),
+                weight_mono=best_params.get('weight_mono', 1.0),
+                knee_weight=best_params.get('knee_weight', 2.0),
+                loss_type='huber',
+                huber_delta=best_params.get('huber_delta', 0.1),
+                sample_weight_power=0.5
+            )
+
+            # Use HPO-optimized training params
+            lr = best_params.get('lr', 5e-4)
+            weight_decay = best_params.get('weight_decay', 1e-5)
+        else:
+            # Fallback to default config (no HPO)
+            print("\nUsing default config (no HPO)")
+            n_ctrl_points = max(self.ctrl_points, 8)
+            config = DirectCurveShapeNetConfig(
+                input_dim=X_train_norm.shape[1],
+                hidden_dims=[512, 256, 128],
+                dropout=0.1,
+                activation='silu',
+                ctrl_points=n_ctrl_points,
+                use_residual=True
+            )
+
+            loss_fn = DirectCurveShapeLoss(
+                weight_smooth=0.05,
+                weight_mono=1.0,
+                knee_weight=2.0,
+                loss_type='huber',
+                huber_delta=0.1,
+                sample_weight_power=0.5
+            )
+
+            lr = 5e-4
+            weight_decay = 1e-5
 
         model = DirectCurveShapeNet(config).to(self.device)
-        loss_fn = DirectCurveShapeLoss(
-            weight_smooth=0.05,
-            weight_mono=1.0,
-            knee_weight=2.0  # Higher weight in knee region
-        )
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=30, T_mult=2, eta_min=1e-6
         )

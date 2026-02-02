@@ -7,7 +7,7 @@
 #SBATCH --time=18:00:00  # Increased for longer HPO runs (was 20:00:00)
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.err
-#SBATCH --account=aip-aspuru
+#SBATCH --account=rrg-aspuru
 
 # ============================================================================
 # Direct Curve Pipeline - WITH HPO
@@ -107,6 +107,7 @@ CMD="python train.py \
     --device cuda \
     --train-curves \
     --direct-curve \
+    --curve-hpo \
     --drop-weak-features \
     --drop-multicollinear \
     --hpo-trials-nn $HPO_TRIALS_NN \
