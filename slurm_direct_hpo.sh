@@ -7,7 +7,7 @@
 #SBATCH --time=18:00:00  # Increased for longer HPO runs (was 20:00:00)
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.err
-#SBATCH --account=rrg-aspuru
+#SBATCH --account=aip-aspuru
 
 # ============================================================================
 # Direct Curve Pipeline - WITH HPO
