@@ -1261,6 +1261,7 @@ class ScalarPredictorPipeline:
         self.models['curve_model'] = model  # For compatibility
 
         print(f"\nDirect curve model training complete. Best val loss: {best_val:.6f}")
+<<<<<<< HEAD
 
     def train_direct_curve_model_v2(self):
         """
@@ -1503,6 +1504,8 @@ class ScalarPredictorPipeline:
         self.models['direct_curve_v2_param_max'] = self.param_max
 
         print(f"\nDirectCurveNetV2 training complete. Best val loss: {best_val:.6f}")
+=======
+>>>>>>> parent of 49be84c (completely new pipeline)
 
     def _predict_voc_nn(self, split: dict) -> np.ndarray:
         """Predict Voc using the trained Voc NN."""
@@ -1840,10 +1843,15 @@ class ScalarPredictorPipeline:
 
         # Prepare data based on model type
 <<<<<<< HEAD
+<<<<<<< HEAD
         use_shape_net = self.models.get('direct_curve_uses_shape_net', False)
 
         if use_direct_curve_v2_model:
             # Get Jsc from LGBM
+=======
+        if use_direct_curve_model:
+            # DirectCurveNetWithJsc: needs Jsc from LGBM
+>>>>>>> parent of 49be84c (completely new pipeline)
             jsc_pred = self.models['jsc_lgbm'].predict(
                 split['X_raw'], split['X_physics'], split['jsc_ceiling']
             )
@@ -1936,6 +1944,7 @@ class ScalarPredictorPipeline:
         with torch.no_grad():
             for batch in loader:
 <<<<<<< HEAD
+<<<<<<< HEAD
                 if use_direct_curve_v2_model:
                     batch_x, batch_jsc, batch_voc_true, batch_curves, batch_anchors_true = batch
                     batch_x = batch_x.to(self.device)
@@ -1966,6 +1975,8 @@ class ScalarPredictorPipeline:
                         batch_curves_norm = batch_curves_norm.to(self.device)
                         batch_anchors_true = batch_anchors_true.to(self.device)
 =======
+=======
+>>>>>>> parent of 49be84c (completely new pipeline)
                 if use_direct_curve_model:
                     # DirectCurveNetWithJsc: uses Jsc from LGBM, predicts Voc + ctrl
                     batch_x, batch_jsc, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
@@ -1975,6 +1986,9 @@ class ScalarPredictorPipeline:
                     batch_curves = batch_curves.to(self.device)
                     batch_curves_norm = batch_curves_norm.to(self.device)
                     batch_anchors_true = batch_anchors_true.to(self.device)
+<<<<<<< HEAD
+>>>>>>> parent of 49be84c (completely new pipeline)
+=======
 >>>>>>> parent of 49be84c (completely new pipeline)
 
                     # Model predicts Voc and control points
