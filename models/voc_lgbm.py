@@ -8,17 +8,23 @@ from dataclasses import dataclass
 
 @dataclass
 class VocLGBMConfig:
-    """Configuration for Voc LightGBM model."""
-    # Core parameters
-    num_leaves: int = 255
-    max_depth: int = 15
-    learning_rate: float = 0.05
-    n_estimators: int = 2000
-    min_child_samples: int = 20
-    subsample: float = 0.8
-    colsample_bytree: float = 0.8
-    reg_alpha: float = 0.1
-    reg_lambda: float = 0.1
+    """
+    Configuration for Voc LightGBM model.
+
+    UPDATED v2.0: Defaults re-centered to MIDDLE of HPO search space
+    to allow HPO to explore both directions effectively.
+    HPO search ranges: num_leaves [31,255], max_depth [6,15], lr [0.01,0.1]
+    """
+    # Core parameters - CENTERED in search space (not at upper bounds)
+    num_leaves: int = 127         # Middle of [31, 255]
+    max_depth: int = 10           # Middle of [6, 15]
+    learning_rate: float = 0.03   # Geometric mean of [0.01, 0.1]
+    n_estimators: int = 1000      # Middle of [500, 2000]
+    min_child_samples: int = 30   # Middle of [10, 50]
+    subsample: float = 0.82       # Middle of [0.7, 0.95]
+    colsample_bytree: float = 0.82
+    reg_alpha: float = 0.01       # Geometric mean of [1e-4, 1.0]
+    reg_lambda: float = 0.01
 
     # GPU settings
     device: str = 'gpu'
@@ -89,8 +95,14 @@ class VocLGBM:
         return np.hstack(features_list)
 
     def _prepare_target(self, voc: np.ndarray, voc_ceiling: np.ndarray) -> np.ndarray:
+        """
+        Prepare target as ratio to ceiling.
+
+        UPDATED v2.0: Extended clip range from [0, 2] to [0, 3] to avoid
+        clipping extreme outlier samples which can cause gradient issues.
+        """
         ratio = voc / (np.abs(voc_ceiling) + 1e-30)
-        return np.clip(ratio, 0, 2)
+        return np.clip(ratio, 0, 3.0)
 
     def _inverse_target(self, ratio: np.ndarray, voc_ceiling: np.ndarray) -> np.ndarray:
         return ratio * np.abs(voc_ceiling)

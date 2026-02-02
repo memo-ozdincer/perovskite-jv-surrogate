@@ -155,6 +155,65 @@ def load_raw_data(params_file: str, iv_file: str) -> tuple[pd.DataFrame, np.ndar
     return params_df, iv_data
 
 
+def load_multiple_data_files(
+    params_files: list[str],
+    iv_files: list[str]
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Load and concatenate multiple parameter/IV file pairs.
+
+    Args:
+        params_files: List of parameter file paths
+        iv_files: List of IV curve file paths (must match params_files length)
+
+    Returns:
+        Combined params_df and iv_data
+
+    Raises:
+        ValueError: If file counts don't match or column structures differ
+    """
+    if len(params_files) != len(iv_files):
+        raise ValueError(
+            f"Number of params files ({len(params_files)}) must match "
+            f"IV files ({len(iv_files)})"
+        )
+
+    if len(params_files) == 0:
+        raise ValueError("At least one file pair is required")
+
+    all_params = []
+    all_iv = []
+
+    for i, (params_file, iv_file) in enumerate(zip(params_files, iv_files)):
+        print(f"  Loading file pair {i+1}/{len(params_files)}: {Path(params_file).name}, {Path(iv_file).name}")
+        params_df, iv_data = load_raw_data(params_file, iv_file)
+
+        # Validate column structure matches first file
+        if i > 0:
+            if list(params_df.columns) != list(all_params[0].columns):
+                raise ValueError(
+                    f"Column mismatch in {params_file}: expected {list(all_params[0].columns)}, "
+                    f"got {list(params_df.columns)}"
+                )
+            if iv_data.shape[1] != all_iv[0].shape[1]:
+                raise ValueError(
+                    f"IV column count mismatch in {iv_file}: expected {all_iv[0].shape[1]}, "
+                    f"got {iv_data.shape[1]}"
+                )
+
+        all_params.append(params_df)
+        all_iv.append(iv_data)
+        print(f"    -> {len(params_df)} samples loaded")
+
+    # Concatenate
+    combined_params = pd.concat(all_params, ignore_index=True)
+    combined_iv = np.vstack(all_iv)
+
+    print(f"  Combined dataset: {len(combined_params)} total samples from {len(params_files)} file pairs")
+
+    return combined_params, combined_iv
+
+
 def prepare_tensors(
     params_df: pd.DataFrame,
     iv_data: np.ndarray,

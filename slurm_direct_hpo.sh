@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
-#SBATCH --time=20:00:00
+#SBATCH --time=18:00:00  # Increased for longer HPO runs (was 20:00:00)
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/direct_hpo_%j.err
 #SBATCH --account=aip-aspuru
@@ -71,27 +71,38 @@ echo "Running Direct Curve Pipeline WITH HPO..."
 echo "Output directory: $OUT_DIR"
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION - UPDATED v2.0 for improved HPO
 # ============================================================================
-HPO_TRIALS_NN=5        # HPO trials for Voc NN (used by shape model)
-HPO_TRIALS_LGBM=100       # HPO trials for LightGBM models
-HPO_TIMEOUT=7200          # 2 hours per model
+HPO_TRIALS_NN=200         # HPO trials for Voc NN (WAS 5, increased for thorough search)
+HPO_TRIALS_LGBM=300       # HPO trials for LightGBM models (WAS 100)
+HPO_TIMEOUT=14400         # 4 hours per model (WAS 7200 = 2h)
 CTRL_POINTS=8             # Shape-only model uses at least 8 for better knee capture
+
+# Additional data files (loaded on top of primary data)
+PARAMS_EXTRA="$WORK_DIR/LHS_parameters_m_300k.txt"
+IV_EXTRA="$WORK_DIR/IV_m_300k.txt"
 
 echo ""
 echo "Configuration:"
 echo "  HPO_TRIALS_NN: $HPO_TRIALS_NN"
 echo "  HPO_TRIALS_LGBM: $HPO_TRIALS_LGBM"
+echo "  HPO_TIMEOUT: $HPO_TIMEOUT"
 echo "  CTRL_POINTS: $CTRL_POINTS"
 echo "  MODEL: Direct Curve (no Vmpp split)"
 echo ""
+echo "Data files:"
+echo "  Primary: $WORK_DIR/LHS_parameters_m.txt, $WORK_DIR/IV_m.txt"
+echo "  Extra: $PARAMS_EXTRA, $IV_EXTRA"
+echo ""
 
 # ============================================================================
-# BUILD COMMAND
+# BUILD COMMAND - UPDATED v2.0 with multi-file loading
 # ============================================================================
 CMD="python train.py \
     --params \"$WORK_DIR/LHS_parameters_m.txt\" \
     --iv \"$WORK_DIR/IV_m.txt\" \
+    --params-extra \"$PARAMS_EXTRA\" \
+    --iv-extra \"$IV_EXTRA\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \

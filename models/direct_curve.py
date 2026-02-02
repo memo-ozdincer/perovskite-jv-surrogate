@@ -450,7 +450,8 @@ def build_knots_single_region(
 def build_knots_nonuniform(
     voc: torch.Tensor,
     ctrl: torch.Tensor,
-    normalized: bool = True
+    normalized: bool = True,
+    enforce_strict_monotonicity: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Build voltage and current knots with NON-UNIFORM spacing.
@@ -459,12 +460,14 @@ def build_knots_nonuniform(
     the curve shape changes most rapidly.
 
     Uses sigmoid control points directly as the J/Jsc fraction at each knot.
-    Monotonicity is enforced by sorting.
+    Monotonicity is enforced by sorting + optional strict spacing.
 
     Args:
         voc: (N,) open-circuit voltage
         ctrl: (N, K) control points from sigmoid, values in [0, 1]
         normalized: If True, J goes from 1 to -1, else from 1 to 0
+        enforce_strict_monotonicity: If True, add small spacing to ensure
+            strictly decreasing J (prevents PCHIP instability from duplicate values)
 
     Returns:
         v_knots: (N, K+2) voltage positions (non-uniform in [0, Voc])
@@ -494,6 +497,17 @@ def build_knots_nonuniform(
     # Sigmoid output is [0, 1], we use it as "fraction of J remaining"
     # Sort to ensure monotonicity
     ctrl_sorted, _ = torch.sort(ctrl, dim=1, descending=True)  # Descending: high to low
+
+    # Enforce strict monotonicity by adding small spacing
+    # This prevents PCHIP numerical issues when adjacent knots have nearly equal J
+    if enforce_strict_monotonicity:
+        # Create linearly increasing offsets: [0, eps, 2*eps, ...]
+        # This ensures strictly decreasing J after subtraction
+        spacing = torch.linspace(0, 0.02 * n_ctrl, n_ctrl, device=device) / n_ctrl
+        spacing = spacing.unsqueeze(0)  # (1, K)
+        ctrl_sorted = ctrl_sorted - spacing
+        # Clamp to valid range
+        ctrl_sorted = ctrl_sorted.clamp(0.02, 0.98)
 
     if normalized:
         # Normalized: J goes from 1 (at V=0) to -1 (at V=Voc)
@@ -797,21 +811,44 @@ class DirectCurveShapeLoss(nn.Module):
     Loss function for DirectCurveShapeNet (Jsc and Voc provided as inputs).
 
     Since both endpoints are provided, we ONLY penalize curve shape:
-    1. Curve MSE with regional weighting (knee region weighted higher)
+    1. Curve MSE/Huber with regional weighting (knee region weighted higher)
     2. Smoothness (penalize non-physical oscillations)
     3. Monotonicity (soft penalty for J increasing with V)
+
+    IMPROVED: Added robust loss options and sample weighting to handle outliers.
     """
 
     def __init__(
         self,
         weight_smooth: float = 0.05,
         weight_mono: float = 1.0,
-        knee_weight: float = 2.0
+        knee_weight: float = 2.0,
+        loss_type: str = 'huber',  # 'mse', 'huber', 'smooth_l1'
+        huber_delta: float = 0.1,  # Huber/SmoothL1 threshold
+        sample_weight_power: float = 0.5,  # Downweight outliers (0=off, 0.5=sqrt, 1=linear)
     ):
         super().__init__()
         self.weight_smooth = weight_smooth
         self.weight_mono = weight_mono
         self.knee_weight = knee_weight
+        self.loss_type = loss_type
+        self.huber_delta = huber_delta
+        self.sample_weight_power = sample_weight_power
+
+    def _robust_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute element-wise robust loss."""
+        if self.loss_type == 'mse':
+            return (pred - target) ** 2
+        elif self.loss_type == 'huber':
+            return nn.functional.huber_loss(
+                pred, target, reduction='none', delta=self.huber_delta
+            )
+        elif self.loss_type == 'smooth_l1':
+            return nn.functional.smooth_l1_loss(
+                pred, target, reduction='none', beta=self.huber_delta
+            )
+        else:
+            return (pred - target) ** 2
 
     def forward(
         self,
@@ -835,7 +872,7 @@ class DirectCurveShapeLoss(nn.Module):
         """
         batch_size = pred_curve_norm.shape[0]
 
-        # Regional weighting: higher weight in knee region (0.6-0.95 of Voc)
+        # Regional weighting: higher weight in knee region (0.5-0.95 of Voc)
         # This is where the curve shape matters most for FF
         voc_expanded = voc.unsqueeze(1)  # (N, 1)
         v_ratio = v_grid.unsqueeze(0) / (voc_expanded + 1e-6)  # (N, M)
@@ -845,9 +882,22 @@ class DirectCurveShapeLoss(nn.Module):
         knee_mask = (v_ratio >= 0.5) & (v_ratio <= 0.95)
         weights = torch.where(knee_mask, self.knee_weight * weights, weights)
 
-        # Weighted MSE
-        sq_err = (pred_curve_norm - true_curve_norm) ** 2
-        loss_curve = (weights * sq_err).sum() / weights.sum()
+        # Robust element-wise loss (Huber/SmoothL1/MSE)
+        element_loss = self._robust_loss(pred_curve_norm, true_curve_norm)
+
+        # Sample-level weighting to downweight outliers
+        n_outliers_detected = 0
+        if self.sample_weight_power > 0:
+            sample_errors = element_loss.mean(dim=1, keepdim=True)  # (N, 1)
+            median_error = sample_errors.median()
+            # Downweight samples with high error
+            sample_weights = (median_error / (sample_errors + 1e-6)) ** self.sample_weight_power
+            sample_weights = sample_weights.clamp(0.1, 2.0)  # Bound weights
+            weights = weights * sample_weights
+            # Count outliers (samples with weight < 0.5)
+            n_outliers_detected = int((sample_weights < 0.5).sum().item())
+
+        loss_curve = (weights * element_loss).sum() / weights.sum()
 
         # Smoothness: penalize second derivative
         dv = v_grid[1:] - v_grid[:-1]
@@ -873,6 +923,7 @@ class DirectCurveShapeLoss(nn.Module):
             'loss_curve': loss_curve.item(),
             'loss_smooth': loss_smooth.item(),
             'loss_mono': loss_mono.item(),
+            'n_outliers_detected': n_outliers_detected,
         }
 
         return loss_total, metrics

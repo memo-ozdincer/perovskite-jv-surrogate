@@ -21,22 +21,29 @@ from models.reconstruction import reconstruct_curve, continuity_loss
 
 @dataclass
 class HPOConfig:
-    """Global HPO configuration."""
-    # Trial counts - reduced after architecture simplification
-    # Simpler search space requires fewer trials
-    n_trials_nn: int = 100
-    n_trials_lgbm: int = 200
+    """
+    Global HPO configuration.
+
+    UPDATED v2.0: Increased trial counts and relaxed pruning to allow
+    more thorough exploration. Previous settings were too aggressive
+    and led to meager HPO gains.
+    """
+    # Trial counts - increased for more thorough exploration
+    n_trials_nn: int = 200       # WAS 100
+    n_trials_lgbm: int = 300     # WAS 200
 
     # Parallelization
     n_parallel_trials: int = 24  # Match GPU node cores
-    n_startup_trials: int = 50   # Random trials before TPE
+    n_startup_trials: int = 75   # WAS 50 - more random exploration before TPE
 
-    # Timeouts
-    timeout_per_model: int = 7200  # 2 hours per model type
+    # Timeouts - increased for longer training runs
+    timeout_per_model: int = 14400  # WAS 7200 (4h vs 2h)
 
-    # Pruning
+    # Pruning - relaxed to allow more trials to complete
     use_pruning: bool = True
-    pruning_warmup: int = 10
+    pruning_warmup: int = 15          # WAS 10
+    pruner_min_resource: int = 10     # NEW: min epochs before pruning
+    pruner_reduction_factor: int = 4  # NEW: less aggressive (was 3)
 
     # Storage (for distributed)
     storage: str = None  # Use in-memory by default
@@ -51,54 +58,52 @@ def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
     """
     Sample hyperparameters for Voc neural network.
 
-    SIMPLIFIED for robustness:
-    - Narrower search ranges based on physics intuition
-    - Favor simpler architectures that generalize
-    - Lower learning rates for stability
+    UPDATED v2.0: Widened search space to allow HPO to find better configs.
+    Previous ranges were too narrow and often converged to suboptimal solutions.
     """
 
-    # Architecture - keep it simple, but allow enough capacity
-    # (older best runs often needed a wider first layer).
-    n_layers = trial.suggest_int('n_layers', 2, 3)
+    # Architecture - allow deeper networks with more capacity
+    n_layers = trial.suggest_int('n_layers', 2, 5)  # WAS [2, 3]
     hidden_dims = []
     for i in range(n_layers):
         # Tapering architecture: wide -> narrow
         if i == 0:
-            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256, 512])
+            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256, 384, 512, 768])  # Added 384, 768
+        elif i == 1:
+            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256, 384, 512])   # Added 384, 512
         else:
-            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256])
+            dim = trial.suggest_categorical(f'hidden_{i}', [32, 64, 128, 256])         # Added 32
         hidden_dims.append(dim)
 
-    # Jacobian regularization is helpful, but can easily over-regularize.
-    # Also: log-uniform cannot include 0, so we use a categorical grid.
+    # Jacobian regularization - expanded range
     jacobian_weight = trial.suggest_categorical(
         'jacobian_weight',
-        [0.0, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]
+        [0.0, 1e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]  # Added 1e-6, 1e-1
     )
 
     return VocNNConfig(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
 
-        # Regularization - stronger to prevent overfitting
-        dropout=trial.suggest_float('dropout', 0.1, 0.25),
+        # Regularization - wider range for dropout
+        dropout=trial.suggest_float('dropout', 0.05, 0.35),  # WAS [0.1, 0.25]
         use_layer_norm=True,  # Always use for stability
         use_residual=trial.suggest_categorical('use_residual', [True, False]),
 
         # Activation - GELU is usually best for smooth problems
-        activation=trial.suggest_categorical('activation', ['gelu', 'silu']),
+        activation=trial.suggest_categorical('activation', ['gelu', 'silu', 'relu']),  # Added relu
 
         # Regularizers
         jacobian_weight=jacobian_weight,
-        physics_weight=trial.suggest_float('physics_weight', 0.0, 0.1),
+        physics_weight=trial.suggest_float('physics_weight', 0.0, 0.2),  # WAS [0.0, 0.1]
 
-        # Optimizer - LOWER learning rates for stability
-        lr=trial.suggest_float('lr', 5e-5, 1e-3, log=True),
-        weight_decay=trial.suggest_float('weight_decay', 1e-6, 1e-4, log=True),
+        # Optimizer - WIDER learning rate range
+        lr=trial.suggest_float('lr', 1e-5, 5e-3, log=True),  # WAS [5e-5, 1e-3]
+        weight_decay=trial.suggest_float('weight_decay', 1e-7, 1e-3, log=True),  # Expanded
 
-        # Training - reasonable epochs with good patience
-        epochs=trial.suggest_int('epochs', 150, 300),
-        patience=trial.suggest_int('patience', 25, 40),
+        # Training - wider epoch range, let HPO decide
+        epochs=trial.suggest_int('epochs', 100, 400),  # WAS [150, 300]
+        patience=trial.suggest_int('patience', 20, 50),  # WAS [25, 40]
         use_amp=True,
     )
 
@@ -138,6 +143,12 @@ class VocNNObjective:
         model = VocNN(config).to(self.device)
         trainer = VocTrainer(model, config, self.device)
 
+        # UPDATED v2.0: Add LR scheduler to match final training
+        # This ensures HPO evaluates configs under the same training regime
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            trainer.optimizer, T_0=10, T_mult=2
+        )
+
         # Create data loaders
         train_ds = torch.utils.data.TensorDataset(self.X_train, self.y_train)
         val_ds = torch.utils.data.TensorDataset(self.X_val, self.y_val)
@@ -168,6 +179,9 @@ class VocNNObjective:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 trainer.optimizer.step()
+
+            # Step the LR scheduler (matches final training)
+            scheduler.step()
 
             # Validate
             model.eval()
@@ -528,10 +542,12 @@ class DistributedHPO:
         else:
             sampler_obj = TPESampler(seed=42)
 
+        # UPDATED v2.0: Use config values for pruner settings
+        # Relaxed pruning allows more trials to complete and find better configs
         pruner = HyperbandPruner(
-            min_resource=1,
-            max_resource=300,
-            reduction_factor=3
+            min_resource=self.config.pruner_min_resource,  # WAS hardcoded 1
+            max_resource=400,                               # WAS 300
+            reduction_factor=self.config.pruner_reduction_factor  # WAS hardcoded 3
         ) if self.config.use_pruning else MedianPruner()
 
         study = optuna.create_study(

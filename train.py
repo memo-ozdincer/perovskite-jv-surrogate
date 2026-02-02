@@ -197,6 +197,8 @@ class ScalarPredictorPipeline:
         self,
         params_file: str = DEFAULT_PARAMS_FILE,
         iv_file: str = DEFAULT_IV_FILE,
+        params_extra: list[str] = None,
+        iv_extra: list[str] = None,
         output_dir: str = 'outputs',
         device: str = 'cuda',
         run_hpo: bool = True,
@@ -219,8 +221,9 @@ class ScalarPredictorPipeline:
         verbose_logging: bool = True,
         use_direct_curve: bool = False  # Use simplified direct curve model
     ):
-        self.params_file = params_file
-        self.iv_file = iv_file
+        # Build file lists for multi-file loading
+        self.params_files = [params_file] + (params_extra or [])
+        self.iv_files = [iv_file] + (iv_extra or [])
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,13 +278,24 @@ class ScalarPredictorPipeline:
         print(f"  multicollinearity_threshold: {multicollinearity_threshold}")
 
     def load_data(self):
-        """Load raw data from files."""
+        """Load raw data from files (supports multiple file pairs)."""
         print("\n" + "=" * 60)
         print("Loading Data")
         print("=" * 60)
 
-        self.params_df, self.iv_data = load_raw_data(self.params_file, self.iv_file)
-        print(f"Loaded {len(self.params_df)} samples")
+        if len(self.params_files) == 1:
+            # Single file pair (original behavior)
+            self.params_df, self.iv_data = load_raw_data(
+                self.params_files[0], self.iv_files[0]
+            )
+        else:
+            # Multiple file pairs - use concatenation
+            from data import load_multiple_data_files
+            self.params_df, self.iv_data = load_multiple_data_files(
+                self.params_files, self.iv_files
+            )
+
+        print(f"Loaded {len(self.params_df)} samples total")
         print(f"Parameters shape: {self.params_df.shape}")
         print(f"IV curves shape: {self.iv_data.shape}")
 
@@ -325,6 +339,42 @@ class ScalarPredictorPipeline:
 
         print(f"Jsc ceiling range: [{self.jsc_ceiling.min():.4f}, {self.jsc_ceiling.max():.4f}]")
         print(f"Voc ceiling range: [{self.voc_ceiling.min():.4f}, {self.voc_ceiling.max():.4f}]")
+
+    def detect_and_log_outliers(self):
+        """
+        Detect and log outliers in target variables using IQR method.
+
+        This provides early visibility into data quality issues that may
+        cause training instability or poor predictions on edge cases.
+        """
+        print("\n" + "=" * 60)
+        print("Detecting Outliers in Target Variables")
+        print("=" * 60)
+
+        # Check key target variables
+        target_names = ['Jsc', 'Voc', 'Vmpp', 'Jmpp', 'FF', 'Pmpp']
+        total_outliers = 0
+
+        for name in target_names:
+            if name in self.targets_np:
+                log = self.logger.log_outliers(name, self.targets_np[name])
+                total_outliers += log.n_outliers
+
+        # Also check derived ratios that are used in training
+        if 'Jsc' in self.targets_np and self.jsc_ceiling is not None:
+            jsc_ratio = self.targets_np['Jsc'] / (self.jsc_ceiling + 1e-30)
+            log = self.logger.log_outliers('Jsc_ratio', jsc_ratio)
+            total_outliers += log.n_outliers
+
+        if 'Voc' in self.targets_np and self.voc_ceiling is not None:
+            voc_ratio = self.targets_np['Voc'] / (np.abs(self.voc_ceiling) + 1e-30)
+            log = self.logger.log_outliers('Voc_ratio', voc_ratio)
+            total_outliers += log.n_outliers
+
+        print(f"\nTotal outliers detected across all targets: {total_outliers}")
+        if total_outliers > 0:
+            pct = 100.0 * total_outliers / (len(self.targets_np.get('Jsc', [])) * len(target_names))
+            print(f"  (Approximate {pct:.2f}% of target-sample pairs)")
 
     def split_data(self):
         """Split data into train/val/test sets."""
@@ -2291,6 +2341,7 @@ class ScalarPredictorPipeline:
         self.load_data()
         self.extract_targets()
         self.compute_features()
+        self.detect_and_log_outliers()
         self.split_data()
         self.run_feature_validation()
 
@@ -2333,6 +2384,10 @@ def main():
                         help='Path to parameters file')
     parser.add_argument('--iv', type=str, default=DEFAULT_IV_FILE,
                         help='Path to IV curves file')
+    parser.add_argument('--params-extra', type=str, nargs='*', default=[],
+                        help='Additional parameters files to concatenate (e.g., --params-extra file1.txt file2.txt)')
+    parser.add_argument('--iv-extra', type=str, nargs='*', default=[],
+                        help='Additional IV files to concatenate (must match --params-extra count)')
     parser.add_argument('--output', type=str, default='outputs',
                         help='Output directory')
     parser.add_argument('--device', type=str, default='cuda',
@@ -2390,6 +2445,8 @@ def main():
     pipeline = ScalarPredictorPipeline(
         params_file=args.params,
         iv_file=args.iv,
+        params_extra=args.params_extra,
+        iv_extra=args.iv_extra,
         output_dir=args.output,
         device=args.device,
         run_hpo=run_scalar_hpo,

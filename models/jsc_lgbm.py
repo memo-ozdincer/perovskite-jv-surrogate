@@ -9,17 +9,23 @@ from dataclasses import dataclass, field
 
 @dataclass
 class JscLGBMConfig:
-    """Configuration for Jsc LightGBM model."""
-    # Core parameters
-    num_leaves: int = 255
-    max_depth: int = 15
-    learning_rate: float = 0.05
-    n_estimators: int = 2000
-    min_child_samples: int = 20
-    subsample: float = 0.8
-    colsample_bytree: float = 0.8
-    reg_alpha: float = 0.1
-    reg_lambda: float = 0.1
+    """
+    Configuration for Jsc LightGBM model.
+
+    UPDATED v2.0: Defaults re-centered to MIDDLE of HPO search space
+    to allow HPO to explore both directions effectively.
+    HPO search ranges: num_leaves [31,255], max_depth [6,15], lr [0.01,0.1]
+    """
+    # Core parameters - CENTERED in search space (not at upper bounds)
+    num_leaves: int = 127         # Middle of [31, 255]
+    max_depth: int = 10           # Middle of [6, 15]
+    learning_rate: float = 0.03   # Geometric mean of [0.01, 0.1]
+    n_estimators: int = 1000      # Middle of [500, 2000]
+    min_child_samples: int = 30   # Middle of [10, 50]
+    subsample: float = 0.82       # Middle of [0.7, 0.95]
+    colsample_bytree: float = 0.82
+    reg_alpha: float = 0.01       # Geometric mean of [1e-4, 1.0]
+    reg_lambda: float = 0.01
 
     # GPU settings
     device: str = 'gpu'
@@ -103,15 +109,20 @@ class JscLGBM:
         """
         Prepare target as collection efficiency (ratio to ceiling).
         This bounds the target to [0, 1] approximately.
+
+        UPDATED v2.0: Extended clip range from [0, 2] to [0, 3] to avoid
+        clipping extreme outlier samples which can cause gradient issues.
         """
         # Collection efficiency: actual / theoretical max
         efficiency = jsc / (jsc_ceiling + 1e-30)
-        # Clip for numerical stability
-        return np.clip(efficiency, 0, 2)
+        # Clip for numerical stability - extended range for edge cases
+        return np.clip(efficiency, 0, 3.0)
 
     def _inverse_target(self, efficiency: np.ndarray, jsc_ceiling: np.ndarray) -> np.ndarray:
-        """Convert efficiency back to Jsc."""
-        return efficiency * jsc_ceiling
+        """Convert efficiency back to Jsc with safety bounds."""
+        jsc = efficiency * jsc_ceiling
+        # Safety clamp to prevent extreme predictions
+        return np.clip(jsc, 0, jsc_ceiling * 3.0)
 
     def fit(
         self,

@@ -54,6 +54,25 @@ class MonotonicityLog:
 
 
 @dataclass
+class OutlierLog:
+    """Track outlier detection results per target variable."""
+    target_name: str
+    n_samples: int
+    n_outliers: int
+    outlier_pct: float
+    q1: float
+    q3: float
+    iqr: float
+    lower_bound: float
+    upper_bound: float
+    n_below: int
+    n_above: int
+    min_value: float
+    max_value: float
+    mean_value: float
+
+
+@dataclass
 class ModelComparisonMetrics:
     """Standardized metrics for model comparison (Split-Spline vs CVAE)."""
     model_name: str
@@ -99,6 +118,7 @@ class TrainingLogger:
         self.multitask_losses: list[MultiTaskLossLog] = []
         self.monotonicity_logs: list[MonotonicityLog] = []
         self.model_comparisons: list[ModelComparisonMetrics] = []
+        self.outlier_logs: list[OutlierLog] = []
         self.feature_correlations: dict = {}
         self.multicollinearity_report: dict = {}
 
@@ -239,6 +259,65 @@ class TrainingLogger:
 
         return high_corr_pairs
 
+    def log_outliers(
+        self,
+        target_name: str,
+        values: np.ndarray,
+        iqr_multiplier: float = 1.5
+    ) -> OutlierLog:
+        """
+        Detect and log outliers using IQR method.
+
+        Args:
+            target_name: Name of the target variable (e.g., 'Jsc', 'Voc')
+            values: Array of target values
+            iqr_multiplier: Multiplier for IQR bounds (default 1.5)
+
+        Returns:
+            OutlierLog with detection results
+        """
+        q1 = np.percentile(values, 25)
+        q3 = np.percentile(values, 75)
+        iqr = q3 - q1
+
+        lower_bound = q1 - iqr_multiplier * iqr
+        upper_bound = q3 + iqr_multiplier * iqr
+
+        below_mask = values < lower_bound
+        above_mask = values > upper_bound
+        n_below = int(below_mask.sum())
+        n_above = int(above_mask.sum())
+        n_outliers = n_below + n_above
+
+        log = OutlierLog(
+            target_name=target_name,
+            n_samples=len(values),
+            n_outliers=n_outliers,
+            outlier_pct=100.0 * n_outliers / len(values),
+            q1=float(q1),
+            q3=float(q3),
+            iqr=float(iqr),
+            lower_bound=float(lower_bound),
+            upper_bound=float(upper_bound),
+            n_below=n_below,
+            n_above=n_above,
+            min_value=float(values.min()),
+            max_value=float(values.max()),
+            mean_value=float(values.mean())
+        )
+        self.outlier_logs.append(log)
+
+        if self.verbose:
+            if n_outliers > 0:
+                print(f"  [{target_name}] Outliers: {n_outliers} ({log.outlier_pct:.2f}%) "
+                      f"[{n_below} below, {n_above} above]")
+                print(f"           Range: [{log.min_value:.4f}, {log.max_value:.4f}], "
+                      f"IQR bounds: [{log.lower_bound:.4f}, {log.upper_bound:.4f}]")
+            else:
+                print(f"  [{target_name}] No outliers detected (IQR method, multiplier={iqr_multiplier})")
+
+        return log
+
     def generate_comparison_table(self) -> str:
         """Generate markdown comparison table for all models."""
         if not self.model_comparisons:
@@ -289,6 +368,18 @@ class TrainingLogger:
                 f.write("# Model Comparison Results\n\n")
                 f.write(self.generate_comparison_table())
 
+        # Outlier detection logs
+        if self.outlier_logs:
+            with open(self.output_dir / 'outlier_detection.json', 'w') as f:
+                json.dump([asdict(log) for log in self.outlier_logs], f, indent=2)
+
+            # Also save CSV for easy viewing
+            with open(self.output_dir / 'outlier_detection.csv', 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=asdict(self.outlier_logs[0]).keys())
+                writer.writeheader()
+                for log in self.outlier_logs:
+                    writer.writerow(asdict(log))
+
         # Multicollinearity report
         if self.multicollinearity_report:
             with open(self.output_dir / 'multicollinearity.json', 'w') as f:
@@ -326,6 +417,21 @@ class TrainingLogger:
             summary['total_constraint_violations'] = total_violations
             summary['total_samples_checked'] = total_samples
             summary['overall_violation_rate'] = total_violations / max(1, total_samples * 4)
+
+        # Add outlier detection summary
+        if self.outlier_logs:
+            summary['outlier_detection'] = {
+                log.target_name: {
+                    'n_outliers': log.n_outliers,
+                    'outlier_pct': log.outlier_pct,
+                    'n_below': log.n_below,
+                    'n_above': log.n_above,
+                    'iqr_bounds': [log.lower_bound, log.upper_bound]
+                }
+                for log in self.outlier_logs
+            }
+            total_outliers = sum(log.n_outliers for log in self.outlier_logs)
+            summary['total_outliers_detected'] = total_outliers
 
         with open(self.output_dir / 'training_summary.json', 'w') as f:
             json.dump(summary, f, indent=2)
