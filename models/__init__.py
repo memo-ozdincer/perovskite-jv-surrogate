@@ -15,10 +15,8 @@ from .cvae import ConditionalVAE, cvae_loss
 from .direct_curve import (
     DirectCurveNet, DirectCurveNetConfig,
     DirectCurveNetWithJsc, DirectCurveNetWithJscConfig,
-    DirectCurveShapeNet, DirectCurveShapeNetConfig,
-    DirectCurveLoss, DirectCurveLossWithJsc, DirectCurveShapeLoss,
+    DirectCurveLoss, DirectCurveLossWithJsc,
     reconstruct_curve_direct, reconstruct_curve_direct_normalized,
-    reconstruct_curve_shape,
     extract_voc_from_curve
 )
 
@@ -33,9 +31,7 @@ __all__ = [
     # Direct curve prediction (simplified, no Vmpp split)
     'DirectCurveNet', 'DirectCurveNetConfig',
     'DirectCurveNetWithJsc', 'DirectCurveNetWithJscConfig',
-    'DirectCurveShapeNet', 'DirectCurveShapeNetConfig',  # RECOMMENDED
-    'DirectCurveLoss', 'DirectCurveLossWithJsc', 'DirectCurveShapeLoss',
+    'DirectCurveLoss', 'DirectCurveLossWithJsc',
     'reconstruct_curve_direct', 'reconstruct_curve_direct_normalized',
-    'reconstruct_curve_shape',
     'extract_voc_from_curve',
 ]

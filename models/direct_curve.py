@@ -1,15 +1,13 @@
 """
 Direct curve prediction model - simplified architecture.
 
-Three variants:
+Two variants:
 1. DirectCurveNet: Predicts Jsc, Voc, and control points (fully self-contained)
 2. DirectCurveNetWithJsc: Takes Jsc as input, only predicts Voc + control points
-3. DirectCurveShapeNet: Takes Jsc AND Voc as inputs, only predicts shape (RECOMMENDED)
-   - Uses pretrained Jsc LGBM (R²=0.965) and Voc NN (R²=0.73)
-   - Separates shape learning from endpoint prediction
-   - Uses non-uniform knot placement for better knee capture
+   (recommended since Jsc LGBM is already accurate: R²=0.965)
 
 No Vmpp split - uses single-region PCHIP from (0, Jsc) to (Voc, 0).
+This avoids cascade errors from inaccurate Voc/Vmpp/Jmpp predictions.
 """
 from __future__ import annotations
 
@@ -39,22 +37,6 @@ class DirectCurveNetWithJscConfig:
     dropout: float = 0.15
     activation: str = 'silu'
     ctrl_points: int = 6  # Interior control points
-
-
-@dataclass
-class DirectCurveShapeNetConfig:
-    """
-    Configuration for shape-only curve network.
-
-    RECOMMENDED: Uses pretrained Jsc LGBM and Voc NN for endpoints,
-    only predicts the curve shape via control points.
-    """
-    input_dim: int = 31 + 71  # raw params + physics features
-    hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
-    dropout: float = 0.1
-    activation: str = 'silu'
-    ctrl_points: int = 8  # More control points for better shape capture
-    use_residual: bool = True  # Residual connections for better training
 
 
 class DirectCurveNetWithJsc(nn.Module):
@@ -163,139 +145,6 @@ class DirectCurveNetWithJsc(nn.Module):
         ctrl = self.head_ctrl(features)
 
         return voc, ctrl
-
-
-class DirectCurveShapeNet(nn.Module):
-    """
-    Shape-only curve prediction network (RECOMMENDED).
-
-    Takes BOTH Jsc AND Voc as inputs from pretrained models.
-    Only predicts the curve SHAPE via control points.
-
-    This separates two orthogonal learning tasks:
-    1. Endpoint prediction (Jsc, Voc) - handled by pretrained models
-    2. Shape prediction (control points) - handled by this network
-
-    Uses non-uniform knot placement with more density near the knee region.
-    """
-
-    def __init__(self, config: DirectCurveShapeNetConfig):
-        super().__init__()
-        self.config = config
-
-        # Input: features + Jsc + Voc
-        total_input = config.input_dim + 2
-
-        # Shared backbone with optional residual connections
-        if config.use_residual and len(config.hidden_dims) >= 2:
-            self.backbone = self._build_residual_backbone(total_input, config)
-        else:
-            self.backbone = self._build_simple_backbone(total_input, config)
-
-        # Final dimension after backbone
-        final_dim = config.hidden_dims[-1]
-
-        # Control points head - predict shape coefficients
-        # Using sigmoid to get values in [0, 1] directly, avoiding cumsum issues
-        self.head_ctrl = nn.Sequential(
-            nn.Linear(final_dim, 64),
-            nn.LayerNorm(64),
-            self._get_activation(config.activation),
-            nn.Linear(64, config.ctrl_points),
-            nn.Sigmoid()  # Output in [0, 1] for monotonic mapping
-        )
-
-        self._init_weights()
-
-    def _build_simple_backbone(self, input_dim: int, config) -> nn.Module:
-        layers = []
-        prev_dim = input_dim
-        for hidden_dim in config.hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(self._get_activation(config.activation))
-            layers.append(nn.Dropout(config.dropout))
-            prev_dim = hidden_dim
-        return nn.Sequential(*layers)
-
-    def _build_residual_backbone(self, input_dim: int, config) -> nn.Module:
-        """Build backbone with residual connections for better gradient flow."""
-        class ResidualBlock(nn.Module):
-            def __init__(self, dim, dropout, activation):
-                super().__init__()
-                self.block = nn.Sequential(
-                    nn.Linear(dim, dim),
-                    nn.LayerNorm(dim),
-                    activation,
-                    nn.Dropout(dropout),
-                    nn.Linear(dim, dim),
-                    nn.LayerNorm(dim),
-                )
-                self.activation = activation
-
-            def forward(self, x):
-                return self.activation(x + self.block(x))
-
-        layers = []
-        # Initial projection
-        layers.append(nn.Linear(input_dim, config.hidden_dims[0]))
-        layers.append(nn.LayerNorm(config.hidden_dims[0]))
-        layers.append(self._get_activation(config.activation))
-
-        # Residual blocks at each hidden dimension
-        for i, hidden_dim in enumerate(config.hidden_dims):
-            if i > 0:
-                # Dimension change
-                layers.append(nn.Linear(config.hidden_dims[i-1], hidden_dim))
-                layers.append(nn.LayerNorm(hidden_dim))
-                layers.append(self._get_activation(config.activation))
-            # Add residual block
-            layers.append(ResidualBlock(hidden_dim, config.dropout, self._get_activation(config.activation)))
-
-        return nn.Sequential(*layers)
-
-    def _get_activation(self, name: str) -> nn.Module:
-        activations = {
-            'gelu': nn.GELU(),
-            'silu': nn.SiLU(),
-            'mish': nn.Mish(),
-            'relu': nn.ReLU(),
-        }
-        return activations.get(name, nn.SiLU())
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        jsc: torch.Tensor,
-        voc: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            x: (N, input_dim) normalized features
-            jsc: (N,) short-circuit current from LGBM
-            voc: (N,) open-circuit voltage from Voc NN
-
-        Returns:
-            ctrl: (N, K) control points in [0, 1] for monotonic J interpolation
-        """
-        # Normalize inputs to ~O(1)
-        jsc_input = jsc.unsqueeze(1) / 50.0
-        voc_input = voc.unsqueeze(1)  # Already ~O(1)
-        combined = torch.cat([x, jsc_input, voc_input], dim=1)
-
-        features = self.backbone(combined)
-        ctrl = self.head_ctrl(features)
-
-        return ctrl
 
 
 class DirectCurveNet(nn.Module):
@@ -445,116 +294,6 @@ def build_knots_single_region(
     j_knots = torch.cat([j_start, j_interior, j_end], dim=1)  # (N, K+2)
 
     return v_knots, j_knots
-
-
-def build_knots_nonuniform(
-    voc: torch.Tensor,
-    ctrl: torch.Tensor,
-    normalized: bool = True
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Build voltage and current knots with NON-UNIFORM spacing.
-
-    Places more knots near the knee region (around 0.7-0.9 * Voc) where
-    the curve shape changes most rapidly.
-
-    Uses sigmoid control points directly as the J/Jsc fraction at each knot.
-    Monotonicity is enforced by sorting.
-
-    Args:
-        voc: (N,) open-circuit voltage
-        ctrl: (N, K) control points from sigmoid, values in [0, 1]
-        normalized: If True, J goes from 1 to -1, else from 1 to 0
-
-    Returns:
-        v_knots: (N, K+2) voltage positions (non-uniform in [0, Voc])
-        j_knots: (N, K+2) current values (monotonically decreasing)
-    """
-    n_ctrl = ctrl.shape[1]
-    device = ctrl.device
-    batch = ctrl.shape[0]
-
-    # Non-uniform voltage positions: denser near the knee (0.7-0.95 of Voc)
-    # Use a quadratic mapping that places more points near the end
-    # v_norm_raw = [0, 0.1, 0.2, 0.4, 0.6, 0.75, 0.85, 0.92, 0.97, 1.0] for 8 ctrl points
-    if n_ctrl == 8:
-        v_norm_raw = torch.tensor([0.0, 0.1, 0.25, 0.45, 0.65, 0.78, 0.88, 0.94, 0.98, 1.0], device=device)
-    elif n_ctrl == 6:
-        v_norm_raw = torch.tensor([0.0, 0.15, 0.35, 0.6, 0.8, 0.92, 0.98, 1.0], device=device)
-    else:
-        # Fallback: use quadratic spacing for any number of control points
-        t = torch.linspace(0, 1, n_ctrl + 2, device=device)
-        # Quadratic mapping: more points near 1.0
-        v_norm_raw = t ** 0.7  # Slightly skewed toward higher V
-
-    v_knots = v_norm_raw.unsqueeze(0) * voc.unsqueeze(1)  # (N, K+2)
-
-    # Control points represent J/Jsc ratio at each interior knot
-    # They should be monotonically DECREASING from ~1 to ~0
-    # Sigmoid output is [0, 1], we use it as "fraction of J remaining"
-    # Sort to ensure monotonicity
-    ctrl_sorted, _ = torch.sort(ctrl, dim=1, descending=True)  # Descending: high to low
-
-    if normalized:
-        # Normalized: J goes from 1 (at V=0) to -1 (at V=Voc)
-        # Interior J = 2 * (J/Jsc) - 1 = 2 * ctrl_sorted - 1
-        j_interior = 2.0 * ctrl_sorted - 1.0  # (N, K)
-        j_start = torch.ones(batch, 1, device=device)
-        j_end = torch.full((batch, 1), -1.0, device=device)
-    else:
-        # Absolute: J goes from 1 (=Jsc/Jsc) to 0
-        j_interior = ctrl_sorted  # (N, K), fraction of Jsc
-        j_start = torch.ones(batch, 1, device=device)
-        j_end = torch.zeros(batch, 1, device=device)
-
-    j_knots = torch.cat([j_start, j_interior, j_end], dim=1)  # (N, K+2)
-
-    return v_knots, j_knots
-
-
-def reconstruct_curve_shape(
-    voc: torch.Tensor,
-    ctrl: torch.Tensor,
-    v_grid: torch.Tensor,
-    clamp_voc: bool = True
-) -> torch.Tensor:
-    """
-    Reconstruct curve using shape-only control points (for DirectCurveShapeNet).
-
-    Works in NORMALIZED space where J/Jsc goes from 1 to -1.
-    Uses non-uniform knot placement for better knee capture.
-
-    Args:
-        voc: (N,) open-circuit voltage
-        ctrl: (N, K) control points from sigmoid [0, 1]
-        v_grid: (M,) voltage evaluation points
-        clamp_voc: If True, set J=-1 for V > Voc
-
-    Returns:
-        j_curve_norm: (N, M) normalized curve in [-1, 1]
-    """
-    v_knots, j_knots = build_knots_nonuniform(voc, ctrl, normalized=True)
-
-    # PCHIP interpolation
-    j_curve_norm = pchip_interpolate_batch(v_knots, j_knots, v_grid)
-
-    # Enforce exact start point
-    batch_idx = torch.arange(j_curve_norm.shape[0], device=j_curve_norm.device)
-    j_curve_norm[batch_idx, 0] = 1.0  # J/Jsc = 1 at V=0
-
-    # Clamp to -1 for V > Voc
-    if clamp_voc:
-        voc_expanded = voc.unsqueeze(1)
-        j_curve_norm = torch.where(
-            v_grid.unsqueeze(0) > voc_expanded,
-            torch.full_like(j_curve_norm, -1.0),
-            j_curve_norm
-        )
-
-    # Clamp to valid range
-    j_curve_norm = torch.clamp(j_curve_norm, min=-1.0, max=1.0)
-
-    return j_curve_norm
 
 
 def reconstruct_curve_direct(
@@ -787,92 +526,6 @@ class DirectCurveLossWithJsc(nn.Module):
             'loss_curve': loss_curve.item(),
             'loss_voc': loss_voc.item(),
             'loss_smooth': loss_smooth.item(),
-        }
-
-        return loss_total, metrics
-
-
-class DirectCurveShapeLoss(nn.Module):
-    """
-    Loss function for DirectCurveShapeNet (Jsc and Voc provided as inputs).
-
-    Since both endpoints are provided, we ONLY penalize curve shape:
-    1. Curve MSE with regional weighting (knee region weighted higher)
-    2. Smoothness (penalize non-physical oscillations)
-    3. Monotonicity (soft penalty for J increasing with V)
-    """
-
-    def __init__(
-        self,
-        weight_smooth: float = 0.05,
-        weight_mono: float = 1.0,
-        knee_weight: float = 2.0
-    ):
-        super().__init__()
-        self.weight_smooth = weight_smooth
-        self.weight_mono = weight_mono
-        self.knee_weight = knee_weight
-
-    def forward(
-        self,
-        pred_curve_norm: torch.Tensor,
-        true_curve_norm: torch.Tensor,
-        voc: torch.Tensor,
-        v_grid: torch.Tensor
-    ) -> tuple[torch.Tensor, dict]:
-        """
-        Compute shape-only loss in NORMALIZED space.
-
-        Args:
-            pred_curve_norm: (N, M) predicted curve in [-1, 1] space
-            true_curve_norm: (N, M) target curve in [-1, 1] space
-            voc: (N,) Voc values (for regional weighting)
-            v_grid: (M,) voltage grid
-
-        Returns:
-            loss: Total loss
-            metrics: Dict of individual loss components
-        """
-        batch_size = pred_curve_norm.shape[0]
-
-        # Regional weighting: higher weight in knee region (0.6-0.95 of Voc)
-        # This is where the curve shape matters most for FF
-        voc_expanded = voc.unsqueeze(1)  # (N, 1)
-        v_ratio = v_grid.unsqueeze(0) / (voc_expanded + 1e-6)  # (N, M)
-
-        # Weight mask: 1.0 everywhere, knee_weight in knee region
-        weights = torch.ones_like(pred_curve_norm)
-        knee_mask = (v_ratio >= 0.5) & (v_ratio <= 0.95)
-        weights = torch.where(knee_mask, self.knee_weight * weights, weights)
-
-        # Weighted MSE
-        sq_err = (pred_curve_norm - true_curve_norm) ** 2
-        loss_curve = (weights * sq_err).sum() / weights.sum()
-
-        # Smoothness: penalize second derivative
-        dv = v_grid[1:] - v_grid[:-1]
-        dj = pred_curve_norm[:, 1:] - pred_curve_norm[:, :-1]
-        slopes = dj / (dv.unsqueeze(0) + 1e-6)
-        d2j = slopes[:, 1:] - slopes[:, :-1]
-        loss_smooth = (d2j ** 2).mean()
-
-        # Monotonicity penalty: J should decrease with V (dJ/dV <= 0)
-        # In normalized space, this means dj should be <= 0
-        mono_violation = torch.relu(dj)  # Positive where J increases
-        loss_mono = (mono_violation ** 2).mean()
-
-        # Total loss
-        loss_total = (
-            loss_curve +
-            self.weight_smooth * loss_smooth +
-            self.weight_mono * loss_mono
-        )
-
-        metrics = {
-            'loss_total': loss_total.item(),
-            'loss_curve': loss_curve.item(),
-            'loss_smooth': loss_smooth.item(),
-            'loss_mono': loss_mono.item(),
         }
 
         return loss_total, metrics

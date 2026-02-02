@@ -41,9 +41,7 @@ from models.reconstruction import (
 )
 from models.direct_curve import (
     DirectCurveNetWithJsc, DirectCurveNetWithJscConfig,
-    DirectCurveShapeNet, DirectCurveShapeNetConfig,
-    DirectCurveLossWithJsc, DirectCurveShapeLoss,
-    reconstruct_curve_direct_normalized, reconstruct_curve_shape,
+    DirectCurveLossWithJsc, reconstruct_curve_direct_normalized,
     extract_voc_from_curve
 )
 from models.direct_curve_v2 import (
@@ -1062,21 +1060,16 @@ class ScalarPredictorPipeline:
 
     def train_direct_curve_model(self):
         """
-        Train direct curve model using shape-only approach.
+        Train simplified direct curve model (no Vmpp split).
 
-        IMPROVED APPROACH:
+        KEY DIFFERENCES from split-spline:
         1. Uses Jsc from pretrained LGBM (accurate: R²=0.965)
-        2. Uses Voc from pretrained Voc NN (R²=0.73) - NOT predicted by curve model
-        3. Only predicts SHAPE via control points (decoupled from endpoints)
-        4. Non-uniform knot placement for better knee capture
-        5. Larger network with residual connections
-
-        This separates two orthogonal learning tasks:
-        - Endpoint prediction (Jsc, Voc) -> pretrained models
-        - Shape prediction (control points) -> this model
+        2. Predicts only Voc and control points (no Vmpp/Jmpp dependence)
+        3. Single-region PCHIP from (0, Jsc) to (Voc, 0)
+        4. Simpler architecture, fewer cascade errors
         """
         print("\n" + "=" * 60)
-        print("Training Direct Curve Model (Shape-Only Approach)")
+        print("Training Direct Curve Model (Simplified - No Vmpp Split)")
         print("=" * 60)
 
         train = self.splits['train']
@@ -1103,106 +1096,93 @@ class ScalarPredictorPipeline:
             val['X_raw'], val['X_physics'], val['jsc_ceiling']
         )
 
-        # Get Voc from pretrained Voc NN (better than predicting in curve model)
-        voc_train_pred = self._predict_voc_nn(train)
-        voc_val_pred = self._predict_voc_nn(val)
+        # Get true Voc for loss computation
+        voc_train = train['targets']['Voc']
+        voc_val = val['targets']['Voc']
 
-        # Also keep true Voc for validation metrics
-        voc_train_true = train['targets']['Voc']
-        voc_val_true = val['targets']['Voc']
+        # Extract true Voc from curves (where J crosses zero)
+        v_grid_np = self.v_grid
+        curves_train = train['curves']
+        curves_val = val['curves']
 
-        # Normalized curves for training
+        # Use normalized curves
         curves_train_norm = train['curves_norm']
         curves_val_norm = val['curves_norm']
 
-        print(f"\nUsing pretrained models for endpoints:")
-        print(f"  Jsc from LGBM - range: [{jsc_train.min():.2f}, {jsc_train.max():.2f}]")
-        print(f"  Voc from Voc NN - range: [{voc_train_pred.min():.4f}, {voc_train_pred.max():.4f}]")
-        print(f"  True Voc range: [{voc_train_true.min():.4f}, {voc_train_true.max():.4f}]")
-        voc_mae_pretrained = np.abs(voc_train_pred - voc_train_true).mean()
-        print(f"  Voc NN MAE (train): {voc_mae_pretrained:.4f}")
+        print(f"\nUsing Jsc from pretrained LGBM")
+        print(f"  Train Jsc range: [{jsc_train.min():.2f}, {jsc_train.max():.2f}]")
+        print(f"  Train Voc range: [{voc_train.min():.4f}, {voc_train.max():.4f}]")
 
-        # Create datasets - use PREDICTED Voc for shape learning
-        # This way the shape model learns to work with the actual Voc it will receive at inference
+        # Create datasets
         train_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_train_norm.astype(np.float32)),
             torch.from_numpy(jsc_train.astype(np.float32)),
-            torch.from_numpy(voc_train_pred.astype(np.float32)),  # Predicted Voc for training
-            torch.from_numpy(voc_train_true.astype(np.float32)),  # True Voc for metrics
-            torch.from_numpy(curves_train_norm.astype(np.float32))
+            torch.from_numpy(voc_train.astype(np.float32)),
+            torch.from_numpy(curves_train_norm.astype(np.float32)),
+            torch.from_numpy(curves_train.astype(np.float32))  # Raw for reference
         )
         val_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_val_norm.astype(np.float32)),
             torch.from_numpy(jsc_val.astype(np.float32)),
-            torch.from_numpy(voc_val_pred.astype(np.float32)),
-            torch.from_numpy(voc_val_true.astype(np.float32)),
-            torch.from_numpy(curves_val_norm.astype(np.float32))
+            torch.from_numpy(voc_val.astype(np.float32)),
+            torch.from_numpy(curves_val_norm.astype(np.float32)),
+            torch.from_numpy(curves_val.astype(np.float32))
         )
 
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        # Create shape-only model (larger network, more control points)
-        # Use at least 8 control points for better shape capture
-        n_ctrl_points = max(self.ctrl_points, 8)
-        config = DirectCurveShapeNetConfig(
+        # Create model
+        config = DirectCurveNetWithJscConfig(
             input_dim=X_train_norm.shape[1],
-            hidden_dims=[512, 256, 128],  # Larger network
-            dropout=0.1,
+            hidden_dims=[256, 128, 64],
+            dropout=0.15,
             activation='silu',
-            ctrl_points=n_ctrl_points,
-            use_residual=True
+            ctrl_points=self.ctrl_points
         )
 
-        model = DirectCurveShapeNet(config).to(self.device)
-        loss_fn = DirectCurveShapeLoss(
-            weight_smooth=0.05,
-            weight_mono=1.0,
-            knee_weight=2.0  # Higher weight in knee region
-        )
+        model = DirectCurveNetWithJsc(config).to(self.device)
+        loss_fn = DirectCurveLossWithJsc(weight_voc=5.0, weight_smooth=0.1)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=30, T_mult=2, eta_min=1e-6
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
 
         v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
 
         best_val = float('inf')
         best_state = None
-        patience = 30  # More patience for shape learning
+        patience = 20
         patience_counter = 0
 
-        print(f"\nTraining DirectCurveShapeNet with:")
+        print(f"\nTraining DirectCurveNetWithJsc with:")
         print(f"  ctrl_points: {config.ctrl_points}")
         print(f"  hidden_dims: {config.hidden_dims}")
-        print(f"  use_residual: {config.use_residual}")
-        print(f"  Jsc and Voc from pretrained models (shape-only learning)")
+        print(f"  Using Jsc from LGBM (no Vmpp/Jmpp)")
 
-        for epoch in range(200):
+        for epoch in range(150):
             model.train()
             epoch_losses = []
 
-            for batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves_norm in train_loader:
+            for batch_x, batch_jsc, batch_voc, batch_curves_norm, batch_curves_raw in train_loader:
                 batch_x = batch_x.to(self.device)
                 batch_jsc = batch_jsc.to(self.device)
-                batch_voc_pred = batch_voc_pred.to(self.device)
+                batch_voc = batch_voc.to(self.device)
                 batch_curves_norm = batch_curves_norm.to(self.device)
 
                 optimizer.zero_grad()
 
-                # Model only predicts control points (shape)
-                ctrl = model(batch_x, batch_jsc, batch_voc_pred)
+                # Model predicts Voc and control points
+                pred_voc, ctrl = model(batch_x, batch_jsc)
 
-                # Reconstruct curve using non-uniform knots
-                pred_curve_norm = reconstruct_curve_shape(
-                    batch_voc_pred, ctrl, v_grid, clamp_voc=True
+                # Reconstruct curve in normalized space
+                pred_curve_norm = reconstruct_curve_direct_normalized(
+                    batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
                 )
 
-                # Compute shape-only loss
+                # Compute loss in normalized space
                 loss, metrics = loss_fn(
                     pred_curve_norm, batch_curves_norm,
-                    batch_voc_pred, v_grid
+                    pred_voc, batch_voc, v_grid
                 )
 
                 if torch.isnan(loss):
@@ -1220,38 +1200,46 @@ class ScalarPredictorPipeline:
             val_losses = []
             sum_sq_full = 0.0
             sum_cnt = 0
+            voc_mae_sum = 0.0
+            voc_cnt = 0
 
             with torch.no_grad():
-                for batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves_norm in val_loader:
+                for batch_x, batch_jsc, batch_voc, batch_curves_norm, batch_curves_raw in val_loader:
                     batch_x = batch_x.to(self.device)
                     batch_jsc = batch_jsc.to(self.device)
-                    batch_voc_pred = batch_voc_pred.to(self.device)
+                    batch_voc = batch_voc.to(self.device)
                     batch_curves_norm = batch_curves_norm.to(self.device)
+                    batch_curves_raw = batch_curves_raw.to(self.device)
 
-                    ctrl = model(batch_x, batch_jsc, batch_voc_pred)
-                    pred_curve_norm = reconstruct_curve_shape(
-                        batch_voc_pred, ctrl, v_grid, clamp_voc=True
+                    pred_voc, ctrl = model(batch_x, batch_jsc)
+                    pred_curve_norm = reconstruct_curve_direct_normalized(
+                        batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
                     )
 
                     val_loss, _ = loss_fn(
                         pred_curve_norm, batch_curves_norm,
-                        batch_voc_pred, v_grid
+                        pred_voc, batch_voc, v_grid
                     )
                     val_losses.append(val_loss.item())
 
-                    # MSE in normalized space
+                    # Compute MSE in normalized space
                     err = (pred_curve_norm - batch_curves_norm) ** 2
                     sum_sq_full += err.sum().item()
                     sum_cnt += err.numel()
+
+                    # Voc MAE
+                    voc_mae_sum += (pred_voc - batch_voc).abs().sum().item()
+                    voc_cnt += batch_voc.numel()
 
             avg_val = float(np.mean(val_losses))
 
             if epoch % 10 == 0:
                 mse_norm = sum_sq_full / max(1, sum_cnt)
+                voc_mae = voc_mae_sum / max(1, voc_cnt)
                 print(
                     f"Epoch {epoch}: train={np.mean(epoch_losses):.6f}, "
                     f"val={avg_val:.6f}, mse_norm={mse_norm:.6f}, "
-                    f"lr={scheduler.get_last_lr()[0]:.2e}"
+                    f"voc_mae={voc_mae:.4f}, lr={scheduler.get_last_lr()[0]:.2e}"
                 )
 
             if avg_val < best_val:
@@ -1271,9 +1259,8 @@ class ScalarPredictorPipeline:
         self.models['direct_curve_model'] = model
         self.models['direct_curve_config'] = config
         self.models['curve_model'] = model  # For compatibility
-        self.models['direct_curve_uses_shape_net'] = True  # Flag for evaluation
 
-        print(f"\nDirect curve model (shape-only) training complete. Best val loss: {best_val:.6f}")
+        print(f"\nDirect curve model training complete. Best val loss: {best_val:.6f}")
 
     def train_direct_curve_model_v2(self):
         """
@@ -1852,6 +1839,7 @@ class ScalarPredictorPipeline:
         curves_true_norm = split.get('curves_norm')
 
         # Prepare data based on model type
+<<<<<<< HEAD
         use_shape_net = self.models.get('direct_curve_uses_shape_net', False)
 
         if use_direct_curve_v2_model:
@@ -1871,38 +1859,28 @@ class ScalarPredictorPipeline:
             model = self.models['direct_curve_v2_model']
         elif use_direct_curve_model:
             # Get Jsc from LGBM
+=======
+        if use_direct_curve_model:
+            # DirectCurveNetWithJsc: needs Jsc from LGBM
+>>>>>>> parent of 49be84c (completely new pipeline)
             jsc_pred = self.models['jsc_lgbm'].predict(
                 split['X_raw'], split['X_physics'], split['jsc_ceiling']
             )
             voc_true = split['targets']['Voc'].astype(np.float32)
             curves_true_norm = split.get('curves_norm')
             if curves_true_norm is None:
+                # Fallback: normalize manually
                 isc = curves_true[:, 0:1]
                 isc_safe = np.where(np.abs(isc) < 1e-9, 1.0, isc)
                 curves_true_norm = 2.0 * (curves_true / isc_safe) - 1.0
-
-            if use_shape_net:
-                # DirectCurveShapeNet: needs Jsc AND Voc from pretrained models
-                voc_pred = self._predict_voc_nn(split)
-                ds = torch.utils.data.TensorDataset(
-                    torch.from_numpy(X_full),
-                    torch.from_numpy(jsc_pred.astype(np.float32)),
-                    torch.from_numpy(voc_pred.astype(np.float32)),  # Predicted Voc
-                    torch.from_numpy(voc_true),  # True Voc for metrics
-                    torch.from_numpy(curves_true),
-                    torch.from_numpy(curves_true_norm.astype(np.float32)),
-                    torch.from_numpy(anchors_true)
-                )
-            else:
-                # Legacy DirectCurveNetWithJsc: needs Jsc, predicts Voc
-                ds = torch.utils.data.TensorDataset(
-                    torch.from_numpy(X_full),
-                    torch.from_numpy(jsc_pred.astype(np.float32)),
-                    torch.from_numpy(voc_true),
-                    torch.from_numpy(curves_true),
-                    torch.from_numpy(curves_true_norm.astype(np.float32)),
-                    torch.from_numpy(anchors_true)
-                )
+            ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(X_full),
+                torch.from_numpy(jsc_pred.astype(np.float32)),
+                torch.from_numpy(voc_true),
+                torch.from_numpy(curves_true),
+                torch.from_numpy(curves_true_norm.astype(np.float32)),
+                torch.from_numpy(anchors_true)
+            )
             model = self.models['direct_curve_model']
         elif use_ctrl_point_model:
             anchors_pred = self._predict_curve_anchors(split)
@@ -1957,6 +1935,7 @@ class ScalarPredictorPipeline:
 
         with torch.no_grad():
             for batch in loader:
+<<<<<<< HEAD
                 if use_direct_curve_v2_model:
                     batch_x, batch_jsc, batch_voc_true, batch_curves, batch_anchors_true = batch
                     batch_x = batch_x.to(self.device)
@@ -1986,36 +1965,26 @@ class ScalarPredictorPipeline:
                         batch_curves = batch_curves.to(self.device)
                         batch_curves_norm = batch_curves_norm.to(self.device)
                         batch_anchors_true = batch_anchors_true.to(self.device)
+=======
+                if use_direct_curve_model:
+                    # DirectCurveNetWithJsc: uses Jsc from LGBM, predicts Voc + ctrl
+                    batch_x, batch_jsc, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
+                    batch_x = batch_x.to(self.device)
+                    batch_jsc = batch_jsc.to(self.device)
+                    batch_voc_true = batch_voc_true.to(self.device)
+                    batch_curves = batch_curves.to(self.device)
+                    batch_curves_norm = batch_curves_norm.to(self.device)
+                    batch_anchors_true = batch_anchors_true.to(self.device)
+>>>>>>> parent of 49be84c (completely new pipeline)
 
-                        # Model only predicts shape (control points)
-                        ctrl = model(batch_x, batch_jsc, batch_voc_pred)
+                    # Model predicts Voc and control points
+                    pred_voc, ctrl = model(batch_x, batch_jsc)
 
-                        # Reconstruct using shape-only reconstruction with non-uniform knots
-                        pred_curve_norm = reconstruct_curve_shape(
-                            batch_voc_pred, ctrl, v_grid, clamp_voc=True
-                        )
-                        pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_jsc)
-
-                        # Use Voc from pretrained model for anchors
-                        pred_voc = batch_voc_pred
-                    else:
-                        # Legacy DirectCurveNetWithJsc: uses Jsc from LGBM, predicts Voc + ctrl
-                        batch_x, batch_jsc, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
-                        batch_x = batch_x.to(self.device)
-                        batch_jsc = batch_jsc.to(self.device)
-                        batch_voc_true = batch_voc_true.to(self.device)
-                        batch_curves = batch_curves.to(self.device)
-                        batch_curves_norm = batch_curves_norm.to(self.device)
-                        batch_anchors_true = batch_anchors_true.to(self.device)
-
-                        # Model predicts Voc and control points
-                        pred_voc, ctrl = model(batch_x, batch_jsc)
-
-                        # Reconstruct curve in normalized space, then denormalize
-                        pred_curve_norm = reconstruct_curve_direct_normalized(
-                            batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
-                        )
-                        pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_jsc)
+                    # Reconstruct curve in normalized space, then denormalize
+                    pred_curve_norm = reconstruct_curve_direct_normalized(
+                        batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
+                    )
+                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_jsc)
 
                     # Create pseudo-anchors for metric computation
                     # Vmpp and Jmpp are estimated from the curve

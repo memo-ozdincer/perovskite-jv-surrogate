@@ -77,7 +77,7 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-CTRL_POINTS=8  # Shape-only model uses at least 8 for better knee capture
+CTRL_POINTS=6
 
 # Check for HPO file argument
 LOAD_HPO_FLAG=""
