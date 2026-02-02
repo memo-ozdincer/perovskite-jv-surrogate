@@ -2224,13 +2224,57 @@ class ScalarPredictorPipeline:
 
     def _train_voc_model(self, trainer, train_loader, val_loader, config):
         """Custom training loop for Voc model."""
-        # [FIX] Use the robust trainer.fit method instead of manual loop
-        # This ensures GradScaler, correct logging, and patience are handled properly
+        # CRITICAL DIAGNOSTIC: Log normalization stats to verify
+        print("\n" + "=" * 40)
+        print("VOC NN TRAINING DIAGNOSTICS")
+        print("=" * 40)
+        print(f"voc_target_mean: {self.voc_target_mean:.6f}")
+        print(f"voc_target_std:  {self.voc_target_std:.6f}")
+        print(f"voc_feature_mean range: [{self.voc_feature_mean.min():.4f}, {self.voc_feature_mean.max():.4f}]")
+        print(f"voc_feature_std range:  [{self.voc_feature_std.min():.4f}, {self.voc_feature_std.max():.4f}]")
+        print(f"Config: lr={config.lr}, dropout={config.dropout}, jacobian_weight={config.jacobian_weight}")
+        print(f"Hidden dims: {config.hidden_dims}")
+        print("=" * 40 + "\n")
+
+        # Use the robust trainer.fit method
         print("Starting VOC NN training via VocTrainer.fit...")
         history = trainer.fit(train_loader, val_loader)
-        
+
         best_mse = history['val'][-1]['mse'] if history['val'] else 0.0
-        print(f"Voc training complete. Best Val MSE: {best_mse:.6f}")
+        print(f"Voc training complete. Best Val MSE (normalized): {best_mse:.6f}")
+
+        # CRITICAL: Verify model isn't collapsed
+        train = self.splits['train']
+        voc_pred = self._predict_voc_nn(train)
+        voc_true = train['targets']['Voc']
+
+        pred_range = voc_pred.max() - voc_pred.min()
+        true_range = voc_true.max() - voc_true.min()
+        pred_std = voc_pred.std()
+
+        print("\n" + "=" * 40)
+        print("VOC NN OUTPUT DIAGNOSTICS")
+        print("=" * 40)
+        print(f"Predicted Voc range: [{voc_pred.min():.4f}, {voc_pred.max():.4f}]")
+        print(f"True Voc range:      [{voc_true.min():.4f}, {voc_true.max():.4f}]")
+        print(f"Predicted Voc std:   {pred_std:.6f}")
+        print(f"True Voc std:        {voc_true.std():.6f}")
+
+        # MODEL COLLAPSE CHECK
+        if pred_range < 0.01 or pred_std < 0.01:
+            print("\n*** WARNING: MODEL COLLAPSE DETECTED! ***")
+            print("The model is predicting nearly constant values!")
+            print("Likely causes:")
+            print("  1. Jacobian regularization causing NaN gradients")
+            print("  2. Learning rate too high/low")
+            print("  3. Normalization mismatch")
+            print("Try running with jacobian_weight=0\n")
+        elif pred_range < true_range * 0.5:
+            print("\n*** WARNING: Model has limited output range! ***")
+            print(f"Predicted range ({pred_range:.4f}) < 50% of true range ({true_range:.4f})")
+        else:
+            print("\n[OK] Model output range looks reasonable")
+        print("=" * 40 + "\n")
 
     def evaluate(self):
         """Evaluate all models on test set."""

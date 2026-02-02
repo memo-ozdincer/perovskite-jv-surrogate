@@ -61,23 +61,22 @@ class VocNNConfig:
     """Configuration for Voc Neural Network."""
     input_dim: int = 31 + 71  # raw params + physics features
     hidden_dims: list = None
-    dropout: float = 0.1
+    dropout: float = 0.15
     use_layer_norm: bool = True
     use_residual: bool = True
     activation: str = 'gelu'
-    jacobian_weight: float = 0.01  # Smoothness regularization
-    physics_weight: float = 0.1     # Physical ceiling constraint
-    lr: float = 1e-3
+    jacobian_weight: float = 0.0   # DISABLED by default - causes instability
+    physics_weight: float = 0.0    # DISABLED by default - ceiling estimation unreliable
+    lr: float = 5e-4              # Conservative default
     weight_decay: float = 1e-5
-    epochs: int = 100
-    patience: int = 15
-    use_amp: bool = True  # Mixed precision for H100
+    epochs: int = 200
+    patience: int = 30            # More patience for stable training
+    use_amp: bool = True          # Mixed precision for H100
 
     def __post_init__(self):
         if self.hidden_dims is None:
-            # Simpler default: 3 layers tapering from 256 -> 64
-            # Prevents overfitting on limited data
-            self.hidden_dims = [256, 128, 64]
+            # Proven working architecture
+            self.hidden_dims = [384, 256, 128]
 
 
 class ResidualBlock(nn.Module):
@@ -212,30 +211,50 @@ class VocNN(nn.Module):
         """
         Forward pass that also computes input-output Jacobian.
         Used for Jacobian regularization during training.
+
+        FIXED v3.0: Added NaN/inf protection to prevent model collapse.
         """
-        # IMPORTANT:
-        # - Jacobian regularization is extremely sensitive under AMP (fp16/bf16).
-        # - If computed in reduced precision, it can overflow -> inf grads.
-        # - With GradScaler, that silently SKIPS optimizer steps -> "instant plateau".
+        # Jacobian regularization is extremely sensitive under AMP (fp16/bf16).
+        # If computed in reduced precision, it can overflow -> inf grads.
+        # With GradScaler, that silently SKIPS optimizer steps -> "instant plateau".
         # We therefore compute the Jacobian in fp32 and normalize by input_dim.
-        x = x.float().requires_grad_(True)
-        out = self.forward(x, voc_ceiling)
+
+        # Detach and re-enable gradients for clean computation
+        x_detached = x.detach().float().requires_grad_(True)
+        out = self.forward(x_detached, voc_ceiling)
         out_for_grad = out.float()
+
+        # Check for NaN in output (early warning)
+        if torch.isnan(out_for_grad).any():
+            return out, torch.tensor(0.0, device=x.device, requires_grad=True)
 
         # Compute Jacobian norm efficiently via vector-Jacobian product
         # We use random projection for efficiency (Hutchinson's trace estimator)
         v = torch.randn_like(out_for_grad)
-        jacobian_vector = torch.autograd.grad(
-            outputs=out_for_grad,
-            inputs=x,
-            grad_outputs=v,
-            create_graph=True,
-            retain_graph=True
-        )[0]
 
-        # Frobenius norm approximation (mean-square per input dimension)
-        # Scaling makes jacobian_weight less brittle across feature counts.
-        jacobian_norm = (jacobian_vector ** 2).sum(dim=1).mean() / max(1, x.shape[1])
+        try:
+            jacobian_vector = torch.autograd.grad(
+                outputs=out_for_grad,
+                inputs=x_detached,
+                grad_outputs=v,
+                create_graph=True,
+                retain_graph=True
+            )[0]
+
+            # Frobenius norm approximation (mean-square per input dimension)
+            # Scaling makes jacobian_weight less brittle across feature counts.
+            jacobian_norm = (jacobian_vector ** 2).sum(dim=1).mean() / max(1, x.shape[1])
+
+            # CRITICAL: Guard against NaN/inf
+            if torch.isnan(jacobian_norm) or torch.isinf(jacobian_norm):
+                jacobian_norm = torch.tensor(0.0, device=x.device, requires_grad=True)
+            else:
+                # Clamp to reasonable range to prevent gradient explosion
+                jacobian_norm = jacobian_norm.clamp(max=10.0)
+
+        except RuntimeError:
+            # Fallback if autograd fails
+            jacobian_norm = torch.tensor(0.0, device=x.device, requires_grad=True)
 
         return out, jacobian_norm
 

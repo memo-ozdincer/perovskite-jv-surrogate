@@ -62,52 +62,52 @@ def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
     """
     Sample hyperparameters for Voc neural network.
 
-    UPDATED v2.0: Widened search space to allow HPO to find better configs.
-    Previous ranges were too narrow and often converged to suboptimal solutions.
+    UPDATED v3.0: Simplified search space for stability.
+    - Removed problematic Jacobian weights that cause NaN
+    - Constrained architecture to proven working ranges
+    - Focus on learning rate and dropout which matter most
     """
 
-    # Architecture - allow deeper networks with more capacity
-    n_layers = trial.suggest_int('n_layers', 2, 5)  # WAS [2, 3]
+    # Architecture - SIMPLIFIED: 2-3 layers, moderate width
+    n_layers = trial.suggest_int('n_layers', 2, 3)
     hidden_dims = []
     for i in range(n_layers):
-        # Tapering architecture: wide -> narrow
         if i == 0:
-            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256, 384, 512, 768])  # Added 384, 768
-        elif i == 1:
-            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256, 384, 512])   # Added 384, 512
+            dim = trial.suggest_categorical(f'hidden_{i}', [256, 384, 512])
         else:
-            dim = trial.suggest_categorical(f'hidden_{i}', [32, 64, 128, 256])         # Added 32
+            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256])
         hidden_dims.append(dim)
 
-    # Jacobian regularization - expanded range
+    # CRITICAL FIX: Jacobian regularization often causes instability
+    # Start with 0.0 by default, only allow small values
     jacobian_weight = trial.suggest_categorical(
         'jacobian_weight',
-        [0.0, 1e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1]  # Added 1e-6, 1e-1
+        [0.0, 0.0, 0.0, 1e-5, 1e-4]  # Heavily bias toward 0 (no Jacobian)
     )
 
     return VocNNConfig(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
 
-        # Regularization - wider range for dropout
-        dropout=trial.suggest_float('dropout', 0.05, 0.35),  # WAS [0.1, 0.25]
-        use_layer_norm=True,  # Always use for stability
-        use_residual=trial.suggest_categorical('use_residual', [True, False]),
+        # Regularization
+        dropout=trial.suggest_float('dropout', 0.1, 0.3),
+        use_layer_norm=True,
+        use_residual=True,  # Always use - helps gradient flow
 
-        # Activation - GELU is usually best for smooth problems
-        activation=trial.suggest_categorical('activation', ['gelu', 'silu', 'relu']),  # Added relu
+        # Activation
+        activation=trial.suggest_categorical('activation', ['gelu', 'silu']),
 
-        # Regularizers
+        # Regularizers - SIMPLIFIED
         jacobian_weight=jacobian_weight,
-        physics_weight=trial.suggest_float('physics_weight', 0.0, 0.2),  # WAS [0.0, 0.1]
+        physics_weight=0.0,  # DISABLED - causes issues with ceiling estimation
 
-        # Optimizer - WIDER learning rate range
-        lr=trial.suggest_float('lr', 1e-5, 5e-3, log=True),  # WAS [5e-5, 1e-3]
-        weight_decay=trial.suggest_float('weight_decay', 1e-7, 1e-3, log=True),  # Expanded
+        # Optimizer - NARROWER but well-tested range
+        lr=trial.suggest_float('lr', 1e-4, 2e-3, log=True),
+        weight_decay=trial.suggest_float('weight_decay', 1e-6, 1e-4, log=True),
 
-        # Training - wider epoch range, let HPO decide
-        epochs=trial.suggest_int('epochs', 100, 400),  # WAS [150, 300]
-        patience=trial.suggest_int('patience', 20, 50),  # WAS [25, 40]
+        # Training
+        epochs=trial.suggest_int('epochs', 150, 300),
+        patience=30,  # Fixed - don't tune this
         use_amp=True,
     )
 
@@ -176,10 +176,27 @@ class VocNNObjective:
                 batch_y = batch_y.to(self.device)
 
                 trainer.optimizer.zero_grad()
-                # Use same loss as actual training: MSE + Jacobian regularization
-                pred, jac_norm = model.forward_with_jacobian(batch_x)
-                loss = torch.nn.functional.mse_loss(pred, batch_y)
-                loss = loss + config.jacobian_weight * jac_norm
+
+                # FIX: Compute Jacobian safely - skip if weight is 0 or negligible
+                # This was causing NaN/inf and model collapse
+                if config.jacobian_weight > 1e-8:
+                    pred, jac_norm = model.forward_with_jacobian(batch_x)
+                    # Guard against NaN/inf Jacobian (critical fix)
+                    if torch.isnan(jac_norm) or torch.isinf(jac_norm):
+                        jac_norm = torch.tensor(0.0, device=self.device)
+                    # Clamp Jacobian to prevent explosion
+                    jac_norm = jac_norm.clamp(max=100.0)
+                    loss = torch.nn.functional.mse_loss(pred, batch_y)
+                    loss = loss + config.jacobian_weight * jac_norm
+                else:
+                    # No Jacobian - simpler and more stable
+                    pred = model(batch_x)
+                    loss = torch.nn.functional.mse_loss(pred, batch_y)
+
+                # Guard against NaN loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 trainer.optimizer.step()
