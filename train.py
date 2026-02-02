@@ -44,12 +44,6 @@ from models.direct_curve import (
     DirectCurveLossWithJsc, reconstruct_curve_direct_normalized,
     extract_voc_from_curve
 )
-from models.direct_curve_v2 import (
-    DirectCurveNetV2, DirectCurveNetV2Config,
-    DirectCurveNetV2WithVoc,
-    DirectCurveLossV2, DirectCurveLossV2WithVoc,
-    get_params_for_reconstruction, normalize_params_for_loss
-)
 from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
 from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
 from logging_utils import (
@@ -221,8 +215,7 @@ class ScalarPredictorPipeline:
         use_hard_clamp_training: bool = True,  # Fix train-test mismatch
         log_constraint_violations: bool = True,
         verbose_logging: bool = True,
-        use_direct_curve: bool = False,  # Use simplified direct curve model
-        use_direct_curve_v2: bool = False  # Use V2 direct curve (high-accuracy)
+        use_direct_curve: bool = False  # Use simplified direct curve model
     ):
         self.params_file = params_file
         self.iv_file = iv_file
@@ -250,7 +243,6 @@ class ScalarPredictorPipeline:
         self.log_constraint_violations = log_constraint_violations
         self.verbose_logging = verbose_logging
         self.use_direct_curve = use_direct_curve
-        self.use_direct_curve_v2 = use_direct_curve_v2
 
         # Will be populated during pipeline
         self.params_df = None
@@ -780,10 +772,7 @@ class ScalarPredictorPipeline:
 
         # 6. Train curve model (optional)
         if self.run_curve_model:
-            if self.use_direct_curve_v2:
-                print("\n--- Training DirectCurveNetV2 (High-Accuracy) ---")
-                self.train_direct_curve_model_v2()
-            elif self.use_direct_curve:
+            if self.use_direct_curve:
                 print("\n--- Training Direct Curve Model (No Vmpp Split) ---")
                 self.train_direct_curve_model()
             else:
@@ -1576,12 +1565,11 @@ class ScalarPredictorPipeline:
         import time
 
         # Check which model type we have
-        use_direct_curve_v2_model = 'direct_curve_v2_model' in self.models
         use_direct_curve_model = 'direct_curve_model' in self.models
         use_ctrl_point_model = 'ctrl_point_model' in self.models
-        use_legacy_model = 'curve_model' in self.models and not use_direct_curve_model and not use_direct_curve_v2_model
+        use_legacy_model = 'curve_model' in self.models and not use_direct_curve_model
 
-        if not use_direct_curve_model and not use_ctrl_point_model and not use_legacy_model and not use_direct_curve_v2_model:
+        if not use_direct_curve_model and not use_ctrl_point_model and not use_legacy_model:
             raise ValueError("No curve model trained. Run train_curve_model() or train_direct_curve_model() first.")
 
         split = self.splits[split_name]
@@ -1597,35 +1585,8 @@ class ScalarPredictorPipeline:
         curves_true_norm = split.get('curves_norm')
 
         # Prepare data based on model type
-<<<<<<< HEAD
-<<<<<<< HEAD
-        use_shape_net = self.models.get('direct_curve_uses_shape_net', False)
-
-        if use_direct_curve_v2_model:
-            # Get Jsc from LGBM
-=======
         if use_direct_curve_model:
             # DirectCurveNetWithJsc: needs Jsc from LGBM
->>>>>>> parent of 49be84c (completely new pipeline)
-            jsc_pred = self.models['jsc_lgbm'].predict(
-                split['X_raw'], split['X_physics'], split['jsc_ceiling']
-            )
-            voc_true = split['targets']['Voc'].astype(np.float32)
-            
-            ds = torch.utils.data.TensorDataset(
-                torch.from_numpy(X_full),
-                torch.from_numpy(jsc_pred.astype(np.float32)),
-                torch.from_numpy(voc_true),
-                torch.from_numpy(curves_true),
-                torch.from_numpy(anchors_true)
-            )
-            model = self.models['direct_curve_v2_model']
-        elif use_direct_curve_model:
-            # Get Jsc from LGBM
-=======
-        if use_direct_curve_model:
-            # DirectCurveNetWithJsc: needs Jsc from LGBM
->>>>>>> parent of 49be84c (completely new pipeline)
             jsc_pred = self.models['jsc_lgbm'].predict(
                 split['X_raw'], split['X_physics'], split['jsc_ceiling']
             )
@@ -1698,40 +1659,6 @@ class ScalarPredictorPipeline:
 
         with torch.no_grad():
             for batch in loader:
-<<<<<<< HEAD
-<<<<<<< HEAD
-                if use_direct_curve_v2_model:
-                    batch_x, batch_jsc, batch_voc_true, batch_curves, batch_anchors_true = batch
-                    batch_x = batch_x.to(self.device)
-                    batch_jsc = batch_jsc.to(self.device)
-                    batch_curves = batch_curves.to(self.device)
-                    batch_anchors_true = batch_anchors_true.to(self.device)
-
-                    # DirectCurveNetV2 forward pass
-                    pred_curve, pred_voc, _ = model(batch_x, batch_jsc, v_grid, return_params=False)
-                    
-                    # Create pseudo-anchors
-                    power = pred_curve * v_grid.unsqueeze(0)
-                    mpp_idx = power.argmax(dim=1)
-                    batch_idx = torch.arange(pred_curve.shape[0], device=self.device)
-                    pred_vmpp = v_grid[mpp_idx]
-                    pred_jmpp = pred_curve[batch_idx, mpp_idx]
-                    pred_anchors = torch.stack([batch_jsc, pred_voc, pred_vmpp, pred_jmpp], dim=1)
-
-                elif use_direct_curve_model:
-                    if use_shape_net:
-                        # DirectCurveShapeNet: uses Jsc AND Voc from pretrained models
-                        batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
-                        batch_x = batch_x.to(self.device)
-                        batch_jsc = batch_jsc.to(self.device)
-                        batch_voc_pred = batch_voc_pred.to(self.device)
-                        batch_voc_true = batch_voc_true.to(self.device)
-                        batch_curves = batch_curves.to(self.device)
-                        batch_curves_norm = batch_curves_norm.to(self.device)
-                        batch_anchors_true = batch_anchors_true.to(self.device)
-=======
-=======
->>>>>>> parent of 49be84c (completely new pipeline)
                 if use_direct_curve_model:
                     # DirectCurveNetWithJsc: uses Jsc from LGBM, predicts Voc + ctrl
                     batch_x, batch_jsc, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
@@ -1741,10 +1668,6 @@ class ScalarPredictorPipeline:
                     batch_curves = batch_curves.to(self.device)
                     batch_curves_norm = batch_curves_norm.to(self.device)
                     batch_anchors_true = batch_anchors_true.to(self.device)
-<<<<<<< HEAD
->>>>>>> parent of 49be84c (completely new pipeline)
-=======
->>>>>>> parent of 49be84c (completely new pipeline)
 
                     # Model predicts Voc and control points
                     pred_voc, ctrl = model(batch_x, batch_jsc)
@@ -1836,8 +1759,8 @@ class ScalarPredictorPipeline:
                     pchip_linear_sum_cnt = 0
                     pchip_linear_max_abs = 0.0
 
-                if use_direct_curve_v2_model or use_direct_curve_model:
-                    # Direct curve models (V2 and legacy) don't use control points, skip split-spline comparison
+                if use_direct_curve_model:
+                    # Direct curve uses single-region PCHIP, skip split-spline comparison
                     pass
                 elif use_ctrl_point_model:
                     # Evaluate in normalized space when using ControlPointNet
@@ -2354,10 +2277,10 @@ class ScalarPredictorPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description='Train scalar PV predictors')
-    parser.add_argument('--params', type=str, nargs='+', default=[DEFAULT_PARAMS_FILE],
-                        help='Path(s) to parameters file(s) - can specify multiple for concatenation')
-    parser.add_argument('--iv', type=str, nargs='+', default=[DEFAULT_IV_FILE],
-                        help='Path(s) to IV curves file(s) - must match number of params files')
+    parser.add_argument('--params', type=str, default=DEFAULT_PARAMS_FILE,
+                        help='Path to parameters file')
+    parser.add_argument('--iv', type=str, default=DEFAULT_IV_FILE,
+                        help='Path to IV curves file')
     parser.add_argument('--output', type=str, default='outputs',
                         help='Output directory')
     parser.add_argument('--device', type=str, default='cuda',
@@ -2400,8 +2323,6 @@ def main():
                         help='Reduce logging verbosity')
     parser.add_argument('--direct-curve', action='store_true',
                         help='Use direct curve model (no Vmpp split, predicts Voc + shape)')
-    parser.add_argument('--direct-curve-v2', action='store_true',
-                        help='Use DirectCurveNetV2 (high-accuracy, direct 45-point prediction with latent loss)')
 
     args = parser.parse_args()
 
@@ -2435,8 +2356,7 @@ def main():
         use_hard_clamp_training=not args.soft_clamp_training,
         log_constraint_violations=not args.no_constraint_logging,
         verbose_logging=not args.quiet,
-        use_direct_curve=args.direct_curve,
-        use_direct_curve_v2=args.direct_curve_v2
+        use_direct_curve=args.direct_curve
     )
 
     metrics = pipeline.run()
