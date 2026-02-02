@@ -283,6 +283,20 @@ class ScalarPredictorPipeline:
         print("Loading Data")
         print("=" * 60)
 
+        # Show which files will be loaded
+        print(f"Number of file pairs to load: {len(self.params_files)}")
+        for i, (pf, ivf) in enumerate(zip(self.params_files, self.iv_files)):
+            print(f"  [{i+1}] Params: {pf}")
+            print(f"      IV:     {ivf}")
+
+        # Check file existence before loading
+        import os
+        for pf, ivf in zip(self.params_files, self.iv_files):
+            if not os.path.exists(pf):
+                raise FileNotFoundError(f"Parameters file not found: {pf}")
+            if not os.path.exists(ivf):
+                raise FileNotFoundError(f"IV file not found: {ivf}")
+
         if len(self.params_files) == 1:
             # Single file pair (original behavior)
             self.params_df, self.iv_data = load_raw_data(
@@ -295,7 +309,7 @@ class ScalarPredictorPipeline:
                 self.params_files, self.iv_files
             )
 
-        print(f"Loaded {len(self.params_df)} samples total")
+        print(f"\nLoaded {len(self.params_df)} samples total")
         print(f"Parameters shape: {self.params_df.shape}")
         print(f"IV curves shape: {self.iv_data.shape}")
 
@@ -2538,6 +2552,26 @@ def main():
                         help='Use direct curve model (no Vmpp split, predicts Voc + shape)')
 
     args = parser.parse_args()
+
+    # Log input files for debugging
+    print("\n" + "=" * 60)
+    print("INPUT FILES")
+    print("=" * 60)
+    print(f"Primary params: {args.params}")
+    print(f"Primary IV:     {args.iv}")
+    if args.params_extra:
+        print(f"Extra params ({len(args.params_extra)} files):")
+        for f in args.params_extra:
+            print(f"  - {f}")
+    else:
+        print("Extra params:   (none)")
+    if args.iv_extra:
+        print(f"Extra IV ({len(args.iv_extra)} files):")
+        for f in args.iv_extra:
+            print(f"  - {f}")
+    else:
+        print("Extra IV:       (none)")
+    print("=" * 60)
 
     hpo_config = HPOConfig(
         n_trials_nn=args.hpo_trials_nn,

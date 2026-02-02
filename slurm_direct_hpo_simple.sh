@@ -59,7 +59,7 @@ echo ""
 echo "Python: $(which python)"
 echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
-echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\")')"
+echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")')"
 echo ""
 
 # Output directory
@@ -97,8 +97,8 @@ import numpy as np
 import sys
 
 # Load data
-params = np.loadtxt('$WORK_DIR/LHS_parameters_m.txt')
-iv = np.loadtxt('$WORK_DIR/IV_m.txt')
+params = np.loadtxt('$WORK_DIR/LHS_parameters_m.txt', delimiter=',')
+iv = np.loadtxt('$WORK_DIR/IV_m.txt', delimiter=',')
 
 print(f'Parameters shape: {params.shape}')
 print(f'IV curves shape: {iv.shape}')

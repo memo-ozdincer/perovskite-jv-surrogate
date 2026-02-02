@@ -61,7 +61,7 @@ echo ""
 echo "Python: $(which python)"
 echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
-echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\")')"
+echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")')"
 echo ""
 
 # Output directory with timestamp
