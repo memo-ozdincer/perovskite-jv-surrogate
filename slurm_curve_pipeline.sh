@@ -125,8 +125,8 @@ echo ""
 # BUILD COMMAND
 # ============================================================================
 CMD="python train.py \
-    --params \"$WORK_DIR/LHS_parameters_m.txt\" \"$WORK_DIR/LHS_parameters_m_300k.txt\" \
-    --iv \"$WORK_DIR/IV_m.txt\" \"$WORK_DIR/IV_m_300k.txt\" \
+    --params \"$WORK_DIR/LHS_parameters_m.txt\" \
+    --iv \"$WORK_DIR/IV_m.txt\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \

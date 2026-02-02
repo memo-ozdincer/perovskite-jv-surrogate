@@ -46,8 +46,8 @@ mkdir -p $OUTPUT_DIR
 # This is useful if you want to try different random seeds or configurations
 for GPU_ID in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
-        --params $WORK_DIR/LHS_parameters_m.txt $WORK_DIR/LHS_parameters_m_300k.txt \
-        --iv $WORK_DIR/IV_m.txt $WORK_DIR/IV_m_300k.txt \
+        --params $WORK_DIR/LHS_parameters_m.txt \
+        --iv $WORK_DIR/IV_m.txt \
         --output ${OUTPUT_DIR}/gpu${GPU_ID} \
         --device cuda \
         --hpo-trials-nn 300 \

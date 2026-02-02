@@ -1,5 +1,5 @@
 PHYSICS-CONSTRAINED SPLIT-SPLINE J-V CURVE RECONSTRUCTION FOR PEROVSKITE SOLAR CELLS
-CONDENSED IMPLEMENTATION PLAN (AS-BUILT PIPELINE v4.0 - DIRECT CURVE V2 EDITION)
+CONDENSED IMPLEMENTATION PLAN (AS-BUILT PIPELINE v2.0 - ROBUST LOGGING EDITION)
 
 ================================================================================
 PROBLEM STATEMENT
@@ -290,8 +290,6 @@ Feature options:
 Training options:
   --train-curves         Train split-spline curve model
   --train-cvae           Train CVAE baseline for comparison
-  --direct-curve         Use V1 direct curve (control points + PCHIP)
-  --direct-curve-v2      Use V2 direct curve (high-accuracy, 45-point direct) [NEW v4.0]
   --device DEVICE        cuda or cpu (default: cuda)
 
 Model options:
@@ -314,17 +312,16 @@ OUTPUT FILES GENERATED
 After training with --train-curves --train-cvae:
 
 Models:
-  models/ctrl_point_model.pt     - ControlPointNet checkpoint (V1 curve model)
-  models/direct_curve_v2_model.pt - DirectCurveNetV2 checkpoint (V2 high-accuracy) [NEW v4.0]
-  models/curve_model.pt          - Legacy UnifiedSplitSplineNet checkpoint (if trained)
-  models/cvae_model.pt           - CVAE checkpoint (comparison only)
-  models/voc_nn.pt               - Voc neural network
-  models/voc_lgbm.txt            - Voc LightGBM
-  models/jsc_lgbm.txt            - Jsc LightGBM
-  models/vmpp_lgbm.txt           - Vmpp LightGBM
-  models/jmpp_lgbm.txt           - Jmpp LightGBM
-  models/ff_lgbm.txt             - FF LightGBM
-  models/preprocessor.joblib     - Parameter/curve preprocessing state
+  models/ctrl_point_model.pt  - ControlPointNet checkpoint (primary curve model)
+  models/curve_model.pt       - Legacy UnifiedSplitSplineNet checkpoint (if trained)
+  models/cvae_model.pt        - CVAE checkpoint (comparison only)
+  models/voc_nn.pt            - Voc neural network
+  models/voc_lgbm.txt         - Voc LightGBM
+  models/jsc_lgbm.txt         - Jsc LightGBM
+  models/vmpp_lgbm.txt        - Vmpp LightGBM
+  models/jmpp_lgbm.txt        - Jmpp LightGBM
+  models/ff_lgbm.txt          - FF LightGBM
+  models/preprocessor.joblib  - Parameter/curve preprocessing state
 
 Logs (new in v2.0):
   constraint_violations.csv   - How often network tried to violate physics
@@ -339,27 +336,10 @@ Metrics:
   metrics.json                - Final test set metrics
 
 ================================================================================
-SLURM SCRIPTS (UPDATED FOR v4.0)
+SLURM SCRIPT (UPDATED FOR v2.0)
 ================================================================================
+File: `slurm_curve_pipeline.sh`
 
-AVAILABLE SCRIPTS:
-
-1. slurm_curve_pipeline.sh - Original split-spline pipeline
-   Time: 30 hours, Full HPO + CVAE comparison
-
-2. slurm_direct_hpo.sh - V1 direct curve WITH HPO
-   Time: 20 hours, Control points + PCHIP
-
-3. slurm_direct_no_hpo.sh - V1 direct curve WITHOUT HPO (fast)
-   Time: 4 hours, Default hyperparameters
-
-4. slurm_direct_v2.sh - V2 direct curve (HIGH-ACCURACY) [NEW v4.0]
-   Time: 12 hours, Direct 45-point prediction + parameter reconstruction
-   TARGET: >99% R² following Zbinden (2026) and Toprak (2025)
-
---------------------------------------------------------------------------------
-V1 SPLIT-SPLINE: slurm_curve_pipeline.sh
---------------------------------------------------------------------------------
 Configuration variables:
   HPO_TRIALS_NN=50            # Reduced due to simplified search space
   HPO_TRIALS_LGBM=100         # Reduced due to simplified search space
@@ -384,39 +364,6 @@ Full command:
     --hpo-timeout $HPO_TIMEOUT \
     --continuity-weight $CONTINUITY_WEIGHT \
     --ctrl-points $CTRL_POINTS
-
---------------------------------------------------------------------------------
-V2 HIGH-ACCURACY: slurm_direct_v2.sh [NEW v4.0]
---------------------------------------------------------------------------------
-Configuration variables:
-  HPO_TRIALS_NN=5             # Only for Voc NN
-  HPO_TRIALS_LGBM=100         # For Jsc, Vmpp, Jmpp
-  HPO_TIMEOUT=7200            # 2 hours per model
-
-Time limit: 12 hours
-
-Features:
-  - Direct 45-point prediction (no control point bottleneck)
-  - Parameter reconstruction loss (6 key physics parameters)
-  - Hard monotonicity via cumulative decrements
-  - Region-weighted loss (3x weight on knee region)
-
-Full command:
-  python train.py \
-    --params "$WORK_DIR/LHS_parameters_m.txt" "$WORK_DIR/LHS_parameters_m_300k.txt" \
-    --iv "$WORK_DIR/IV_m.txt" "$WORK_DIR/IV_m_300k.txt" \
-    --output "$OUT_DIR" \
-    --device cuda \
-    --train-curves \
-    --direct-curve-v2 \
-    --drop-weak-features \
-    --drop-multicollinear \
-    --hpo-trials-nn $HPO_TRIALS_NN \
-    --hpo-trials-lgbm $HPO_TRIALS_LGBM \
-    --hpo-timeout $HPO_TIMEOUT
-
-To reuse HPO results from previous run:
-  sbatch slurm_direct_v2.sh /path/to/hpo_results.json
 
 ================================================================================
 INFERENCE PIPELINE
@@ -728,188 +675,10 @@ FLOP Counting (optional):
     print(f"FLOPs: {flops/1e9:.2f}G, Params: {params/1e6:.2f}M")
 
 ================================================================================
-DIRECT CURVE V2: HIGH-ACCURACY ARCHITECTURE (NEW IN v4.0)
-================================================================================
-File: `models/direct_curve_v2.py`
-
-TARGET: >99% R² accuracy (inspired by Zbinden et al. 2026 R²=0.996 and Toprak 2025 R>0.9996)
-
-MOTIVATION - Why V2?
-  The original Split-Spline approach with control points + PCHIP has a fundamental
-  information bottleneck: K control points cannot fully represent the 45-point curve.
-  This limits accuracy regardless of how well the control points are predicted.
-
-KEY IMPROVEMENTS OVER V1 (CONTROL POINT + PCHIP):
-
-1. DIRECT 45-POINT PREDICTION (no control point bottleneck)
-   - Network directly predicts all 45 curve points
-   - Removes information loss from PCHIP interpolation
-   - Each curve point can be optimized independently
-
-2. PARAMETER RECONSTRUCTION LOSS (Zbinden's "latent loss")
-   - Network also reconstructs 6 key physics parameters from learned features
-   - Forces encoder to learn physically meaningful representations
-   - Parameters: mue_P, muh_P, Gavg, Aug, Brad, SRV_E
-   - These are the most important physics drivers of J-V characteristics
-
-3. HARD MONOTONICITY via cumulative decrements
-   - Network predicts positive decrements (softplus activation)
-   - Curve = Jsc - cumsum(decrements) * Jsc / sum(decrements)
-   - Guarantees monotonically decreasing J-V curve by construction
-   - Endpoint constraint: curve starts at Jsc, ends near 0 at Voc
-
-4. REGION-WEIGHTED LOSS
-   - Higher weight on knee region (~0.75 * Voc) where curve shape changes rapidly
-   - Endpoint constraints (Jsc at V=0, ~0 at Voc)
-   - Smoothness penalty for non-physical oscillations
-
-ARCHITECTURE:
-
-DirectCurveNetV2 (core model, takes Jsc as input):
-  Input: features (102-dim) + Jsc (from pretrained LGBM)
-  Encoder: MLP with residual connections
-    - Layers: configurable (default 4)
-    - Hidden dim: configurable (default 512)
-    - Activation: SiLU
-    - Normalization: LayerNorm
-    - Dropout: 0.1
-  Curve Head: Linear → Softplus → 45-point decrements
-    - cumsum gives monotonically increasing sequence
-    - Normalize by total → fraction in [0, 1]
-    - Curve = Jsc * (1 - fraction)
-  Parameter Head (optional): Linear → 6 reconstructed parameters
-  Output: 45-point curve, optionally Voc + reconstructed parameters
-
-DirectCurveNetV2WithVoc (full model, predicts Voc jointly):
-  Input: features (102-dim) + Jsc (from pretrained LGBM)
-  Encoder: Same as above
-  Voc Head: Linear → Softplus (ensures positive)
-  Curve Head: Same as above (uses predicted Voc for knee weighting)
-  Parameter Head: Same as above
-  Output: 45-point curve + Voc + reconstructed parameters
-
-LOSS FUNCTIONS:
-
-DirectCurveLossV2:
-  L_total = L_curve + λ_endpoint * L_endpoint + λ_smooth * L_smooth + λ_params * L_params
-
-  L_curve: Region-weighted MSE on 45 points
-    - Knee region (0.6*Voc to 0.9*Voc): 3x weight
-    - Elsewhere: 1x weight
-
-  L_endpoint: Hard endpoint constraint
-    - |pred[0] - Jsc|² (must start at Jsc)
-    - |pred[-1] - 0|² (must end near 0 at Voc)
-
-  L_smooth: Second derivative penalty
-    - Σ|pred[i+1] - 2*pred[i] + pred[i-1]|²
-    - Prevents non-physical oscillations
-
-  L_params: Parameter reconstruction MSE
-    - MSE(reconstructed_params, true_params) on normalized scale
-    - Only active if param_weight > 0
-
-DirectCurveLossV2WithVoc (adds Voc loss):
-  L_total = L_curve + L_voc + L_endpoint + L_smooth + L_params
-  L_voc = MSE(pred_voc, true_voc) * voc_weight
-
-CONFIG CLASSES:
-
-DirectCurveNetV2Config:
-  - input_dim: Number of input features (default 102)
-  - n_curve_points: Output curve points (default 45)
-  - hidden_dim: Encoder hidden dimension (default 512)
-  - n_layers: Number of encoder layers (default 4)
-  - dropout: Dropout rate (default 0.1)
-  - use_residual: Use residual connections (default True)
-  - n_params_to_reconstruct: Number of physics params (default 6)
-
-HELPER FUNCTIONS:
-
-get_params_for_reconstruction(X_raw, param_names):
-  Extracts the 6 key physics parameters from raw input:
-    - mue_P: Electron mobility in perovskite
-    - muh_P: Hole mobility in perovskite
-    - Gavg: Generation rate
-    - Aug: Auger recombination coefficient
-    - Brad: Radiative recombination coefficient
-    - SRV_E: Surface recombination velocity (ETL side)
-
-normalize_params_for_loss(params, param_names):
-  Log-normalizes parameters for balanced loss contribution:
-    - log1p transform compresses orders of magnitude
-    - Zero-mean, unit-variance scaling
-
-CLI USAGE:
-
-  python train.py \
-    --params LHS_parameters_m.txt LHS_parameters_m_300k.txt \
-    --iv IV_m.txt IV_m_300k.txt \
-    --output outputs_direct_v2/ \
-    --device cuda \
-    --train-curves \
-    --direct-curve-v2 \        # <-- New flag for V2
-    --drop-weak-features \
-    --drop-multicollinear \
-    --hpo-trials-nn 5 \
-    --hpo-trials-lgbm 100
-
-SLURM SCRIPT:
-
-File: `slurm_direct_v2.sh`
-  - Uses --direct-curve-v2 flag
-  - HPO_TRIALS_NN=5 (Voc NN only)
-  - HPO_TRIALS_LGBM=100 (for Jsc, Vmpp, Jmpp)
-  - HPO_TIMEOUT=7200 (2 hours per model)
-  - Time limit: 12 hours
-
-  Output files:
-    - $OUT_DIR/hpo_results.json (reusable for future runs)
-    - $OUT_DIR/models/direct_curve_v2_model.pt
-    - $OUT_DIR/metrics.json
-    - $OUT_DIR/training_summary.json
-
-  To skip HPO in future runs:
-    sbatch slurm_direct_v2.sh $OUT_DIR/hpo_results.json
-
-TRAINING FLOW (train_direct_curve_model_v2):
-
-1. Extract Jsc values from true curves (first point)
-2. Extract 6 physics parameters for reconstruction loss
-3. Normalize parameters for balanced loss
-4. Initialize DirectCurveNetV2WithVoc with config
-5. Training loop:
-   a. Forward pass: features + Jsc → curve + Voc + params
-   b. Compute region-weighted curve loss
-   c. Compute Voc MSE loss
-   d. Compute parameter reconstruction loss
-   e. Compute smoothness penalty
-   f. Backprop combined loss
-6. Validation: Track R² on hold-out set
-7. Save best model checkpoint
-
-COMPARISON: V1 vs V2
-
-| Aspect              | V1 (Split-Spline)        | V2 (Direct Curve)        |
-|---------------------|--------------------------|--------------------------|
-| Output              | K control points + PCHIP | 45 points directly       |
-| Monotonicity        | PCHIP guarantees         | Cumulative decrements    |
-| Information         | Bottleneck at K points   | Full 45-point capacity   |
-| Physics encoding    | None                     | Parameter reconstruction |
-| Knee handling       | Split at Vmpp            | Region weighting         |
-| Typical R²          | ~0.95-0.98               | Target >0.99             |
-
-EXPECTED IMPROVEMENTS:
-  - 2-5% higher R² (removes control point bottleneck)
-  - Better knee region accuracy (explicit weighting)
-  - More physically meaningful features (parameter reconstruction)
-  - Comparable inference speed (same encoder, different head)
-
-================================================================================
-KEY IMPLEMENTATION DETAILS FOR REPLICATION (UPDATED v4.0)
+KEY IMPLEMENTATION DETAILS FOR REPLICATION (UPDATED v3.0)
 ================================================================================
 Voltage grid: `config.py` hardcodes `V_GRID` (45 points)
-Control points: Default K=4 per region → 6 knots total per region (V1 only)
+Control points: Default K=4 per region → 6 knots total per region
 Cumulative scaling: build_knots uses cumsum for guaranteed monotonicity
 PCHIP slopes: Fritsch-Carlson with eps=1e-12 safe division
 Continuity: Finite differences with local grid spacing
@@ -928,14 +697,6 @@ Training space: Normalized [-1, 1] for better gradients
 Evaluation space: Absolute [0, isc] for interpretability
 Validation: Round-trip error < 1e-4, normalized range [-1.1, 1.1]
 
-**NEW in v4.0:**
-DirectCurveNetV2: Direct 45-point prediction (no control point bottleneck)
-Parameter reconstruction: 6 key physics parameters (latent loss)
-Cumulative decrements: Guaranteed monotonicity by construction
-Region weighting: 3x weight on knee region (0.6-0.9 * Voc)
-CLI flag: --direct-curve-v2 for new architecture
-SLURM script: slurm_direct_v2.sh for cluster runs
-
 ================================================================================
-END OF DOCUMENTATION (v4.0 - WITH DIRECT CURVE V2 HIGH-ACCURACY)
+END OF DOCUMENTATION (v3.0 - WITH DATA PREPROCESSING PIPELINE)
 ================================================================================

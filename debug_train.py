@@ -377,10 +377,10 @@ def train_ff_lgbm(data: dict, n_estimators: int = 100, verbose: bool = True):
 
 def main():
     parser = argparse.ArgumentParser(description='Debug training for scalar predictors')
-    parser.add_argument('--params', type=str, nargs='+', default=[DEFAULT_PARAMS_FILE],
-                        help='Path(s) to parameters file(s) - can specify multiple for concatenation')
-    parser.add_argument('--iv', type=str, nargs='+', default=[DEFAULT_IV_FILE],
-                        help='Path(s) to IV curves file(s) - must match number of params files')
+    parser.add_argument('--params', type=str, default=DEFAULT_PARAMS_FILE,
+                        help='Path to parameters file')
+    parser.add_argument('--iv', type=str, default=DEFAULT_IV_FILE,
+                        help='Path to IV curves file')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device (cuda/cpu)')
     parser.add_argument('--n-samples', type=int, default=None,

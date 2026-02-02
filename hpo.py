@@ -753,39 +753,32 @@ def run_full_hpo(
         )
         return model
 
-    # 1. Voc Neural Network (skip for direct curve mode)
-    if not direct_curve_only:
-        print("=" * 60)
-        print("HPO: Voc Neural Network")
-        print("=" * 60)
-        voc_params, voc_study = engine.optimize_voc_nn(
-            X_train_full, targets_train['Voc'],
-            X_val_full, targets_val['Voc'],
-            voc_ceiling_train, voc_ceiling_val,
-            device
-        )
-        results['voc_nn'] = {'params': voc_params, 'study': voc_study}
+    # 1. Voc Neural Network (ALWAYS run - needed for direct curve shape model too)
+    print("=" * 60)
+    print("HPO: Voc Neural Network")
+    print("=" * 60)
+    voc_params, voc_study = engine.optimize_voc_nn(
+        X_train_full, targets_train['Voc'],
+        X_val_full, targets_val['Voc'],
+        voc_ceiling_train, voc_ceiling_val,
+        device
+    )
+    results['voc_nn'] = {'params': voc_params, 'study': voc_study}
 
-        # Train Voc NN to generate predicted Voc for downstream HPO
-        voc_config = get_best_configs_from_study({'voc_nn': {'params': voc_params}})['voc_nn']
-        voc_config.input_dim = X_train_full.shape[1]
-        voc_model, voc_mean, voc_std = _train_voc_for_features(
-            X_train_full, targets_train['Voc'],
-            X_val_full, targets_val['Voc'],
-            voc_config, device
-        )
-        voc_model.eval()
-        with torch.no_grad():
-            voc_pred_train = voc_model(torch.from_numpy(X_train_full).float().to(device)).cpu().numpy()
-            voc_pred_val = voc_model(torch.from_numpy(X_val_full).float().to(device)).cpu().numpy()
-        voc_pred_train = voc_pred_train * voc_std + voc_mean
-        voc_pred_val = voc_pred_val * voc_std + voc_mean
-    else:
-        print("=" * 60)
-        print("Skipping Voc NN HPO (direct curve mode)")
-        print("=" * 60)
-        voc_pred_train = None
-        voc_pred_val = None
+    # Train Voc NN to generate predicted Voc for downstream HPO
+    voc_config = get_best_configs_from_study({'voc_nn': {'params': voc_params}})['voc_nn']
+    voc_config.input_dim = X_train_full.shape[1]
+    voc_model, voc_mean, voc_std = _train_voc_for_features(
+        X_train_full, targets_train['Voc'],
+        X_val_full, targets_val['Voc'],
+        voc_config, device
+    )
+    voc_model.eval()
+    with torch.no_grad():
+        voc_pred_train = voc_model(torch.from_numpy(X_train_full).float().to(device)).cpu().numpy()
+        voc_pred_val = voc_model(torch.from_numpy(X_val_full).float().to(device)).cpu().numpy()
+    voc_pred_train = voc_pred_train * voc_std + voc_mean
+    voc_pred_val = voc_pred_val * voc_std + voc_mean
 
     # 2. Jsc LGBM (with ceiling feature)
     print("=" * 60)

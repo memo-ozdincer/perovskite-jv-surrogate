@@ -77,7 +77,7 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-CTRL_POINTS=6
+CTRL_POINTS=8  # Shape-only model uses at least 8 for better knee capture
 
 # Check for HPO file argument
 LOAD_HPO_FLAG=""
@@ -97,8 +97,8 @@ echo ""
 # BUILD COMMAND
 # ============================================================================
 CMD="python train.py \
-    --params \"$WORK_DIR/LHS_parameters_m.txt\" \"$WORK_DIR/LHS_parameters_m_300k.txt\" \
-    --iv \"$WORK_DIR/IV_m.txt\" \"$WORK_DIR/IV_m_300k.txt\" \
+    --params \"$WORK_DIR/LHS_parameters_m.txt\" \
+    --iv \"$WORK_DIR/IV_m.txt\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \

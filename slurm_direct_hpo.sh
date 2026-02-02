@@ -73,10 +73,10 @@ echo "Output directory: $OUT_DIR"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-HPO_TRIALS_NN=5        # HPO trials for Jsc LGBM (Voc NN still runs for comparison)
+HPO_TRIALS_NN=5        # HPO trials for Voc NN (used by shape model)
 HPO_TRIALS_LGBM=100       # HPO trials for LightGBM models
 HPO_TIMEOUT=7200          # 2 hours per model
-CTRL_POINTS=6             # Control points for direct curve model
+CTRL_POINTS=8             # Shape-only model uses at least 8 for better knee capture
 
 echo ""
 echo "Configuration:"
@@ -90,8 +90,8 @@ echo ""
 # BUILD COMMAND
 # ============================================================================
 CMD="python train.py \
-    --params \"$WORK_DIR/LHS_parameters_m.txt\" \"$WORK_DIR/LHS_parameters_m_300k.txt\" \
-    --iv \"$WORK_DIR/IV_m.txt\" \"$WORK_DIR/IV_m_300k.txt\" \
+    --params \"$WORK_DIR/LHS_parameters_m.txt\" \
+    --iv \"$WORK_DIR/IV_m.txt\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
