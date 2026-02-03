@@ -91,6 +91,12 @@ class ModelComparisonMetrics:
     violations_j_exceeds_jsc: int = 0
     inference_time_ms: float = 0.0
     total_samples: int = 0
+    # New: more interpretable metrics
+    r2_full_curve: float = 0.0
+    r2_region1: float = 0.0
+    r2_region2: float = 0.0
+    nrmse_full_pct: float = 0.0  # Normalized RMSE as percentage
+    median_curve_r2: float = 0.0  # Median per-sample R²
 
     @property
     def total_violations(self) -> int:
@@ -323,12 +329,20 @@ class TrainingLogger:
         if not self.model_comparisons:
             return "No model comparisons logged."
 
-        table = "| Model | MSE Full | MSE R1 | MSE R2 | FF MAPE (%) | Violations/1000 | Time (ms) |\n"
-        table += "|-------|----------|--------|--------|-------------|-----------------|------------|\n"
+        # Primary table with interpretable metrics (R², NRMSE)
+        table = "| Model | R² (Full) | R² (R1) | R² (R2) | NRMSE (%) | FF MAPE (%) | Violations/1000 |\n"
+        table += "|-------|-----------|---------|---------|-----------|-------------|------------------|\n"
 
         for m in self.model_comparisons:
-            table += f"| {m.model_name} | {m.mse_full_curve:.6f} | {m.mse_region1:.6f} | {m.mse_region2:.6f} | "
-            table += f"{m.mape_ff:.2f} | {m.violations_per_1000:.2f} | {m.inference_time_ms:.2f} |\n"
+            table += f"| {m.model_name} | {m.r2_full_curve:.4f} | {m.r2_region1:.4f} | {m.r2_region2:.4f} | "
+            table += f"{m.nrmse_full_pct:.2f} | {m.mape_ff:.2f} | {m.violations_per_1000:.2f} |\n"
+
+        # Secondary table with raw MSE for reference
+        table += "\n*Raw MSE values (for reference):*\n"
+        table += "| Model | MSE Full | MSE R1 | MSE R2 |\n"
+        table += "|-------|----------|--------|--------|\n"
+        for m in self.model_comparisons:
+            table += f"| {m.model_name} | {m.mse_full_curve:.2f} | {m.mse_region1:.2f} | {m.mse_region2:.2f} |\n"
 
         return table
 

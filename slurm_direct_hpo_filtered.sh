@@ -10,22 +10,14 @@
 #SBATCH --account=aip-aspuru
 
 # ============================================================================
-# Direct Curve Pipeline - FILTERED VERSION (NO HPO)
+# Direct Curve Pipeline with Preprocessed Data
 # ============================================================================
-# This version filters out outlier samples before training to improve
-# model accuracy on well-behaved IV curves.
-#
-# Filtering criteria (based on IV curve analysis):
-# - Remove samples with Fill Factor < 0.30 (abnormal IV curve shapes)
-# - Remove samples with Vmpp <= 0.30 (extreme operating conditions)
-#
-# These filters remove ~15% of samples but improve R² by ~4-5%.
-#
-# NO HPO - uses default hyperparameters for fast iteration
+# This version uses preprocessed (quality-filtered) data for training.
+# The preprocessing step removes anomalous samples to improve model accuracy.
 # ============================================================================
 
 echo "==========================================="
-echo "FILTERED VERSION (NO HPO) - Outlier Removal"
+echo "PREPROCESSED DATA PIPELINE"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "Start time: $(date)"
@@ -55,46 +47,64 @@ echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available()
 echo "GPU: $(python -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")')"
 echo ""
 
-# Output directory
-OUT_DIR="$WORK_DIR/outputs_filtered_$(date +%Y%m%d_%H%M%S)"
-RESULTS_DIR="$WORK_DIR/results"
-
 # ============================================================================
-# CONFIGURATION - FILTERED (NO HPO)
+# STEP 1: DATA PREPROCESSING
 # ============================================================================
-CTRL_POINTS=8
+PREPROCESS_DIR="$WORK_DIR/preprocessed"
+mkdir -p "$PREPROCESS_DIR"
 
-# Filtering thresholds (based on curve error analysis)
-FILTER_MIN_FF=0.30      # Drop samples with FF < 0.30
-FILTER_MIN_VMPP=0.30    # Drop samples with Vmpp <= 0.30
+echo "==========================================="
+echo "STEP 1: Data Preprocessing"
+echo "==========================================="
 
-# Additional data files
-PARAMS_EXTRA="$WORK_DIR/LHS_parameters_m_300k.txt"
-IV_EXTRA="$WORK_DIR/IV_m_300k.txt"
+# Preprocess primary dataset (100k)
+python scripts/preprocess_data.py \
+    --params "$WORK_DIR/LHS_parameters_m.txt" \
+    --iv "$WORK_DIR/IV_m.txt" \
+    --output-dir "$PREPROCESS_DIR" \
+    --min-ff 0.30 \
+    --min-vmpp 0.30 \
+    --suffix "_clean"
+
+# Preprocess extra dataset (300k)
+python scripts/preprocess_data.py \
+    --params "$WORK_DIR/LHS_parameters_m_300k.txt" \
+    --iv "$WORK_DIR/IV_m_300k.txt" \
+    --output-dir "$PREPROCESS_DIR" \
+    --min-ff 0.30 \
+    --min-vmpp 0.30 \
+    --suffix "_clean"
 
 echo ""
-echo "Configuration (FILTERED - NO HPO):"
+echo "Preprocessing complete. Using cleaned datasets for training."
+echo ""
+
+# ============================================================================
+# STEP 2: MODEL TRAINING (NO HPO)
+# ============================================================================
+OUT_DIR="$WORK_DIR/outputs_preprocessed_$(date +%Y%m%d_%H%M%S)"
+RESULTS_DIR="$WORK_DIR/results"
+
+CTRL_POINTS=8
+
+echo "==========================================="
+echo "STEP 2: Model Training"
+echo "==========================================="
+echo ""
+echo "Configuration:"
 echo "  CTRL_POINTS: $CTRL_POINTS"
 echo "  HPO: DISABLED"
 echo ""
-echo "Outlier Filtering:"
-echo "  FILTER_MIN_FF: $FILTER_MIN_FF"
-echo "  FILTER_MIN_VMPP: $FILTER_MIN_VMPP"
-echo "  Expected drop: ~15% of samples"
-echo ""
-echo "Data files:"
-echo "  Primary: $WORK_DIR/LHS_parameters_m.txt, $WORK_DIR/IV_m.txt"
-echo "  Extra: $PARAMS_EXTRA, $IV_EXTRA"
+echo "Data files (preprocessed):"
+echo "  Primary: $PREPROCESS_DIR/LHS_parameters_m_clean.txt"
+echo "  Extra:   $PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
 echo ""
 
-# ============================================================================
-# BUILD COMMAND
-# ============================================================================
 CMD="python train.py \
-    --params \"$WORK_DIR/LHS_parameters_m.txt\" \
-    --iv \"$WORK_DIR/IV_m.txt\" \
-    --params-extra \"$PARAMS_EXTRA\" \
-    --iv-extra \"$IV_EXTRA\" \
+    --params \"$PREPROCESS_DIR/LHS_parameters_m_clean.txt\" \
+    --iv \"$PREPROCESS_DIR/IV_m_clean.txt\" \
+    --params-extra \"$PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt\" \
+    --iv-extra \"$PREPROCESS_DIR/IV_m_300k_clean.txt\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
@@ -103,9 +113,6 @@ CMD="python train.py \
     --drop-multicollinear \
     --no-hpo \
     --ctrl-points $CTRL_POINTS \
-    --filter-outliers \
-    --filter-min-ff $FILTER_MIN_FF \
-    --filter-min-vmpp $FILTER_MIN_VMPP \
     --report-trimmed-metrics"
 
 echo "Running command:"
@@ -123,11 +130,14 @@ cp -f "$OUT_DIR/curve_error_analysis_summary.json" "$RESULTS_DIR/${RUN_TAG}_curv
 cp -f "$OUT_DIR/outlier_detection.csv" "$RESULTS_DIR/${RUN_TAG}_outlier_detection.csv" 2>/dev/null
 cp -f "$OUT_DIR/model_comparison.md" "$RESULTS_DIR/${RUN_TAG}_model_comparison.md" 2>/dev/null
 
+# Copy preprocessing stats
+cp -f "$PREPROCESS_DIR/preprocessing_stats_clean.json" "$RESULTS_DIR/${RUN_TAG}_preprocessing_stats.json" 2>/dev/null
 
 echo ""
 echo "==========================================="
-echo "FILTERED VERSION (NO HPO) - Complete"
+echo "PIPELINE COMPLETE"
 echo "End time: $(date)"
 echo "==========================================="
 echo ""
 echo "Output: $OUT_DIR"
+echo "Preprocessing stats: $PREPROCESS_DIR/preprocessing_stats_clean.json"

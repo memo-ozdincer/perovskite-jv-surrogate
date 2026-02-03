@@ -1825,6 +1825,15 @@ class ScalarPredictorPipeline:
         sum_sq_r2 = 0.0
         sum_cnt_r2 = 0.0
 
+        # For R² computation: track variance of true curves
+        sum_true = 0.0  # sum of true values
+        sum_true_sq = 0.0  # sum of squared true values
+        curve_min = float('inf')
+        curve_max = float('-inf')
+
+        # Per-sample R² values for median computation
+        per_sample_r2_list = []
+
         jsc_mae = 0.0
         voc_mae = 0.0
         vmpp_mae = 0.0
@@ -1959,6 +1968,19 @@ class ScalarPredictorPipeline:
                 sum_sq_full += err.sum().item()
                 sum_cnt += err.numel()
 
+                # Track true curve statistics for R² and NRMSE
+                sum_true += batch_curves.sum().item()
+                sum_true_sq += (batch_curves ** 2).sum().item()
+                curve_min = min(curve_min, batch_curves.min().item())
+                curve_max = max(curve_max, batch_curves.max().item())
+
+                # Per-sample R² for median computation
+                curve_ss_res_batch = err.sum(dim=1)
+                curve_mean_batch = batch_curves.mean(dim=1, keepdim=True)
+                curve_ss_tot_batch = ((batch_curves - curve_mean_batch) ** 2).sum(dim=1).clamp(min=1e-12)
+                r2_batch = (1.0 - (curve_ss_res_batch / curve_ss_tot_batch)).detach().cpu().numpy()
+                per_sample_r2_list.extend(r2_batch.tolist())
+
                 vmpp = pred_anchors[:, 2].unsqueeze(1)
                 mask_r1 = v_grid.unsqueeze(0) <= vmpp
                 mask_r2 = ~mask_r1
@@ -2073,10 +2095,35 @@ class ScalarPredictorPipeline:
         n_samples = max(1, len(split['X_raw']))
         inference_time_ms = (elapsed_time / n_samples) * 1000
 
+        # Compute R² and NRMSE
+        mse_full = sum_sq_full / max(1.0, sum_cnt)
+        mean_true = sum_true / max(1.0, sum_cnt)
+        var_true = (sum_true_sq / max(1.0, sum_cnt)) - (mean_true ** 2)
+        var_true = max(var_true, 1e-12)  # Avoid division by zero
+
+        r2_full = 1.0 - (mse_full / var_true)
+        rmse_full = np.sqrt(mse_full)
+        curve_range = max(curve_max - curve_min, 1e-12)
+        nrmse_pct = (rmse_full / curve_range) * 100
+
+        # Median per-sample R²
+        median_r2 = float(np.median(per_sample_r2_list)) if per_sample_r2_list else 0.0
+
+        # R² for regions (approximate using same variance)
+        mse_r1 = sum_sq_r1 / max(1.0, sum_cnt_r1)
+        mse_r2 = sum_sq_r2 / max(1.0, sum_cnt_r2)
+        r2_r1 = 1.0 - (mse_r1 / var_true)  # Approximation using full variance
+        r2_r2 = 1.0 - (mse_r2 / var_true)
+
         results = {
-            'mse_full_curve': sum_sq_full / max(1.0, sum_cnt),
-            'mse_region1': sum_sq_r1 / max(1.0, sum_cnt_r1),
-            'mse_region2': sum_sq_r2 / max(1.0, sum_cnt_r2),
+            'mse_full_curve': mse_full,
+            'mse_region1': mse_r1,
+            'mse_region2': mse_r2,
+            'r2_full_curve': r2_full,
+            'r2_region1': r2_r1,
+            'r2_region2': r2_r2,
+            'nrmse_pct': nrmse_pct,
+            'median_r2': median_r2,
             'mae_jsc': jsc_mae / n_samples,
             'mae_voc': voc_mae / n_samples,
             'mae_vmpp': vmpp_mae / n_samples,
@@ -2108,15 +2155,26 @@ class ScalarPredictorPipeline:
             violations_jmpp_invalid=violations['jmpp_invalid'],
             violations_j_exceeds_jsc=violations['j_exceeds_jsc'],
             inference_time_ms=inference_time_ms,
-            total_samples=n_samples
+            total_samples=n_samples,
+            # New interpretable metrics
+            r2_full_curve=results['r2_full_curve'],
+            r2_region1=results['r2_region1'],
+            r2_region2=results['r2_region2'],
+            nrmse_full_pct=results['nrmse_pct'],
+            median_curve_r2=results['median_r2']
         )
         self.logger.log_model_comparison(comparison_metrics)
 
         print("\nCurve Model Metrics:")
-        for k, v in results.items():
-            if k != 'constraint_violations':
-                print(f"  {k}: {v}")
-        print(f"  constraint_violations: {results['constraint_violations']}")
+        print(f"  R² (full curve):  {results['r2_full_curve']:.4f}")
+        print(f"  R² (region 1):    {results['r2_region1']:.4f}")
+        print(f"  R² (region 2):    {results['r2_region2']:.4f}")
+        print(f"  Median R²:        {results['median_r2']:.4f}")
+        print(f"  NRMSE:            {results['nrmse_pct']:.2f}%")
+        print(f"  FF MAPE:          {results['mape_ff']:.2f}%")
+        print(f"  MAE Jsc:          {results['mae_jsc']:.2f}")
+        print(f"  MAE Voc:          {results['mae_voc']:.4f}")
+        print(f"  Violations:       {sum(results['constraint_violations'].values())}")
 
         # Plot reconstructed curves (test split only)
         if split_name == 'test' and pred_curves_for_plot and true_curves_for_plot:
