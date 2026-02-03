@@ -59,8 +59,8 @@ RESULTS_DIR="$WORK_DIR/results"
 # ============================================================================
 # CONFIGURATION - CURRENT (Full HPO)
 # ============================================================================
-HPO_TRIALS_NN=200
-HPO_TRIALS_LGBM=300
+HPO_TRIALS_NN=5
+HPO_TRIALS_LGBM=100
 HPO_TIMEOUT=14400      # 4 hours per model
 CTRL_POINTS=8
 
