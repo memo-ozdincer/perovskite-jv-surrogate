@@ -87,6 +87,10 @@ RESULTS_DIR="$WORK_DIR/results"
 
 CTRL_POINTS=8
 
+# Use oracle Voc for evaluation (true Voc for truncation)
+# This shows upper-bound curve accuracy since Voc NN has ~99% accuracy
+USE_ORACLE_VOC=true
+
 echo "==========================================="
 echo "STEP 2: Model Training"
 echo "==========================================="
@@ -94,6 +98,7 @@ echo ""
 echo "Configuration:"
 echo "  CTRL_POINTS: $CTRL_POINTS"
 echo "  HPO: DISABLED"
+echo "  ORACLE_VOC: $USE_ORACLE_VOC"
 echo ""
 echo "Data files (preprocessed):"
 echo "  Primary: $PREPROCESS_DIR/LHS_parameters_m_clean.txt"
@@ -114,6 +119,11 @@ CMD="python train.py \
     --no-hpo \
     --ctrl-points $CTRL_POINTS \
     --report-trimmed-metrics"
+
+# Add oracle Voc flag if enabled
+if [ "$USE_ORACLE_VOC" = true ]; then
+    CMD="$CMD --oracle-voc"
+fi
 
 echo "Running command:"
 echo "$CMD"

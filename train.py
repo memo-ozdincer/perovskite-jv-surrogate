@@ -225,7 +225,9 @@ class ScalarPredictorPipeline:
         filter_min_ff: float = 0.30,
         filter_min_vmpp: float = 0.30,
         filter_min_pce_quantile: float = 0.0,
-        report_trimmed_metrics: bool = False
+        report_trimmed_metrics: bool = False,
+        # Oracle mode
+        oracle_voc: bool = False  # Use true Voc for curve truncation
     ):
         # Build file lists for multi-file loading
         self.params_files = [params_file] + (params_extra or [])
@@ -262,6 +264,9 @@ class ScalarPredictorPipeline:
         self.filter_min_pce_quantile = filter_min_pce_quantile
         self.report_trimmed_metrics = report_trimmed_metrics
         self.filter_stats = None  # Will store filtering statistics
+
+        # Oracle mode: use true Voc for curve truncation (shows upper bound performance)
+        self.oracle_voc = oracle_voc
 
         # Will be populated during pipeline
         self.params_df = None
@@ -1735,6 +1740,10 @@ class ScalarPredictorPipeline:
         use_ctrl_point_model = 'ctrl_point_model' in self.models
         use_legacy_model = 'curve_model' in self.models and not use_direct_curve_model
 
+        # Log oracle mode if enabled
+        if self.oracle_voc and use_direct_curve_model:
+            print("\n[Oracle Mode] Using TRUE Voc for curve truncation (upper bound evaluation)")
+
         if not use_direct_curve_model and not use_ctrl_point_model and not use_legacy_model:
             raise ValueError("No curve model trained. Run train_curve_model() or train_direct_curve_model() first.")
 
@@ -1902,14 +1911,17 @@ class ScalarPredictorPipeline:
                         # Model only predicts shape (control points)
                         ctrl = model(batch_x, batch_jsc, batch_voc_pred)
 
+                        # Oracle mode: use true Voc for reconstruction
+                        voc_for_curve = batch_voc_true if self.oracle_voc else batch_voc_pred
+
                         # Reconstruct using shape-only reconstruction with non-uniform knots
                         pred_curve_norm = reconstruct_curve_shape(
-                            batch_voc_pred, ctrl, v_grid, clamp_voc=True
+                            voc_for_curve, ctrl, v_grid, clamp_voc=True
                         )
                         pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_jsc)
 
-                        # Use Voc from pretrained model for anchors
-                        pred_voc = batch_voc_pred
+                        # Use Voc for anchors (oracle or predicted)
+                        pred_voc = voc_for_curve
                     else:
                         # Legacy DirectCurveNetWithJsc: uses Jsc from LGBM, predicts Voc + ctrl
                         batch_x, batch_jsc, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
@@ -1923,11 +1935,17 @@ class ScalarPredictorPipeline:
                         # Model predicts Voc and control points
                         pred_voc, ctrl = model(batch_x, batch_jsc)
 
+                        # Oracle mode: use true Voc for reconstruction
+                        voc_for_curve = batch_voc_true if self.oracle_voc else pred_voc
+
                         # Reconstruct curve in normalized space, then denormalize
                         pred_curve_norm = reconstruct_curve_direct_normalized(
-                            batch_jsc, pred_voc, ctrl, v_grid, clamp_voc=True
+                            batch_jsc, voc_for_curve, ctrl, v_grid, clamp_voc=True
                         )
                         pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_jsc)
+
+                        # For anchors, use the Voc we used for curve
+                        pred_voc = voc_for_curve
 
                     # Create pseudo-anchors for metric computation
                     # Vmpp and Jmpp are estimated from the curve
@@ -2138,7 +2156,10 @@ class ScalarPredictorPipeline:
         }
 
         # Log to structured logger for comparison table
-        model_name = 'Direct-Curve' if use_direct_curve_model else 'Split-Spline'
+        if use_direct_curve_model:
+            model_name = 'Direct-Curve (Oracle Voc)' if self.oracle_voc else 'Direct-Curve'
+        else:
+            model_name = 'Split-Spline'
         comparison_metrics = ModelComparisonMetrics(
             model_name=model_name,
             mse_full_curve=results['mse_full_curve'],
@@ -2778,6 +2799,10 @@ def main():
     parser.add_argument('--report-trimmed-metrics', action='store_true',
                         help='Report trimmed metrics (exclude worst 10%% samples)')
 
+    # Oracle mode for curve evaluation
+    parser.add_argument('--oracle-voc', action='store_true',
+                        help='Use true Voc for curve truncation (oracle mode for upper bound evaluation)')
+
     args = parser.parse_args()
 
     # Log input files for debugging
@@ -2838,7 +2863,8 @@ def main():
         filter_min_ff=args.filter_min_ff,
         filter_min_vmpp=args.filter_min_vmpp,
         filter_min_pce_quantile=args.filter_min_pce_quantile,
-        report_trimmed_metrics=args.report_trimmed_metrics
+        report_trimmed_metrics=args.report_trimmed_metrics,
+        oracle_voc=args.oracle_voc
     )
 
     metrics = pipeline.run()
