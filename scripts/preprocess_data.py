@@ -120,6 +120,7 @@ def preprocess_dataset(
     # Apply filter
     params_clean = params_df.iloc[mask].reset_index(drop=True)
     iv_clean = iv_data[mask]
+    kept_indices = np.where(mask)[0].astype(np.int64)
 
     n_kept = mask.sum()
     n_removed = n_original - n_kept
@@ -189,6 +190,20 @@ def preprocess_dataset(
     print(f"  IV curves:  {iv_out}")
     print(f"  Anchors:    {anchors_out}")
 
+    # Save Voc values separately (for decoupled inference inputs)
+    voc_out = output_path / f"voc{suffix}_{params_file_base.replace('LHS_parameters_m', '')}.txt"
+    if voc_out.name == f"voc{suffix}_.txt":
+        voc_out = output_path / f"voc{suffix}_100k.txt"
+    np.savetxt(voc_out, voc_clean, delimiter=',', fmt='%.6f', header='Voc', comments='')
+    print(f"  Voc file:   {voc_out}")
+
+    # Save kept indices for alignment checks across files
+    indices_out = output_path / f"kept_indices{suffix}_{params_file_base.replace('LHS_parameters_m', '')}.txt"
+    if indices_out.name == f"kept_indices{suffix}_.txt":
+        indices_out = output_path / f"kept_indices{suffix}_100k.txt"
+    np.savetxt(indices_out, kept_indices, fmt='%d', header='idx', comments='')
+    print(f"  Kept idx:   {indices_out}")
+
     # Save statistics
     stats = {
         'original_samples': n_original,
@@ -218,10 +233,19 @@ def preprocess_dataset(
             'vmpp_mean': float(vmpp_clean.mean()),
             'pce_mean': float(pce_clean.mean())
         },
+        'alignment': {
+            'kept_indices_file': str(indices_out),
+            'params_out': str(params_out),
+            'iv_out': str(iv_out),
+            'anchors_out': str(anchors_out),
+            'voc_out': str(voc_out)
+        },
         'output_files': {
             'params': str(params_out),
             'iv': str(iv_out),
-            'anchors': str(anchors_out)
+            'anchors': str(anchors_out),
+            'voc': str(voc_out),
+            'kept_indices': str(indices_out)
         }
     }
 

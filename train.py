@@ -231,6 +231,8 @@ class ScalarPredictorPipeline:
         # Auxiliary anchor inputs
         anchors_file: str = None,
         anchors_extra: list = None,
+        voc_anchors_file: str = None,
+        voc_anchors_extra: list = None,
         use_vmpp_input: bool = False,
         use_jmpp_input: bool = False,
         use_ff_input: bool = False
@@ -276,10 +278,12 @@ class ScalarPredictorPipeline:
 
         # Auxiliary anchor inputs for curve model conditioning
         self.anchors_files = [anchors_file] + (anchors_extra or []) if anchors_file else []
+        self.voc_anchors_files = [voc_anchors_file] + (voc_anchors_extra or []) if voc_anchors_file else []
         self.use_vmpp_input = use_vmpp_input
         self.use_jmpp_input = use_jmpp_input
         self.use_ff_input = use_ff_input
         self.anchors_data = None  # Will be loaded if anchor files provided
+        self.voc_anchors_data = None  # Optional Voc-only anchors
 
         # Will be populated during pipeline
         self.params_df = None
@@ -361,6 +365,36 @@ class ScalarPredictorPipeline:
         # Load auxiliary anchor files if provided
         if self.anchors_files:
             self._load_anchor_files()
+        if self.voc_anchors_files:
+            self._load_voc_anchor_files()
+
+    def _load_voc_anchor_files(self):
+        """Load auxiliary Voc-only anchors from txt files."""
+        print("\n" + "=" * 60)
+        print("Loading Voc Anchor Files")
+        print("=" * 60)
+
+        all_voc = []
+        for voc_file in self.voc_anchors_files:
+            if voc_file is None:
+                continue
+            print(f"  Loading: {voc_file}")
+            voc_vals = np.loadtxt(voc_file, delimiter=',', skiprows=1, dtype=np.float32)
+            if voc_vals.ndim > 1:
+                voc_vals = voc_vals.squeeze()
+            all_voc.append(voc_vals)
+            print(f"    -> {len(voc_vals)} samples")
+
+        if all_voc:
+            self.voc_anchors_data = np.concatenate(all_voc, axis=0)
+            print(f"\nTotal Voc anchor samples: {len(self.voc_anchors_data)}")
+
+            if len(self.voc_anchors_data) != len(self.iv_data):
+                raise ValueError(
+                    f"Voc anchor size ({len(self.voc_anchors_data)}) does not match "
+                    f"IV data size ({len(self.iv_data)}). Ensure Voc anchors were generated "
+                    f"from the same preprocessed data."
+                )
 
     def _load_anchor_files(self):
         """Load auxiliary anchor data from txt files."""
@@ -555,6 +589,12 @@ class ScalarPredictorPipeline:
             self.splits['train']['anchors'] = self.anchors_data[self.train_idx]
             self.splits['val']['anchors'] = self.anchors_data[self.val_idx]
             self.splits['test']['anchors'] = self.anchors_data[self.test_idx]
+
+        # Attach Voc anchors per split if provided
+        if self.voc_anchors_data is not None:
+            self.splits['train']['voc_anchor'] = self.voc_anchors_data[self.train_idx]
+            self.splits['val']['voc_anchor'] = self.voc_anchors_data[self.val_idx]
+            self.splits['test']['voc_anchor'] = self.voc_anchors_data[self.test_idx]
 
         # Debug + verification
         train_curves = self.splits['train']['curves']
@@ -1256,9 +1296,13 @@ class ScalarPredictorPipeline:
             val['X_raw'], val['X_physics'], val['jsc_ceiling']
         )
 
-        # Get Voc from pretrained Voc NN (better than predicting in curve model)
-        voc_train_pred = self._predict_voc_nn(train)
-        voc_val_pred = self._predict_voc_nn(val)
+        # Get Voc from Voc anchors if provided, otherwise from pretrained Voc NN
+        if train.get('voc_anchor') is not None and val.get('voc_anchor') is not None:
+            voc_train_pred = train['voc_anchor'].astype(np.float32)
+            voc_val_pred = val['voc_anchor'].astype(np.float32)
+        else:
+            voc_train_pred = self._predict_voc_nn(train)
+            voc_val_pred = self._predict_voc_nn(val)
 
         # Also keep true Voc for validation metrics
         voc_train_true = train['targets']['Voc']
@@ -1324,6 +1368,7 @@ class ScalarPredictorPipeline:
         if self.use_ff_input:
             train_tensors.append(torch.from_numpy(ff_train.astype(np.float32)))
             val_tensors.append(torch.from_numpy(ff_val.astype(np.float32)))
+
 
         train_ds = torch.utils.data.TensorDataset(*train_tensors)
         val_ds = torch.utils.data.TensorDataset(*val_tensors)
@@ -1945,7 +1990,10 @@ class ScalarPredictorPipeline:
 
             if use_shape_net:
                 # DirectCurveShapeNet: needs Jsc AND Voc from pretrained models
-                voc_pred = self._predict_voc_nn(split)
+                if split.get('voc_anchor') is not None:
+                    voc_pred = split['voc_anchor'].astype(np.float32)
+                else:
+                    voc_pred = self._predict_voc_nn(split)
                 tensors = [
                     torch.from_numpy(sample_indices),
                     torch.from_numpy(X_full),
@@ -2998,6 +3046,10 @@ def main():
                         help='Path to primary anchors file (Jsc,Voc,Vmpp,Jmpp,FF,PCE,Pmpp)')
     parser.add_argument('--anchors-extra', type=str, nargs='*', default=[],
                         help='Additional anchor files to concatenate')
+    parser.add_argument('--voc-anchors', type=str, default=None,
+                        help='Path to Voc-only anchors file (one value per sample)')
+    parser.add_argument('--voc-anchors-extra', type=str, nargs='*', default=[],
+                        help='Additional Voc-only anchor files to concatenate')
     parser.add_argument('--use-vmpp-input', action='store_true',
                         help='Use Vmpp from anchor files as curve model input')
     parser.add_argument('--use-jmpp-input', action='store_true',
@@ -3070,6 +3122,8 @@ def main():
         # Auxiliary anchor inputs
         anchors_file=args.anchors,
         anchors_extra=args.anchors_extra,
+        voc_anchors_file=args.voc_anchors,
+        voc_anchors_extra=args.voc_anchors_extra,
         use_vmpp_input=args.use_vmpp_input,
         use_jmpp_input=args.use_jmpp_input,
         use_ff_input=args.use_ff_input

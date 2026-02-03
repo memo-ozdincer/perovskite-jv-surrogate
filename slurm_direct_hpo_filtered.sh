@@ -88,6 +88,8 @@ RESULTS_DIR="$WORK_DIR/results"
 # Anchor files (from preprocessing)
 ANCHORS_PRIMARY="$PREPROCESS_DIR/anchors_clean_100k.txt"
 ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean__300k.txt"
+VOC_PRIMARY="$PREPROCESS_DIR/voc_clean_100k.txt"
+VOC_EXTRA="$PREPROCESS_DIR/voc_clean__300k.txt"
 
 CTRL_POINTS=8
 
@@ -109,6 +111,8 @@ echo "  Primary: $PREPROCESS_DIR/LHS_parameters_m_clean.txt"
 echo "  Extra:   $PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
 echo "  Anchors: $ANCHORS_PRIMARY"
 echo "  Anchors extra: $ANCHORS_EXTRA"
+echo "  Voc anchors: $VOC_PRIMARY"
+echo "  Voc anchors extra: $VOC_EXTRA"
 echo ""
 
 CMD="python train.py \
@@ -128,6 +132,8 @@ CMD="python train.py \
     --ctrl-points $CTRL_POINTS \
     --report-trimmed-metrics \
     --use-vmpp-input"
+        --voc-anchors "$VOC_PRIMARY" \
+        --voc-anchors-extra "$VOC_EXTRA" \
 
 # Add oracle Voc flag if enabled
 if [ "$USE_ORACLE_VOC" = true ]; then
