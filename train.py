@@ -1722,6 +1722,8 @@ class ScalarPredictorPipeline:
         ).astype(np.float32)
         curves_true = split['curves'].astype(np.float32)
         curves_true_norm = split.get('curves_norm')
+        sample_indices = np.arange(len(split['X_raw']), dtype=np.int64)
+        targets = split.get('targets', {})
 
         # Prepare data based on model type
         use_shape_net = self.models.get('direct_curve_uses_shape_net', False)
@@ -1742,6 +1744,7 @@ class ScalarPredictorPipeline:
                 # DirectCurveShapeNet: needs Jsc AND Voc from pretrained models
                 voc_pred = self._predict_voc_nn(split)
                 ds = torch.utils.data.TensorDataset(
+                    torch.from_numpy(sample_indices),
                     torch.from_numpy(X_full),
                     torch.from_numpy(jsc_pred.astype(np.float32)),
                     torch.from_numpy(voc_pred.astype(np.float32)),  # Predicted Voc
@@ -1753,6 +1756,7 @@ class ScalarPredictorPipeline:
             else:
                 # Legacy DirectCurveNetWithJsc: needs Jsc, predicts Voc
                 ds = torch.utils.data.TensorDataset(
+                    torch.from_numpy(sample_indices),
                     torch.from_numpy(X_full),
                     torch.from_numpy(jsc_pred.astype(np.float32)),
                     torch.from_numpy(voc_true),
@@ -1765,6 +1769,7 @@ class ScalarPredictorPipeline:
             anchors_pred = self._predict_curve_anchors(split)
             anchors_norm = (anchors_pred - self.anchor_mean) / self.anchor_std
             ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(sample_indices),
                 torch.from_numpy(X_full),
                 torch.from_numpy(anchors_norm.astype(np.float32)),
                 torch.from_numpy(anchors_pred),
@@ -1774,6 +1779,7 @@ class ScalarPredictorPipeline:
             model = self.models['ctrl_point_model']
         else:
             ds = torch.utils.data.TensorDataset(
+                torch.from_numpy(sample_indices),
                 torch.from_numpy(X_full),
                 torch.from_numpy(anchors_true),
                 torch.from_numpy(curves_true)
@@ -1812,8 +1818,39 @@ class ScalarPredictorPipeline:
         true_curves_for_plot = []
         max_plot_samples = 2000
 
+        analysis_records = None
+        if split_name == 'test':
+            analysis_records = {
+                'sample_idx': [],
+                'curve_mse': [],
+                'curve_r2': [],
+                'mse_region1': [],
+                'mse_region2': [],
+                'jsc_true': [],
+                'voc_true': [],
+                'vmpp_true': [],
+                'jmpp_true': [],
+                'jsc_pred': [],
+                'voc_pred': [],
+                'vmpp_pred': [],
+                'jmpp_pred': [],
+                'ff_true': [],
+                'ff_pred': [],
+                'ff_abs_err': []
+            }
+            if 'PCE' in targets:
+                analysis_records['pce_true'] = []
+            if 'Pmpp' in targets:
+                analysis_records['pmpp_true'] = []
+            if 'Jsc' in targets:
+                analysis_records['jsc_ratio'] = []
+            if 'Voc' in targets:
+                analysis_records['voc_ratio'] = []
+
         with torch.no_grad():
             for batch in loader:
+                sample_idx = batch[0].cpu().numpy().astype(np.int64)
+                batch = batch[1:]
                 if use_direct_curve_model:
                     if use_shape_net:
                         # DirectCurveShapeNet: uses Jsc AND Voc from pretrained models
@@ -1915,8 +1952,45 @@ class ScalarPredictorPipeline:
                 ff_true = (batch_anchors_true[:, 2] * batch_anchors_true[:, 3]) / (
                     batch_anchors_true[:, 0] * batch_anchors_true[:, 1] + 1e-12
                 )
+                ff_abs_err = torch.abs(ff_pred - ff_true)
                 ff_mape_sum += torch.abs((ff_pred - ff_true) / (ff_true + 1e-12)).sum().item()
                 ff_cnt += ff_true.numel()
+
+                if analysis_records is not None:
+                    curve_mse = err.mean(dim=1)
+                    curve_ss_res = err.sum(dim=1)
+                    curve_mean = batch_curves.mean(dim=1, keepdim=True)
+                    curve_ss_tot = ((batch_curves - curve_mean) ** 2).sum(dim=1).clamp(min=1e-12)
+                    curve_r2 = 1.0 - (curve_ss_res / curve_ss_tot)
+
+                    analysis_records['sample_idx'].extend(sample_idx.tolist())
+                    analysis_records['curve_mse'].extend(curve_mse.detach().cpu().numpy().tolist())
+                    analysis_records['curve_r2'].extend(curve_r2.detach().cpu().numpy().tolist())
+                    analysis_records['mse_region1'].extend((err * mask_r1).sum(dim=1).div(mask_r1.sum(dim=1).clamp(min=1)).detach().cpu().numpy().tolist())
+                    analysis_records['mse_region2'].extend((err * mask_r2).sum(dim=1).div(mask_r2.sum(dim=1).clamp(min=1)).detach().cpu().numpy().tolist())
+
+                    analysis_records['jsc_true'].extend(batch_anchors_true[:, 0].detach().cpu().numpy().tolist())
+                    analysis_records['voc_true'].extend(batch_anchors_true[:, 1].detach().cpu().numpy().tolist())
+                    analysis_records['vmpp_true'].extend(batch_anchors_true[:, 2].detach().cpu().numpy().tolist())
+                    analysis_records['jmpp_true'].extend(batch_anchors_true[:, 3].detach().cpu().numpy().tolist())
+
+                    analysis_records['jsc_pred'].extend(pred_anchors[:, 0].detach().cpu().numpy().tolist())
+                    analysis_records['voc_pred'].extend(pred_anchors[:, 1].detach().cpu().numpy().tolist())
+                    analysis_records['vmpp_pred'].extend(pred_anchors[:, 2].detach().cpu().numpy().tolist())
+                    analysis_records['jmpp_pred'].extend(pred_anchors[:, 3].detach().cpu().numpy().tolist())
+
+                    analysis_records['ff_true'].extend(ff_true.detach().cpu().numpy().tolist())
+                    analysis_records['ff_pred'].extend(ff_pred.detach().cpu().numpy().tolist())
+                    analysis_records['ff_abs_err'].extend(ff_abs_err.detach().cpu().numpy().tolist())
+
+                    if 'PCE' in targets:
+                        analysis_records['pce_true'].extend(targets['PCE'][sample_idx].tolist())
+                    if 'Pmpp' in targets:
+                        analysis_records['pmpp_true'].extend(targets['Pmpp'][sample_idx].tolist())
+                    if 'Jsc' in targets:
+                        analysis_records['jsc_ratio'].extend((targets['Jsc'][sample_idx] / (split['jsc_ceiling'][sample_idx] + 1e-30)).tolist())
+                    if 'Voc' in targets:
+                        analysis_records['voc_ratio'].extend((targets['Voc'][sample_idx] / (np.abs(split['voc_ceiling'][sample_idx]) + 1e-30)).tolist())
 
                 # Violations (always 0 for new model since using true anchors)
                 violations['jsc_negative'] += (pred_anchors[:, 0] < 0).sum().item()
@@ -2029,6 +2103,20 @@ class ScalarPredictorPipeline:
                 i_pred=pred_curves,
                 prefix=f"{split_name}_curve"
             )
+
+        if analysis_records is not None:
+            analysis_df = pd.DataFrame(analysis_records)
+            analysis_df.to_csv(self.output_dir / 'curve_error_analysis.csv', index=False)
+            if not analysis_df.empty:
+                quantiles = analysis_df['curve_mse'].quantile([0.5, 0.8, 0.9, 0.95]).to_dict()
+                summary = {
+                    'n_samples': int(len(analysis_df)),
+                    'curve_mse_quantiles': {str(k): float(v) for k, v in quantiles.items()},
+                    'low_pce_threshold': float(analysis_df['pce_true'].quantile(0.2)) if 'pce_true' in analysis_df else None,
+                    'high_error_threshold': float(analysis_df['curve_mse'].quantile(0.9))
+                }
+                with open(self.output_dir / 'curve_error_analysis_summary.json', 'w') as f:
+                    json.dump(summary, f, indent=2)
 
         return results
 

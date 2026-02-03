@@ -54,6 +54,7 @@ echo ""
 
 # Output directory
 OUT_DIR="$WORK_DIR/outputs_current_$(date +%Y%m%d_%H%M%S)"
+RESULTS_DIR="$WORK_DIR/results"
 
 # ============================================================================
 # CONFIGURATION - CURRENT (Full HPO)
@@ -103,8 +104,18 @@ CMD="python train.py \
 echo "Running command:"
 echo "$CMD"
 echo ""
+mkdir -p "$RESULTS_DIR"
 
 eval $CMD
+
+RUN_TAG=$(basename "$OUT_DIR")
+cp -f "$OUT_DIR/metrics.json" "$RESULTS_DIR/${RUN_TAG}_metrics.json" 2>/dev/null
+cp -f "$OUT_DIR/training_summary.json" "$RESULTS_DIR/${RUN_TAG}_training_summary.json" 2>/dev/null
+cp -f "$OUT_DIR/curve_error_analysis.csv" "$RESULTS_DIR/${RUN_TAG}_curve_error_analysis.csv" 2>/dev/null
+cp -f "$OUT_DIR/curve_error_analysis_summary.json" "$RESULTS_DIR/${RUN_TAG}_curve_error_analysis_summary.json" 2>/dev/null
+cp -f "$OUT_DIR/outlier_detection.csv" "$RESULTS_DIR/${RUN_TAG}_outlier_detection.csv" 2>/dev/null
+cp -f "$OUT_DIR/model_comparison.md" "$RESULTS_DIR/${RUN_TAG}_model_comparison.md" 2>/dev/null
+
 
 echo ""
 echo "==========================================="
