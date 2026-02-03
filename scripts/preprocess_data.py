@@ -178,9 +178,11 @@ def preprocess_dataset(
     ])
 
     # Save anchors to txt file
-    anchors_out = output_path / f"anchors{suffix}_{params_file_base.replace('LHS_parameters_m', '')}.txt"
-    if anchors_out.name == f"anchors{suffix}_.txt":
-        anchors_out = output_path / f"anchors{suffix}_100k.txt"
+    file_tag = params_file_base.replace('LHS_parameters_m', '')
+    file_tag = file_tag.lstrip('_')
+    if not file_tag:
+        file_tag = '100k'
+    anchors_out = output_path / f"anchors{suffix}_{file_tag}.txt"
 
     np.savetxt(anchors_out, anchors, delimiter=',', fmt='%.6f',
                header='Jsc,Voc,Vmpp,Jmpp,FF,PCE,Pmpp', comments='')
@@ -191,16 +193,12 @@ def preprocess_dataset(
     print(f"  Anchors:    {anchors_out}")
 
     # Save Voc values separately (for decoupled inference inputs)
-    voc_out = output_path / f"voc{suffix}_{params_file_base.replace('LHS_parameters_m', '')}.txt"
-    if voc_out.name == f"voc{suffix}_.txt":
-        voc_out = output_path / f"voc{suffix}_100k.txt"
+    voc_out = output_path / f"voc{suffix}_{file_tag}.txt"
     np.savetxt(voc_out, voc_clean, delimiter=',', fmt='%.6f', header='Voc', comments='')
     print(f"  Voc file:   {voc_out}")
 
     # Save kept indices for alignment checks across files
-    indices_out = output_path / f"kept_indices{suffix}_{params_file_base.replace('LHS_parameters_m', '')}.txt"
-    if indices_out.name == f"kept_indices{suffix}_.txt":
-        indices_out = output_path / f"kept_indices{suffix}_100k.txt"
+    indices_out = output_path / f"kept_indices{suffix}_{file_tag}.txt"
     np.savetxt(indices_out, kept_indices, fmt='%d', header='idx', comments='')
     print(f"  Kept idx:   {indices_out}")
 

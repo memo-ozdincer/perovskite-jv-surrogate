@@ -87,9 +87,9 @@ RESULTS_DIR="$WORK_DIR/results"
 
 # Anchor files (from preprocessing)
 ANCHORS_PRIMARY="$PREPROCESS_DIR/anchors_clean_100k.txt"
-ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean__300k.txt"
+ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean_300k.txt"
 VOC_PRIMARY="$PREPROCESS_DIR/voc_clean_100k.txt"
-VOC_EXTRA="$PREPROCESS_DIR/voc_clean__300k.txt"
+VOC_EXTRA="$PREPROCESS_DIR/voc_clean_300k.txt"
 
 CTRL_POINTS=8
 
