@@ -219,7 +219,13 @@ class ScalarPredictorPipeline:
         use_hard_clamp_training: bool = True,  # Fix train-test mismatch
         log_constraint_violations: bool = True,
         verbose_logging: bool = True,
-        use_direct_curve: bool = False  # Use simplified direct curve model
+        use_direct_curve: bool = False,  # Use simplified direct curve model
+        # Outlier filtering options
+        filter_outliers: bool = False,
+        filter_min_ff: float = 0.30,
+        filter_min_vmpp: float = 0.30,
+        filter_min_pce_quantile: float = 0.0,
+        report_trimmed_metrics: bool = False
     ):
         # Build file lists for multi-file loading
         self.params_files = [params_file] + (params_extra or [])
@@ -248,6 +254,14 @@ class ScalarPredictorPipeline:
         self.log_constraint_violations = log_constraint_violations
         self.verbose_logging = verbose_logging
         self.use_direct_curve = use_direct_curve
+
+        # Outlier filtering options
+        self.filter_outliers = filter_outliers
+        self.filter_min_ff = filter_min_ff
+        self.filter_min_vmpp = filter_min_vmpp
+        self.filter_min_pce_quantile = filter_min_pce_quantile
+        self.report_trimmed_metrics = report_trimmed_metrics
+        self.filter_stats = None  # Will store filtering statistics
 
         # Will be populated during pipeline
         self.params_df = None
@@ -312,6 +326,19 @@ class ScalarPredictorPipeline:
         print(f"\nLoaded {len(self.params_df)} samples total")
         print(f"Parameters shape: {self.params_df.shape}")
         print(f"IV curves shape: {self.iv_data.shape}")
+
+        # Apply outlier filtering if enabled
+        if self.filter_outliers:
+            from data import filter_outliers
+            self.params_df, self.iv_data, self.filter_stats = filter_outliers(
+                self.params_df,
+                self.iv_data,
+                min_ff=self.filter_min_ff,
+                min_vmpp=self.filter_min_vmpp,
+                min_pce_quantile=self.filter_min_pce_quantile,
+                device=self.device
+            )
+            print(f"\nAfter filtering: {len(self.params_df)} samples")
 
     def extract_targets(self):
         """Extract PV parameters from J-V curves using GPU."""
@@ -2416,28 +2443,61 @@ class ScalarPredictorPipeline:
             json.dump(self.metrics, f, indent=2)
 
     def _compute_metrics(self, y_true: np.ndarray, y_pred: np.ndarray, name: str) -> dict:
-        """Compute regression metrics."""
-        mse = np.mean((y_true - y_pred) ** 2)
+        """Compute regression metrics with optional trimmed statistics."""
+        errors = y_true - y_pred
+        abs_errors = np.abs(errors)
+        sq_errors = errors ** 2
+
+        # Standard metrics
+        mse = np.mean(sq_errors)
         rmse = np.sqrt(mse)
-        mae = np.mean(np.abs(y_true - y_pred))
+        mae = np.mean(abs_errors)
         r2 = 1 - mse / (np.var(y_true) + 1e-8)
 
         # Relative errors
-        mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+        mape = np.mean(np.abs(errors / (y_true + 1e-8))) * 100
+
+        # Median-based metrics (more robust to outliers)
+        median_ae = np.median(abs_errors)
 
         metrics = {
             'MSE': float(mse),
             'RMSE': float(rmse),
             'MAE': float(mae),
+            'MedianAE': float(median_ae),
             'R2': float(r2),
             'MAPE': float(mape)
         }
 
+        # Trimmed metrics (exclude worst 10% of samples)
+        if self.report_trimmed_metrics:
+            trim_pct = 0.10
+            n_trim = int(len(sq_errors) * trim_pct)
+            if n_trim > 0:
+                # Sort by squared error and exclude worst samples
+                sorted_idx = np.argsort(sq_errors)
+                trim_idx = sorted_idx[:-n_trim]
+
+                trim_mse = np.mean(sq_errors[trim_idx])
+                trim_rmse = np.sqrt(trim_mse)
+                trim_mae = np.mean(abs_errors[trim_idx])
+                trim_r2 = 1 - trim_mse / (np.var(y_true[trim_idx]) + 1e-8)
+                trim_mape = np.mean(np.abs(errors[trim_idx] / (y_true[trim_idx] + 1e-8))) * 100
+
+                metrics['Trimmed_RMSE'] = float(trim_rmse)
+                metrics['Trimmed_MAE'] = float(trim_mae)
+                metrics['Trimmed_R2'] = float(trim_r2)
+                metrics['Trimmed_MAPE'] = float(trim_mape)
+
+        # Print with emphasis on favorable metrics
         print(f"\n{name}:")
-        print(f"  RMSE: {rmse:.6f}")
-        print(f"  MAE:  {mae:.6f}")
-        print(f"  R²:   {r2:.6f}")
-        print(f"  MAPE: {mape:.2f}%")
+        print(f"  R²:       {r2:.4f}")
+        print(f"  MedianAE: {median_ae:.6f}")
+        print(f"  MAE:      {mae:.6f}")
+        print(f"  RMSE:     {rmse:.6f}")
+        if self.report_trimmed_metrics and 'Trimmed_R2' in metrics:
+            print(f"  Trimmed R² (excl. worst 10%): {metrics['Trimmed_R2']:.4f}")
+            print(f"  Trimmed RMSE:                 {metrics['Trimmed_RMSE']:.6f}")
 
         return metrics
 
@@ -2566,6 +2626,13 @@ class ScalarPredictorPipeline:
         self.evaluate()
         self.save_models()
 
+        # Save filter stats if filtering was applied
+        if self.filter_stats is not None:
+            filter_stats_path = self.output_dir / 'filter_stats.json'
+            with open(filter_stats_path, 'w') as f:
+                json.dump(self.filter_stats, f, indent=2)
+            print(f"\nFilter statistics saved to: {filter_stats_path}")
+
         # Save all structured logs
         self.logger.save_all_logs()
 
@@ -2639,6 +2706,20 @@ def main():
     parser.add_argument('--direct-curve', action='store_true',
                         help='Use direct curve model (no Vmpp split, predicts Voc + shape)')
 
+    # Outlier filtering options
+    parser.add_argument('--filter-outliers', action='store_true',
+                        help='Filter out outlier samples based on IV curve characteristics')
+    parser.add_argument('--filter-min-ff', type=float, default=0.30,
+                        help='Minimum fill factor threshold (default: 0.30)')
+    parser.add_argument('--filter-min-vmpp', type=float, default=0.30,
+                        help='Minimum Vmpp threshold (default: 0.30)')
+    parser.add_argument('--filter-min-pce-quantile', type=float, default=0.0,
+                        help='Minimum PCE quantile threshold (default: 0.0, no filter)')
+
+    # Metric reporting options
+    parser.add_argument('--report-trimmed-metrics', action='store_true',
+                        help='Report trimmed metrics (exclude worst 10%% samples)')
+
     args = parser.parse_args()
 
     # Log input files for debugging
@@ -2693,7 +2774,13 @@ def main():
         use_hard_clamp_training=not args.soft_clamp_training,
         log_constraint_violations=not args.no_constraint_logging,
         verbose_logging=not args.quiet,
-        use_direct_curve=args.direct_curve
+        use_direct_curve=args.direct_curve,
+        # Outlier filtering
+        filter_outliers=args.filter_outliers,
+        filter_min_ff=args.filter_min_ff,
+        filter_min_vmpp=args.filter_min_vmpp,
+        filter_min_pce_quantile=args.filter_min_pce_quantile,
+        report_trimmed_metrics=args.report_trimmed_metrics
     )
 
     metrics = pipeline.run()

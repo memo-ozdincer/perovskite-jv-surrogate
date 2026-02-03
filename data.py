@@ -329,3 +329,107 @@ def split_indices(n_samples: int, val_split: float = 0.1, test_split: float = 0.
         indices[n_train:n_train + n_val],
         indices[n_train + n_val:]
     )
+
+
+# ============================================================================
+# OUTLIER FILTERING
+# ============================================================================
+
+def filter_outliers(
+    params_df: pd.DataFrame,
+    iv_data: np.ndarray,
+    min_ff: float = 0.30,
+    min_vmpp: float = 0.30,
+    min_pce_quantile: float = 0.0,
+    device: torch.device = None
+) -> tuple[pd.DataFrame, np.ndarray, dict]:
+    """
+    Filter out outlier samples based on IV curve characteristics.
+
+    Samples are removed if they have:
+    - Fill factor below min_ff (indicates abnormal IV curve shape)
+    - Vmpp below min_vmpp (indicates extreme operating conditions)
+    - PCE below the min_pce_quantile percentile
+
+    Args:
+        params_df: Parameter DataFrame
+        iv_data: IV curve data array
+        min_ff: Minimum fill factor threshold (default: 0.30)
+        min_vmpp: Minimum Vmpp threshold (default: 0.30)
+        min_pce_quantile: PCE percentile threshold (default: 0.0, no filter)
+        device: Torch device for GPU computation
+
+    Returns:
+        Filtered params_df, iv_data, and filter statistics dict
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    n_original = len(params_df)
+
+    # Extract targets to compute FF, Vmpp, PCE
+    v_grid = torch.from_numpy(V_GRID.astype(np.float32)).to(device)
+    iv_tensor = torch.from_numpy(iv_data.astype(np.float32)).to(device)
+
+    targets = extract_targets_gpu(iv_tensor, v_grid)
+
+    ff = targets['FF'].cpu().numpy()
+    vmpp = targets['Vmpp'].cpu().numpy()
+    pce = targets['PCE'].cpu().numpy()
+
+    # Build filter mask
+    mask = np.ones(n_original, dtype=bool)
+
+    # Filter by fill factor
+    ff_mask = ff >= min_ff
+    n_ff_dropped = (~ff_mask).sum()
+    mask &= ff_mask
+
+    # Filter by Vmpp
+    vmpp_mask = vmpp > min_vmpp
+    n_vmpp_dropped = (~vmpp_mask).sum()
+    mask &= vmpp_mask
+
+    # Filter by PCE quantile
+    n_pce_dropped = 0
+    if min_pce_quantile > 0:
+        pce_threshold = np.quantile(pce, min_pce_quantile)
+        pce_mask = pce >= pce_threshold
+        n_pce_dropped = (~pce_mask & mask).sum()  # Count only newly dropped
+        mask &= pce_mask
+    else:
+        pce_threshold = 0.0
+
+    # Apply filter
+    params_df_filtered = params_df.iloc[mask].reset_index(drop=True)
+    iv_data_filtered = iv_data[mask]
+
+    n_kept = mask.sum()
+    n_dropped = n_original - n_kept
+
+    stats = {
+        'n_original': n_original,
+        'n_kept': int(n_kept),
+        'n_dropped': int(n_dropped),
+        'pct_dropped': float(100 * n_dropped / n_original),
+        'filter_config': {
+            'min_ff': min_ff,
+            'min_vmpp': min_vmpp,
+            'min_pce_quantile': min_pce_quantile,
+            'pce_threshold': float(pce_threshold)
+        },
+        'dropped_by_reason': {
+            'low_ff': int(n_ff_dropped),
+            'low_vmpp': int(n_vmpp_dropped),
+            'low_pce': int(n_pce_dropped)
+        }
+    }
+
+    print(f"\n[Outlier Filter] Dropped {n_dropped}/{n_original} samples ({stats['pct_dropped']:.1f}%)")
+    print(f"  - Low FF (<{min_ff}): {n_ff_dropped}")
+    print(f"  - Low Vmpp (≤{min_vmpp}): {n_vmpp_dropped}")
+    if min_pce_quantile > 0:
+        print(f"  - Low PCE (<q{min_pce_quantile*100:.0f}={pce_threshold:.4f}): {n_pce_dropped}")
+    print(f"  Remaining samples: {n_kept}")
+
+    return params_df_filtered, iv_data_filtered, stats
