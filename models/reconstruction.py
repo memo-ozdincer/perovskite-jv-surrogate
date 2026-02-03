@@ -13,7 +13,9 @@ def build_knots(
     ctrl2: torch.Tensor,
     j_end: float = 0.0,
     validate_monotonicity: bool = False,
-    return_violation_counts: bool = False
+    return_violation_counts: bool = False,
+    knot_strategy: str = "uniform",
+    cluster_power: float = 2.0
 ):
     """
     Build knot points for split spline reconstruction.
@@ -36,8 +38,15 @@ def build_knots(
     n_ctrl = ctrl1.shape[1]
     device = anchors.device
 
-    # Build voltage knots (uniformly spaced in each region)
-    v1_norm = torch.linspace(0, 1, n_ctrl + 2, device=device)
+    # Build voltage knots (uniform or clustered near Vmpp)
+    t = torch.linspace(0, 1, n_ctrl + 2, device=device)
+    if knot_strategy == "mpp_cluster":
+        v1_norm = 1.0 - (1.0 - t) ** cluster_power  # cluster near Vmpp (end of region1)
+        v2_norm = t ** cluster_power                # cluster near Vmpp (start of region2)
+    else:
+        v1_norm = t
+        v2_norm = t
+
     v1_knots = v1_norm.unsqueeze(0) * v_mpp.unsqueeze(1)
 
     eps = 1e-4  # Increased epsilon for better numerical stability
@@ -55,7 +64,6 @@ def build_knots(
     j1_knots = torch.cat([j_sc.unsqueeze(1), j1_interior, j_mpp.unsqueeze(1)], dim=1)
 
     # Region 2: Jmpp -> J_end (same cumulative scaling approach)
-    v2_norm = torch.linspace(0, 1, n_ctrl + 2, device=device)
     # Clamp (v_oc - v_mpp) to ensure non-negative range
     v_range2 = (v_oc - v_mpp).clamp(min=eps).unsqueeze(1)
     v2_knots = v_mpp.unsqueeze(1) + v2_norm.unsqueeze(0) * v_range2
@@ -244,7 +252,9 @@ def reconstruct_curve(
     v_grid: torch.Tensor,
     j_end: float = 0.0,
     clamp_voc: bool = True,
-    validate_monotonicity: bool = False
+    validate_monotonicity: bool = False,
+    knot_strategy: str = "uniform",
+    cluster_power: float = 2.0
 ) -> torch.Tensor:
     """
     Reconstruct full J-V curve using split PCHIP interpolation.
@@ -259,7 +269,11 @@ def reconstruct_curve(
         j_curve: (N, M)
     """
     v1_knots, j1_knots, v2_knots, j2_knots = build_knots(
-        anchors, ctrl1, ctrl2, j_end=j_end, validate_monotonicity=validate_monotonicity
+        anchors, ctrl1, ctrl2,
+        j_end=j_end,
+        validate_monotonicity=validate_monotonicity,
+        knot_strategy=knot_strategy,
+        cluster_power=cluster_power
     )
     j1 = pchip_interpolate_batch(v1_knots, j1_knots, v_grid)
     j2 = pchip_interpolate_batch(v2_knots, j2_knots, v_grid)
@@ -336,7 +350,9 @@ def reconstruct_curve_normalized(
     ctrl2: torch.Tensor,
     v_grid: torch.Tensor,
     clamp_voc: bool = True,
-    validate_monotonicity: bool = False
+    validate_monotonicity: bool = False,
+    knot_strategy: str = "uniform",
+    cluster_power: float = 2.0
 ) -> torch.Tensor:
     """
     Reconstruct curve in normalized space ([-1, 1]) using Jsc normalization.
@@ -349,7 +365,9 @@ def reconstruct_curve_normalized(
         v_grid,
         j_end=-1.0,
         clamp_voc=clamp_voc,
-        validate_monotonicity=validate_monotonicity
+        validate_monotonicity=validate_monotonicity,
+        knot_strategy=knot_strategy,
+        cluster_power=cluster_power
     )
 
 
@@ -359,13 +377,19 @@ def continuity_loss(
     ctrl2: torch.Tensor,
     v_grid: torch.Tensor,
     j_end: float = 0.0,
-    validate_monotonicity: bool = False
+    validate_monotonicity: bool = False,
+    knot_strategy: str = "uniform",
+    cluster_power: float = 2.0
 ) -> torch.Tensor:
     """
     Enforce C1 continuity at Vmpp using finite differences.
     """
     v1_knots, j1_knots, v2_knots, j2_knots = build_knots(
-        anchors, ctrl1, ctrl2, j_end=j_end, validate_monotonicity=validate_monotonicity
+        anchors, ctrl1, ctrl2,
+        j_end=j_end,
+        validate_monotonicity=validate_monotonicity,
+        knot_strategy=knot_strategy,
+        cluster_power=cluster_power
     )
     j1 = pchip_interpolate_batch(v1_knots, j1_knots, v_grid)
     j2 = pchip_interpolate_batch(v2_knots, j2_knots, v_grid)

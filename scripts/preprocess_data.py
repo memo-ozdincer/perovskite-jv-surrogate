@@ -192,11 +192,6 @@ def preprocess_dataset(
     print(f"  IV curves:  {iv_out}")
     print(f"  Anchors:    {anchors_out}")
 
-    # Save Voc values separately (for decoupled inference inputs)
-    voc_out = output_path / f"voc{suffix}_{file_tag}.txt"
-    np.savetxt(voc_out, voc_clean, delimiter=',', fmt='%.6f', header='Voc', comments='')
-    print(f"  Voc file:   {voc_out}")
-
     # Save kept indices for alignment checks across files
     indices_out = output_path / f"kept_indices{suffix}_{file_tag}.txt"
     np.savetxt(indices_out, kept_indices, fmt='%d', header='idx', comments='')
@@ -235,14 +230,12 @@ def preprocess_dataset(
             'kept_indices_file': str(indices_out),
             'params_out': str(params_out),
             'iv_out': str(iv_out),
-            'anchors_out': str(anchors_out),
-            'voc_out': str(voc_out)
+            'anchors_out': str(anchors_out)
         },
         'output_files': {
             'params': str(params_out),
             'iv': str(iv_out),
             'anchors': str(anchors_out),
-            'voc': str(voc_out),
             'kept_indices': str(indices_out)
         }
     }

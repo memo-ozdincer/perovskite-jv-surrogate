@@ -144,6 +144,7 @@ class ScalarPredictor:
         curve_config_dict = self.configs.get('curve_model', {})
         self.v_grid = np.array(curve_config_dict.get('v_grid', V_GRID), dtype=np.float32)
         self.curve_output_normalized = bool(curve_config_dict.get('curve_output_normalized', False))
+        self.curve_knot_strategy = curve_config_dict.get('knot_strategy', 'uniform')
 
         curve_model_path = self.models_dir / 'curve_model.pt'
         ctrl_point_model_path = self.models_dir / 'ctrl_point_model.pt'
@@ -353,7 +354,8 @@ class ScalarPredictor:
                 for _ in range(n_samples):
                     ctrl1, ctrl2 = model(x, anchors_norm_tensor)
                     curve = reconstruct_curve_normalized(
-                        anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True
+                        anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor,
+                        clamp_voc=True, knot_strategy=self.curve_knot_strategy
                     )
                     if self.curve_norm_by_isc and self.curve_output_normalized:
                         curve = denormalize_curves_by_isc(curve, anchors_raw_tensor[:, 0])
@@ -368,7 +370,8 @@ class ScalarPredictor:
             with torch.no_grad():
                 ctrl1, ctrl2 = model(x, anchors_norm_tensor)
                 curve = reconstruct_curve_normalized(
-                    anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True
+                    anchors_raw_tensor, ctrl1, ctrl2, v_grid_tensor,
+                    clamp_voc=True, knot_strategy=self.curve_knot_strategy
                 )
                 if self.curve_norm_by_isc and self.curve_output_normalized:
                     curve = denormalize_curves_by_isc(curve, anchors_raw_tensor[:, 0])
@@ -380,7 +383,10 @@ class ScalarPredictor:
             curves = []
             for _ in range(n_samples):
                 anchors, ctrl1, ctrl2 = model(x)
-                curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+                curve = reconstruct_curve(
+                    anchors, ctrl1, ctrl2, v_grid_tensor,
+                    clamp_voc=True, knot_strategy=self.curve_knot_strategy
+                )
                 if self.curve_norm_by_isc and self.curve_output_normalized:
                     curve = denormalize_curves_by_isc(curve, anchors[:, 0])
                 curves.append(curve)
@@ -393,7 +399,10 @@ class ScalarPredictor:
 
         with torch.no_grad():
             anchors, ctrl1, ctrl2 = model(x)
-            curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid_tensor, clamp_voc=True)
+            curve = reconstruct_curve(
+                anchors, ctrl1, ctrl2, v_grid_tensor,
+                clamp_voc=True, knot_strategy=self.curve_knot_strategy
+            )
             if self.curve_norm_by_isc and self.curve_output_normalized:
                 curve = denormalize_curves_by_isc(curve, anchors[:, 0])
         return self.v_grid, curve.cpu().numpy(), None

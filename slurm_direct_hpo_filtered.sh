@@ -75,6 +75,19 @@ python scripts/preprocess_data.py \
     --min-vmpp 0.30 \
     --suffix "_clean"
 
+# Generate scalar TXT files (Voc/Vmpp) from cleaned IV curves
+python scripts/generate_scalar_txt.py \
+    --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
+    --output-dir "$PREPROCESS_DIR" \
+    --tag 100k \
+    --suffix "_clean"
+
+python scripts/generate_scalar_txt.py \
+    --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
+    --output-dir "$PREPROCESS_DIR" \
+    --tag 300k \
+    --suffix "_clean"
+
 echo ""
 echo "Preprocessing complete. Using cleaned datasets for training."
 echo ""
@@ -90,6 +103,8 @@ ANCHORS_PRIMARY="$PREPROCESS_DIR/anchors_clean_100k.txt"
 ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean_300k.txt"
 VOC_PRIMARY="$PREPROCESS_DIR/voc_clean_100k.txt"
 VOC_EXTRA="$PREPROCESS_DIR/voc_clean_300k.txt"
+VMPP_PRIMARY="$PREPROCESS_DIR/vmpp_clean_100k.txt"
+VMPP_EXTRA="$PREPROCESS_DIR/vmpp_clean_300k.txt"
 
 CTRL_POINTS=8
 
@@ -113,6 +128,8 @@ echo "  Anchors: $ANCHORS_PRIMARY"
 echo "  Anchors extra: $ANCHORS_EXTRA"
 echo "  Voc anchors: $VOC_PRIMARY"
 echo "  Voc anchors extra: $VOC_EXTRA"
+echo "  Vmpp anchors: $VMPP_PRIMARY"
+echo "  Vmpp anchors extra: $VMPP_EXTRA"
 echo ""
 
 CMD="python train.py \
@@ -122,6 +139,10 @@ CMD="python train.py \
     --iv-extra \"$PREPROCESS_DIR/IV_m_300k_clean.txt\" \
     --anchors \"$ANCHORS_PRIMARY\" \
     --anchors-extra \"$ANCHORS_EXTRA\" \
+    --voc-anchors \"$VOC_PRIMARY\" \
+    --voc-anchors-extra \"$VOC_EXTRA\" \
+    --vmpp-anchors \"$VMPP_PRIMARY\" \
+    --vmpp-anchors-extra \"$VMPP_EXTRA\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
@@ -132,8 +153,6 @@ CMD="python train.py \
     --ctrl-points $CTRL_POINTS \
     --report-trimmed-metrics \
     --use-vmpp-input"
-        --voc-anchors "$VOC_PRIMARY" \
-        --voc-anchors-extra "$VOC_EXTRA" \
 
 # Add oracle Voc flag if enabled
 if [ "$USE_ORACLE_VOC" = true ]; then

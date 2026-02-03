@@ -233,6 +233,8 @@ class ScalarPredictorPipeline:
         anchors_extra: list = None,
         voc_anchors_file: str = None,
         voc_anchors_extra: list = None,
+        vmpp_anchors_file: str = None,
+        vmpp_anchors_extra: list = None,
         use_vmpp_input: bool = False,
         use_jmpp_input: bool = False,
         use_ff_input: bool = False
@@ -279,11 +281,13 @@ class ScalarPredictorPipeline:
         # Auxiliary anchor inputs for curve model conditioning
         self.anchors_files = [anchors_file] + (anchors_extra or []) if anchors_file else []
         self.voc_anchors_files = [voc_anchors_file] + (voc_anchors_extra or []) if voc_anchors_file else []
+        self.vmpp_anchors_files = [vmpp_anchors_file] + (vmpp_anchors_extra or []) if vmpp_anchors_file else []
         self.use_vmpp_input = use_vmpp_input
         self.use_jmpp_input = use_jmpp_input
         self.use_ff_input = use_ff_input
         self.anchors_data = None  # Will be loaded if anchor files provided
         self.voc_anchors_data = None  # Optional Voc-only anchors
+        self.vmpp_anchors_data = None  # Optional Vmpp-only anchors
 
         # Will be populated during pipeline
         self.params_df = None
@@ -367,6 +371,36 @@ class ScalarPredictorPipeline:
             self._load_anchor_files()
         if self.voc_anchors_files:
             self._load_voc_anchor_files()
+        if self.vmpp_anchors_files:
+            self._load_vmpp_anchor_files()
+
+    def _load_vmpp_anchor_files(self):
+        """Load auxiliary Vmpp-only anchors from txt files."""
+        print("\n" + "=" * 60)
+        print("Loading Vmpp Anchor Files")
+        print("=" * 60)
+
+        all_vmpp = []
+        for vmpp_file in self.vmpp_anchors_files:
+            if vmpp_file is None:
+                continue
+            print(f"  Loading: {vmpp_file}")
+            vmpp_vals = np.loadtxt(vmpp_file, delimiter=',', skiprows=1, dtype=np.float32)
+            if vmpp_vals.ndim > 1:
+                vmpp_vals = vmpp_vals.squeeze()
+            all_vmpp.append(vmpp_vals)
+            print(f"    -> {len(vmpp_vals)} samples")
+
+        if all_vmpp:
+            self.vmpp_anchors_data = np.concatenate(all_vmpp, axis=0)
+            print(f"\nTotal Vmpp anchor samples: {len(self.vmpp_anchors_data)}")
+
+            if len(self.vmpp_anchors_data) != len(self.iv_data):
+                raise ValueError(
+                    f"Vmpp anchor size ({len(self.vmpp_anchors_data)}) does not match "
+                    f"IV data size ({len(self.iv_data)}). Ensure Vmpp anchors were generated "
+                    f"from the same preprocessed data."
+                )
 
     def _load_voc_anchor_files(self):
         """Load auxiliary Voc-only anchors from txt files."""
@@ -596,6 +630,11 @@ class ScalarPredictorPipeline:
             self.splits['val']['voc_anchor'] = self.voc_anchors_data[self.val_idx]
             self.splits['test']['voc_anchor'] = self.voc_anchors_data[self.test_idx]
 
+        if self.vmpp_anchors_data is not None:
+            self.splits['train']['vmpp_anchor'] = self.vmpp_anchors_data[self.train_idx]
+            self.splits['val']['vmpp_anchor'] = self.vmpp_anchors_data[self.val_idx]
+            self.splits['test']['vmpp_anchor'] = self.vmpp_anchors_data[self.test_idx]
+
         # Debug + verification
         train_curves = self.splits['train']['curves']
         assert train_curves.shape[1] == self.v_grid.shape[0], (
@@ -760,8 +799,11 @@ class ScalarPredictorPipeline:
         anchors_train = self._predict_curve_anchors(train)
         anchors_val = self._predict_curve_anchors(val)
 
-        curves_train = train['curves'].astype(np.float32)
-        curves_val = val['curves'].astype(np.float32)
+        curves_train = train['curves_norm'].astype(np.float32)
+        curves_val = val['curves_norm'].astype(np.float32)
+        self.curve_norm_by_isc = True
+        self.curve_output_normalized = True
+        self.curve_knot_strategy = "mpp_cluster"
 
         curve_hpo_results = run_curve_hpo(
             X_train=X_train_full,
@@ -985,7 +1027,7 @@ class ScalarPredictorPipeline:
                 print("\n--- Training Unified Split-Spline Curve Model ---")
                 if self.run_curve_hpo:
                     self.run_curve_hyperparameter_optimization()
-                self.train_curve_model()
+                self.train_curve_model_legacy()
 
         # 7. Train CVAE baseline (optional)
         if self.train_cvae:
@@ -1316,19 +1358,24 @@ class ScalarPredictorPipeline:
         use_anchor_inputs = self.use_vmpp_input or self.use_jmpp_input or self.use_ff_input
         vmpp_train = jmpp_train = ff_train = None
         vmpp_val = jmpp_val = ff_val = None
-        if use_anchor_inputs:
+        if self.use_vmpp_input:
+            if train.get('vmpp_anchor') is None or val.get('vmpp_anchor') is None:
+                raise ValueError(
+                    "Vmpp input enabled but vmpp anchors are missing. "
+                    "Provide --vmpp-anchors (and --vmpp-anchors-extra if needed)."
+                )
+            vmpp_train = train['vmpp_anchor'].astype(np.float32)
+            vmpp_val = val['vmpp_anchor'].astype(np.float32)
+        if self.use_jmpp_input or self.use_ff_input:
             if self.anchors_data is None:
                 raise ValueError(
-                    "Anchor inputs enabled but no anchors file loaded. "
+                    "Jmpp/FF inputs enabled but no anchors file loaded. "
                     "Provide --anchors (and --anchors-extra if needed)."
                 )
             anchors_train = train.get('anchors')
             anchors_val = val.get('anchors')
             if anchors_train is None or anchors_val is None:
-                raise ValueError("Anchor inputs enabled but anchors are missing from splits.")
-            if self.use_vmpp_input:
-                vmpp_train = anchors_train[:, 2].astype(np.float32)
-                vmpp_val = anchors_val[:, 2].astype(np.float32)
+                raise ValueError("Jmpp/FF inputs enabled but anchors are missing from splits.")
             if self.use_jmpp_input:
                 jmpp_train = anchors_train[:, 3].astype(np.float32)
                 jmpp_val = anchors_val[:, 3].astype(np.float32)
@@ -1793,7 +1840,8 @@ class ScalarPredictorPipeline:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=self.ctrl_points)
+        ctrl_points = min(max(self.ctrl_points, 4), 5)
+        config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=ctrl_points)
         model = UnifiedSplitSplineNet(config).to(self.device)
         multitask_loss = MultiTaskLoss(init_log_sigma=-1.0).to(self.device)  # Fixed init
 
@@ -1822,9 +1870,14 @@ class ScalarPredictorPipeline:
 
                 optimizer.zero_grad()
                 pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+                pred_curve = reconstruct_curve_normalized(
+                    pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True, knot_strategy="mpp_cluster"
+                )
                 loss, metrics = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
-                cont_loss = continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
+                cont_loss = continuity_loss(
+                    normalize_anchors_by_jsc(pred_anchors), ctrl1, ctrl2,
+                    v_grid, j_end=-1.0, knot_strategy="mpp_cluster"
+                )
                 loss = loss + self.continuity_weight * cont_loss
 
                 if torch.isnan(loss):
@@ -1852,7 +1905,9 @@ class ScalarPredictorPipeline:
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
                     pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+                    pred_curve = reconstruct_curve_normalized(
+                        pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True, knot_strategy="mpp_cluster"
+                    )
                     val_loss, val_metrics_last = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
                     val_losses.append(val_loss.item())
 
@@ -1951,13 +2006,18 @@ class ScalarPredictorPipeline:
         vmpp_split = jmpp_split = ff_split = None
         if self.use_vmpp_input or self.use_jmpp_input or self.use_ff_input:
             anchors_split = split.get('anchors')
-            if anchors_split is None:
+            if anchors_split is None and (self.use_jmpp_input or self.use_ff_input):
                 raise ValueError(
                     "Anchor inputs enabled but split anchors are missing. "
                     "Ensure --anchors were provided and preprocessing is aligned."
                 )
             if self.use_vmpp_input:
-                vmpp_split = anchors_split[:, 2].astype(np.float32)
+                if split.get('vmpp_anchor') is None:
+                    raise ValueError(
+                        "Vmpp input enabled but vmpp anchors are missing. "
+                        "Provide --vmpp-anchors (and --vmpp-anchors-extra if needed)."
+                    )
+                vmpp_split = split['vmpp_anchor'].astype(np.float32)
             if self.use_jmpp_input:
                 jmpp_split = anchors_split[:, 3].astype(np.float32)
             if self.use_ff_input:
@@ -2206,7 +2266,8 @@ class ScalarPredictorPipeline:
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
                     pred_anchors = batch_anchors  # Predicted anchors
                     pred_curve_norm = reconstruct_curve_normalized(
-                        batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True
+                        batch_anchors, ctrl1, ctrl2, v_grid,
+                        clamp_voc=True, knot_strategy=getattr(self, 'curve_knot_strategy', 'uniform')
                     )
                     pred_curve = denormalize_curves_by_isc(pred_curve_norm, pred_anchors[:, 0])
                 else:
@@ -2218,7 +2279,11 @@ class ScalarPredictorPipeline:
 
                     # Legacy model: predicts anchors + control points
                     pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+                    pred_curve_norm = reconstruct_curve_normalized(
+                        pred_anchors, ctrl1, ctrl2, v_grid,
+                        clamp_voc=True, knot_strategy="mpp_cluster"
+                    )
+                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, pred_anchors[:, 0])
 
                 err = (pred_curve - batch_curves) ** 2
                 sum_sq_full += err.sum().item()
@@ -2322,7 +2387,9 @@ class ScalarPredictorPipeline:
                 elif use_ctrl_point_model:
                     # Evaluate in normalized space when using ControlPointNet
                     anchors_norm = normalize_anchors_by_jsc(pred_anchors)
-                    v1k, j1k, v2k, j2k = build_knots(anchors_norm, ctrl1, ctrl2, j_end=-1.0)
+                    v1k, j1k, v2k, j2k = build_knots(
+                        anchors_norm, ctrl1, ctrl2, j_end=-1.0, knot_strategy="mpp_cluster"
+                    )
                     j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
                     j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
                     mask = v_grid.unsqueeze(0) <= anchors_norm[:, 2].unsqueeze(1)
@@ -2335,7 +2402,9 @@ class ScalarPredictorPipeline:
                     pchip_linear_max_abs = max(pchip_linear_max_abs, delta.abs().max().item())
                 else:
                     # Legacy model
-                    v1k, j1k, v2k, j2k = build_knots(pred_anchors, ctrl1, ctrl2)
+                    v1k, j1k, v2k, j2k = build_knots(
+                        pred_anchors, ctrl1, ctrl2, knot_strategy="mpp_cluster"
+                    )
                     j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
                     j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
                     mask = v_grid.unsqueeze(0) <= pred_anchors[:, 2].unsqueeze(1)
@@ -2866,7 +2935,10 @@ class ScalarPredictorPipeline:
             configs['curve_model'] = {
                 **(self.models['curve_model'].config.__dict__ if hasattr(self.models['curve_model'], 'config') else {}),
                 'v_grid': self.v_grid.tolist(),
-                'type': 'unified_split_spline'
+                'type': 'unified_split_spline',
+                'curve_norm_by_isc': bool(getattr(self, 'curve_norm_by_isc', False)),
+                'curve_output_normalized': bool(getattr(self, 'curve_output_normalized', False)),
+                'knot_strategy': getattr(self, 'curve_knot_strategy', 'uniform')
             }
 
         if 'ctrl_point_model' in self.models:
@@ -2876,7 +2948,8 @@ class ScalarPredictorPipeline:
                 'v_grid': self.v_grid.tolist(),
                 'type': 'control_point_net',
                 'curve_norm_by_isc': bool(self.curve_norm_by_isc),
-                'curve_output_normalized': True
+                'curve_output_normalized': True,
+                'knot_strategy': getattr(self, 'curve_knot_strategy', 'uniform')
             }
 
         if 'cvae' in self.models:
@@ -3050,6 +3123,10 @@ def main():
                         help='Path to Voc-only anchors file (one value per sample)')
     parser.add_argument('--voc-anchors-extra', type=str, nargs='*', default=[],
                         help='Additional Voc-only anchor files to concatenate')
+    parser.add_argument('--vmpp-anchors', type=str, default=None,
+                        help='Path to Vmpp-only anchors file (one value per sample)')
+    parser.add_argument('--vmpp-anchors-extra', type=str, nargs='*', default=[],
+                        help='Additional Vmpp-only anchor files to concatenate')
     parser.add_argument('--use-vmpp-input', action='store_true',
                         help='Use Vmpp from anchor files as curve model input')
     parser.add_argument('--use-jmpp-input', action='store_true',
@@ -3124,6 +3201,8 @@ def main():
         anchors_extra=args.anchors_extra,
         voc_anchors_file=args.voc_anchors,
         voc_anchors_extra=args.voc_anchors_extra,
+        vmpp_anchors_file=args.vmpp_anchors,
+        vmpp_anchors_extra=args.vmpp_anchors_extra,
         use_vmpp_input=args.use_vmpp_input,
         use_jmpp_input=args.use_jmpp_input,
         use_ff_input=args.use_ff_input
