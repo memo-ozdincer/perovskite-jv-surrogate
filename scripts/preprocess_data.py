@@ -155,9 +155,39 @@ def preprocess_dataset(
     # Save IV curves
     np.savetxt(iv_out, iv_clean, delimiter=',', fmt='%.6f')
 
+    # Extract and save anchor values for the CLEANED data
+    # These can be used as auxiliary inputs to the curve model
+    targets_clean = extract_targets_gpu(
+        torch.from_numpy(iv_clean).to(device),
+        v_grid
+    )
+
+    jsc_clean = targets_clean['Jsc'].cpu().numpy()
+    voc_clean = targets_clean['Voc'].cpu().numpy()
+    vmpp_clean = targets_clean['Vmpp'].cpu().numpy()
+    jmpp_clean = targets_clean['Jmpp'].cpu().numpy()
+    ff_clean_arr = targets_clean['FF'].cpu().numpy()
+    pce_clean_arr = targets_clean['PCE'].cpu().numpy()
+    pmpp_clean = targets_clean['Pmpp'].cpu().numpy()
+
+    # Stack anchors: [Jsc, Voc, Vmpp, Jmpp, FF, PCE, Pmpp]
+    anchors = np.column_stack([
+        jsc_clean, voc_clean, vmpp_clean, jmpp_clean,
+        ff_clean_arr, pce_clean_arr, pmpp_clean
+    ])
+
+    # Save anchors to txt file
+    anchors_out = output_path / f"anchors{suffix}_{params_file_base.replace('LHS_parameters_m', '')}.txt"
+    if anchors_out.name == f"anchors{suffix}_.txt":
+        anchors_out = output_path / f"anchors{suffix}_100k.txt"
+
+    np.savetxt(anchors_out, anchors, delimiter=',', fmt='%.6f',
+               header='Jsc,Voc,Vmpp,Jmpp,FF,PCE,Pmpp', comments='')
+
     print(f"\nSaved preprocessed data:")
     print(f"  Parameters: {params_out}")
     print(f"  IV curves:  {iv_out}")
+    print(f"  Anchors:    {anchors_out}")
 
     # Save statistics
     stats = {
@@ -190,7 +220,8 @@ def preprocess_dataset(
         },
         'output_files': {
             'params': str(params_out),
-            'iv': str(iv_out)
+            'iv': str(iv_out),
+            'anchors': str(anchors_out)
         }
     }
 

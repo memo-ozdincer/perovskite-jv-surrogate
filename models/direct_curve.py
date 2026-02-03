@@ -48,6 +48,9 @@ class DirectCurveShapeNetConfig:
 
     RECOMMENDED: Uses pretrained Jsc LGBM and Voc NN for endpoints,
     only predicts the curve shape via control points.
+
+    Can optionally use additional anchor inputs (Vmpp, Jmpp, FF) for better
+    curve shape prediction. These can be loaded from auxiliary files.
     """
     input_dim: int = 31 + 71  # raw params + physics features
     hidden_dims: List[int] = field(default_factory=lambda: [512, 256, 128])
@@ -55,6 +58,10 @@ class DirectCurveShapeNetConfig:
     activation: str = 'silu'
     ctrl_points: int = 8  # More control points for better shape capture
     use_residual: bool = True  # Residual connections for better training
+    # Additional anchor inputs (from auxiliary files)
+    use_vmpp_input: bool = False  # Add Vmpp as conditioning
+    use_jmpp_input: bool = False  # Add Jmpp as conditioning
+    use_ff_input: bool = False    # Add FF as conditioning
 
 
 class DirectCurveNetWithJsc(nn.Module):
@@ -183,8 +190,14 @@ class DirectCurveShapeNet(nn.Module):
         super().__init__()
         self.config = config
 
-        # Input: features + Jsc + Voc
-        total_input = config.input_dim + 2
+        # Input: features + Jsc + Voc + optional anchors
+        total_input = config.input_dim + 2  # Base: features + Jsc + Voc
+        if config.use_vmpp_input:
+            total_input += 1
+        if config.use_jmpp_input:
+            total_input += 1
+        if config.use_ff_input:
+            total_input += 1
 
         # Shared backbone with optional residual connections
         if config.use_residual and len(config.hidden_dims) >= 2:
@@ -274,7 +287,10 @@ class DirectCurveShapeNet(nn.Module):
         self,
         x: torch.Tensor,
         jsc: torch.Tensor,
-        voc: torch.Tensor
+        voc: torch.Tensor,
+        vmpp: torch.Tensor = None,
+        jmpp: torch.Tensor = None,
+        ff: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -283,6 +299,9 @@ class DirectCurveShapeNet(nn.Module):
             x: (N, input_dim) normalized features
             jsc: (N,) short-circuit current from LGBM
             voc: (N,) open-circuit voltage from Voc NN
+            vmpp: (N,) optional Vmpp from auxiliary file
+            jmpp: (N,) optional Jmpp from auxiliary file
+            ff: (N,) optional FF from auxiliary file
 
         Returns:
             ctrl: (N, K) control points in [0, 1] for monotonic J interpolation
@@ -290,7 +309,22 @@ class DirectCurveShapeNet(nn.Module):
         # Normalize inputs to ~O(1)
         jsc_input = jsc.unsqueeze(1) / 50.0
         voc_input = voc.unsqueeze(1)  # Already ~O(1)
-        combined = torch.cat([x, jsc_input, voc_input], dim=1)
+
+        # Build combined input
+        inputs = [x, jsc_input, voc_input]
+
+        # Add optional anchor inputs if configured and provided
+        if self.config.use_vmpp_input and vmpp is not None:
+            vmpp_input = vmpp.unsqueeze(1)  # Already ~O(1)
+            inputs.append(vmpp_input)
+        if self.config.use_jmpp_input and jmpp is not None:
+            jmpp_input = jmpp.unsqueeze(1) / 50.0  # Normalize similar to Jsc
+            inputs.append(jmpp_input)
+        if self.config.use_ff_input and ff is not None:
+            ff_input = ff.unsqueeze(1)  # Already in [0, 1]
+            inputs.append(ff_input)
+
+        combined = torch.cat(inputs, dim=1)
 
         features = self.backbone(combined)
         ctrl = self.head_ctrl(features)

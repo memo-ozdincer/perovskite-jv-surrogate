@@ -580,6 +580,15 @@ class DirectCurveShapeObjective:
         curves_val: np.ndarray,
         v_grid: np.ndarray,
         device: torch.device,
+        vmpp_train: np.ndarray | None = None,
+        jmpp_train: np.ndarray | None = None,
+        ff_train: np.ndarray | None = None,
+        vmpp_val: np.ndarray | None = None,
+        jmpp_val: np.ndarray | None = None,
+        ff_val: np.ndarray | None = None,
+        use_vmpp_input: bool = False,
+        use_jmpp_input: bool = False,
+        use_ff_input: bool = False,
         batch_size: int = 2048,
         max_epochs: int = 100,
         patience: int = 20
@@ -598,9 +607,21 @@ class DirectCurveShapeObjective:
         self.input_dim = X_train.shape[1]
         self.max_epochs = max_epochs
         self.patience = patience
+        self.use_vmpp_input = use_vmpp_input
+        self.use_jmpp_input = use_jmpp_input
+        self.use_ff_input = use_ff_input
+        self.vmpp_train = torch.from_numpy(vmpp_train).float() if vmpp_train is not None else None
+        self.jmpp_train = torch.from_numpy(jmpp_train).float() if jmpp_train is not None else None
+        self.ff_train = torch.from_numpy(ff_train).float() if ff_train is not None else None
+        self.vmpp_val = torch.from_numpy(vmpp_val).float() if vmpp_val is not None else None
+        self.jmpp_val = torch.from_numpy(jmpp_val).float() if jmpp_val is not None else None
+        self.ff_val = torch.from_numpy(ff_val).float() if ff_val is not None else None
 
     def __call__(self, trial: optuna.Trial) -> float:
         config = sample_direct_curve_shape_config(trial, self.input_dim)
+        config.use_vmpp_input = self.use_vmpp_input
+        config.use_jmpp_input = self.use_jmpp_input
+        config.use_ff_input = self.use_ff_input
 
         # Training hyperparameters
         lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
@@ -627,12 +648,26 @@ class DirectCurveShapeObjective:
             optimizer, T_0=20, T_mult=2, eta_min=1e-7
         )
 
-        train_ds = torch.utils.data.TensorDataset(
-            self.X_train, self.jsc_train, self.voc_train, self.curves_train
-        )
-        val_ds = torch.utils.data.TensorDataset(
-            self.X_val, self.jsc_val, self.voc_val, self.curves_val
-        )
+        train_tensors = [self.X_train, self.jsc_train, self.voc_train, self.curves_train]
+        val_tensors = [self.X_val, self.jsc_val, self.voc_val, self.curves_val]
+        if self.use_vmpp_input:
+            if self.vmpp_train is None or self.vmpp_val is None:
+                raise ValueError("Vmpp input enabled but Vmpp arrays were not provided.")
+            train_tensors.append(self.vmpp_train)
+            val_tensors.append(self.vmpp_val)
+        if self.use_jmpp_input:
+            if self.jmpp_train is None or self.jmpp_val is None:
+                raise ValueError("Jmpp input enabled but Jmpp arrays were not provided.")
+            train_tensors.append(self.jmpp_train)
+            val_tensors.append(self.jmpp_val)
+        if self.use_ff_input:
+            if self.ff_train is None or self.ff_val is None:
+                raise ValueError("FF input enabled but FF arrays were not provided.")
+            train_tensors.append(self.ff_train)
+            val_tensors.append(self.ff_val)
+
+        train_ds = torch.utils.data.TensorDataset(*train_tensors)
+        val_ds = torch.utils.data.TensorDataset(*val_tensors)
 
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=self.batch_size, shuffle=True
@@ -649,14 +684,28 @@ class DirectCurveShapeObjective:
         for epoch in range(self.max_epochs):
             # Train
             model.train()
-            for batch_x, batch_jsc, batch_voc, batch_curves in train_loader:
+            for batch in train_loader:
+                batch_iter = iter(batch)
+                batch_x = next(batch_iter)
+                batch_jsc = next(batch_iter)
+                batch_voc = next(batch_iter)
+                batch_curves = next(batch_iter)
+                batch_vmpp = next(batch_iter) if self.use_vmpp_input else None
+                batch_jmpp = next(batch_iter) if self.use_jmpp_input else None
+                batch_ff = next(batch_iter) if self.use_ff_input else None
                 batch_x = batch_x.to(self.device)
                 batch_jsc = batch_jsc.to(self.device)
                 batch_voc = batch_voc.to(self.device)
                 batch_curves = batch_curves.to(self.device)
+                if batch_vmpp is not None:
+                    batch_vmpp = batch_vmpp.to(self.device)
+                if batch_jmpp is not None:
+                    batch_jmpp = batch_jmpp.to(self.device)
+                if batch_ff is not None:
+                    batch_ff = batch_ff.to(self.device)
 
                 optimizer.zero_grad()
-                ctrl = model(batch_x, batch_jsc, batch_voc)
+                ctrl = model(batch_x, batch_jsc, batch_voc, batch_vmpp, batch_jmpp, batch_ff)
                 pred_curve = reconstruct_curve_shape(batch_voc, ctrl, v_grid, clamp_voc=True)
 
                 loss, _ = loss_fn(pred_curve, batch_curves, batch_voc, v_grid)
@@ -674,13 +723,27 @@ class DirectCurveShapeObjective:
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for batch_x, batch_jsc, batch_voc, batch_curves in val_loader:
+                for batch in val_loader:
+                    batch_iter = iter(batch)
+                    batch_x = next(batch_iter)
+                    batch_jsc = next(batch_iter)
+                    batch_voc = next(batch_iter)
+                    batch_curves = next(batch_iter)
+                    batch_vmpp = next(batch_iter) if self.use_vmpp_input else None
+                    batch_jmpp = next(batch_iter) if self.use_jmpp_input else None
+                    batch_ff = next(batch_iter) if self.use_ff_input else None
                     batch_x = batch_x.to(self.device)
                     batch_jsc = batch_jsc.to(self.device)
                     batch_voc = batch_voc.to(self.device)
                     batch_curves = batch_curves.to(self.device)
+                    if batch_vmpp is not None:
+                        batch_vmpp = batch_vmpp.to(self.device)
+                    if batch_jmpp is not None:
+                        batch_jmpp = batch_jmpp.to(self.device)
+                    if batch_ff is not None:
+                        batch_ff = batch_ff.to(self.device)
 
-                    ctrl = model(batch_x, batch_jsc, batch_voc)
+                    ctrl = model(batch_x, batch_jsc, batch_voc, batch_vmpp, batch_jmpp, batch_ff)
                     pred_curve = reconstruct_curve_shape(batch_voc, ctrl, v_grid, clamp_voc=True)
 
                     # Use MSE for validation metric (consistent across trials)
@@ -889,6 +952,15 @@ class DistributedHPO:
         curves_val: np.ndarray,
         v_grid: np.ndarray,
         device: torch.device,
+        vmpp_train: np.ndarray | None = None,
+        jmpp_train: np.ndarray | None = None,
+        ff_train: np.ndarray | None = None,
+        vmpp_val: np.ndarray | None = None,
+        jmpp_val: np.ndarray | None = None,
+        ff_val: np.ndarray | None = None,
+        use_vmpp_input: bool = False,
+        use_jmpp_input: bool = False,
+        use_ff_input: bool = False,
         n_trials: int = None
     ) -> tuple[dict, optuna.Study]:
         """Run HPO for DirectCurveShapeNet (shape-only curve model)."""
@@ -898,7 +970,16 @@ class DistributedHPO:
         objective = DirectCurveShapeObjective(
             X_train, jsc_train, voc_train, curves_train,
             X_val, jsc_val, voc_val, curves_val,
-            v_grid, device
+            v_grid, device,
+            vmpp_train=vmpp_train,
+            jmpp_train=jmpp_train,
+            ff_train=ff_train,
+            vmpp_val=vmpp_val,
+            jmpp_val=jmpp_val,
+            ff_val=ff_val,
+            use_vmpp_input=use_vmpp_input,
+            use_jmpp_input=use_jmpp_input,
+            use_ff_input=use_ff_input
         )
 
         study = self.create_study('direct_curve_shape', sampler='tpe')
@@ -1344,6 +1425,15 @@ def run_direct_curve_shape_hpo(
     curves_val: np.ndarray,
     v_grid: np.ndarray,
     device: torch.device,
+    vmpp_train: np.ndarray | None = None,
+    jmpp_train: np.ndarray | None = None,
+    ff_train: np.ndarray | None = None,
+    vmpp_val: np.ndarray | None = None,
+    jmpp_val: np.ndarray | None = None,
+    ff_val: np.ndarray | None = None,
+    use_vmpp_input: bool = False,
+    use_jmpp_input: bool = False,
+    use_ff_input: bool = False,
     hpo_config: HPOConfig = None,
     n_trials: int = None
 ) -> dict:
@@ -1379,7 +1469,17 @@ def run_direct_curve_shape_hpo(
     shape_params, shape_study = engine.optimize_direct_curve_shape(
         X_train, jsc_train, voc_train, curves_train,
         X_val, jsc_val, voc_val, curves_val,
-        v_grid, device, n_trials
+        v_grid, device,
+        vmpp_train=vmpp_train,
+        jmpp_train=jmpp_train,
+        ff_train=ff_train,
+        vmpp_val=vmpp_val,
+        jmpp_val=jmpp_val,
+        ff_val=ff_val,
+        use_vmpp_input=use_vmpp_input,
+        use_jmpp_input=use_jmpp_input,
+        use_ff_input=use_ff_input,
+        n_trials=n_trials
     )
 
     results = {

@@ -227,7 +227,13 @@ class ScalarPredictorPipeline:
         filter_min_pce_quantile: float = 0.0,
         report_trimmed_metrics: bool = False,
         # Oracle mode
-        oracle_voc: bool = False  # Use true Voc for curve truncation
+        oracle_voc: bool = False,  # Use true Voc for curve truncation
+        # Auxiliary anchor inputs
+        anchors_file: str = None,
+        anchors_extra: list = None,
+        use_vmpp_input: bool = False,
+        use_jmpp_input: bool = False,
+        use_ff_input: bool = False
     ):
         # Build file lists for multi-file loading
         self.params_files = [params_file] + (params_extra or [])
@@ -267,6 +273,13 @@ class ScalarPredictorPipeline:
 
         # Oracle mode: use true Voc for curve truncation (shows upper bound performance)
         self.oracle_voc = oracle_voc
+
+        # Auxiliary anchor inputs for curve model conditioning
+        self.anchors_files = [anchors_file] + (anchors_extra or []) if anchors_file else []
+        self.use_vmpp_input = use_vmpp_input
+        self.use_jmpp_input = use_jmpp_input
+        self.use_ff_input = use_ff_input
+        self.anchors_data = None  # Will be loaded if anchor files provided
 
         # Will be populated during pipeline
         self.params_df = None
@@ -344,6 +357,52 @@ class ScalarPredictorPipeline:
                 device=self.device
             )
             print(f"\nAfter filtering: {len(self.params_df)} samples")
+
+        # Load auxiliary anchor files if provided
+        if self.anchors_files:
+            self._load_anchor_files()
+
+    def _load_anchor_files(self):
+        """Load auxiliary anchor data from txt files."""
+        print("\n" + "=" * 60)
+        print("Loading Auxiliary Anchor Files")
+        print("=" * 60)
+
+        all_anchors = []
+        for anchor_file in self.anchors_files:
+            if anchor_file is None:
+                continue
+            print(f"  Loading: {anchor_file}")
+            # Format: Jsc,Voc,Vmpp,Jmpp,FF,PCE,Pmpp (with header)
+            anchors = np.loadtxt(anchor_file, delimiter=',', skiprows=1, dtype=np.float32)
+            all_anchors.append(anchors)
+            print(f"    -> {len(anchors)} samples")
+
+        if all_anchors:
+            self.anchors_data = np.vstack(all_anchors)
+            print(f"\nTotal anchor samples: {len(self.anchors_data)}")
+            print(f"Anchor columns: Jsc, Voc, Vmpp, Jmpp, FF, PCE, Pmpp")
+
+            # Validate size matches IV data
+            if len(self.anchors_data) != len(self.iv_data):
+                raise ValueError(
+                    f"Anchor data size ({len(self.anchors_data)}) does not match "
+                    f"IV data size ({len(self.iv_data)}). Ensure anchors were generated "
+                    f"from the same preprocessed data."
+                )
+
+            # Log which anchor inputs will be used
+            inputs_used = []
+            if self.use_vmpp_input:
+                inputs_used.append("Vmpp")
+            if self.use_jmpp_input:
+                inputs_used.append("Jmpp")
+            if self.use_ff_input:
+                inputs_used.append("FF")
+            if inputs_used:
+                print(f"Anchor inputs enabled for curve model: {', '.join(inputs_used)}")
+            else:
+                print("No anchor inputs enabled (anchors loaded but not used as inputs)")
 
     def extract_targets(self):
         """Extract PV parameters from J-V curves using GPU."""
@@ -460,7 +519,8 @@ class ScalarPredictorPipeline:
                 'curves': self.iv_data[self.train_idx],
                 'curves_norm': curves_train_norm,
                 'isc_values': isc_train,
-                'v_grid': self.v_grid
+                'v_grid': self.v_grid,
+                'anchors': None  # Placeholder for anchors
             },
             'val': {
                 'X_raw': X_val_proc,
@@ -472,7 +532,8 @@ class ScalarPredictorPipeline:
                 'curves': self.iv_data[self.val_idx],
                 'curves_norm': curves_val_norm,
                 'isc_values': isc_val,
-                'v_grid': self.v_grid
+                'v_grid': self.v_grid,
+                'anchors': None  # Placeholder for anchors
             },
             'test': {
                 'X_raw': X_test_proc,
@@ -484,9 +545,16 @@ class ScalarPredictorPipeline:
                 'curves': self.iv_data[self.test_idx],
                 'curves_norm': curves_test_norm,
                 'isc_values': isc_test,
-                'v_grid': self.v_grid
+                'v_grid': self.v_grid,
+                'anchors': None  # Placeholder for anchors
             }
         }
+
+        # Attach auxiliary anchors per split if provided
+        if self.anchors_data is not None:
+            self.splits['train']['anchors'] = self.anchors_data[self.train_idx]
+            self.splits['val']['anchors'] = self.anchors_data[self.val_idx]
+            self.splits['test']['anchors'] = self.anchors_data[self.test_idx]
 
         # Debug + verification
         train_curves = self.splits['train']['curves']
@@ -1200,6 +1268,30 @@ class ScalarPredictorPipeline:
         curves_train_norm = train['curves_norm']
         curves_val_norm = val['curves_norm']
 
+        # Optional anchor inputs (Vmpp, Jmpp, FF)
+        use_anchor_inputs = self.use_vmpp_input or self.use_jmpp_input or self.use_ff_input
+        vmpp_train = jmpp_train = ff_train = None
+        vmpp_val = jmpp_val = ff_val = None
+        if use_anchor_inputs:
+            if self.anchors_data is None:
+                raise ValueError(
+                    "Anchor inputs enabled but no anchors file loaded. "
+                    "Provide --anchors (and --anchors-extra if needed)."
+                )
+            anchors_train = train.get('anchors')
+            anchors_val = val.get('anchors')
+            if anchors_train is None or anchors_val is None:
+                raise ValueError("Anchor inputs enabled but anchors are missing from splits.")
+            if self.use_vmpp_input:
+                vmpp_train = anchors_train[:, 2].astype(np.float32)
+                vmpp_val = anchors_val[:, 2].astype(np.float32)
+            if self.use_jmpp_input:
+                jmpp_train = anchors_train[:, 3].astype(np.float32)
+                jmpp_val = anchors_val[:, 3].astype(np.float32)
+            if self.use_ff_input:
+                ff_train = anchors_train[:, 4].astype(np.float32)
+                ff_val = anchors_val[:, 4].astype(np.float32)
+
         print(f"\nUsing pretrained models for endpoints:")
         print(f"  Jsc from LGBM - range: [{jsc_train.min():.2f}, {jsc_train.max():.2f}]")
         print(f"  Voc from Voc NN - range: [{voc_train_pred.min():.4f}, {voc_train_pred.max():.4f}]")
@@ -1209,20 +1301,32 @@ class ScalarPredictorPipeline:
 
         # Create datasets - use PREDICTED Voc for shape learning
         # This way the shape model learns to work with the actual Voc it will receive at inference
-        train_ds = torch.utils.data.TensorDataset(
+        train_tensors = [
             torch.from_numpy(X_train_norm.astype(np.float32)),
             torch.from_numpy(jsc_train.astype(np.float32)),
             torch.from_numpy(voc_train_pred.astype(np.float32)),  # Predicted Voc for training
             torch.from_numpy(voc_train_true.astype(np.float32)),  # True Voc for metrics
             torch.from_numpy(curves_train_norm.astype(np.float32))
-        )
-        val_ds = torch.utils.data.TensorDataset(
+        ]
+        val_tensors = [
             torch.from_numpy(X_val_norm.astype(np.float32)),
             torch.from_numpy(jsc_val.astype(np.float32)),
             torch.from_numpy(voc_val_pred.astype(np.float32)),
             torch.from_numpy(voc_val_true.astype(np.float32)),
             torch.from_numpy(curves_val_norm.astype(np.float32))
-        )
+        ]
+        if self.use_vmpp_input:
+            train_tensors.append(torch.from_numpy(vmpp_train.astype(np.float32)))
+            val_tensors.append(torch.from_numpy(vmpp_val.astype(np.float32)))
+        if self.use_jmpp_input:
+            train_tensors.append(torch.from_numpy(jmpp_train.astype(np.float32)))
+            val_tensors.append(torch.from_numpy(jmpp_val.astype(np.float32)))
+        if self.use_ff_input:
+            train_tensors.append(torch.from_numpy(ff_train.astype(np.float32)))
+            val_tensors.append(torch.from_numpy(ff_val.astype(np.float32)))
+
+        train_ds = torch.utils.data.TensorDataset(*train_tensors)
+        val_ds = torch.utils.data.TensorDataset(*val_tensors)
 
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
@@ -1247,7 +1351,16 @@ class ScalarPredictorPipeline:
                 v_grid=self.v_grid,
                 device=self.device,
                 hpo_config=self.hpo_config,
-                n_trials=self.hpo_config.n_trials_nn
+                n_trials=self.hpo_config.n_trials_nn,
+                vmpp_train=vmpp_train,
+                jmpp_train=jmpp_train,
+                ff_train=ff_train,
+                vmpp_val=vmpp_val,
+                jmpp_val=jmpp_val,
+                ff_val=ff_val,
+                use_vmpp_input=self.use_vmpp_input,
+                use_jmpp_input=self.use_jmpp_input,
+                use_ff_input=self.use_ff_input
             )
 
             # Extract best params
@@ -1266,7 +1379,11 @@ class ScalarPredictorPipeline:
                 dropout=best_params.get('dropout', 0.1),
                 activation=best_params.get('activation', 'silu'),
                 ctrl_points=best_params.get('ctrl_points', 8),
-                use_residual=best_params.get('use_residual', True)
+                use_residual=best_params.get('use_residual', True),
+                # Auxiliary anchor inputs
+                use_vmpp_input=self.use_vmpp_input,
+                use_jmpp_input=self.use_jmpp_input,
+                use_ff_input=self.use_ff_input
             )
 
             # Use HPO-optimized loss params
@@ -1292,7 +1409,11 @@ class ScalarPredictorPipeline:
                 dropout=0.1,
                 activation='silu',
                 ctrl_points=n_ctrl_points,
-                use_residual=True
+                use_residual=True,
+                # Auxiliary anchor inputs
+                use_vmpp_input=self.use_vmpp_input,
+                use_jmpp_input=self.use_jmpp_input,
+                use_ff_input=self.use_ff_input
             )
 
             loss_fn = DirectCurveShapeLoss(
@@ -1330,16 +1451,31 @@ class ScalarPredictorPipeline:
             model.train()
             epoch_losses = []
 
-            for batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves_norm in train_loader:
+            for batch in train_loader:
+                batch_iter = iter(batch)
+                batch_x = next(batch_iter)
+                batch_jsc = next(batch_iter)
+                batch_voc_pred = next(batch_iter)
+                batch_voc_true = next(batch_iter)
+                batch_curves_norm = next(batch_iter)
+                batch_vmpp = next(batch_iter) if self.use_vmpp_input else None
+                batch_jmpp = next(batch_iter) if self.use_jmpp_input else None
+                batch_ff = next(batch_iter) if self.use_ff_input else None
                 batch_x = batch_x.to(self.device)
                 batch_jsc = batch_jsc.to(self.device)
                 batch_voc_pred = batch_voc_pred.to(self.device)
                 batch_curves_norm = batch_curves_norm.to(self.device)
+                if batch_vmpp is not None:
+                    batch_vmpp = batch_vmpp.to(self.device)
+                if batch_jmpp is not None:
+                    batch_jmpp = batch_jmpp.to(self.device)
+                if batch_ff is not None:
+                    batch_ff = batch_ff.to(self.device)
 
                 optimizer.zero_grad()
 
                 # Model only predicts control points (shape)
-                ctrl = model(batch_x, batch_jsc, batch_voc_pred)
+                ctrl = model(batch_x, batch_jsc, batch_voc_pred, batch_vmpp, batch_jmpp, batch_ff)
 
                 # Reconstruct curve using non-uniform knots
                 pred_curve_norm = reconstruct_curve_shape(
@@ -1369,13 +1505,28 @@ class ScalarPredictorPipeline:
             sum_cnt = 0
 
             with torch.no_grad():
-                for batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves_norm in val_loader:
+                for batch in val_loader:
+                    batch_iter = iter(batch)
+                    batch_x = next(batch_iter)
+                    batch_jsc = next(batch_iter)
+                    batch_voc_pred = next(batch_iter)
+                    batch_voc_true = next(batch_iter)
+                    batch_curves_norm = next(batch_iter)
+                    batch_vmpp = next(batch_iter) if self.use_vmpp_input else None
+                    batch_jmpp = next(batch_iter) if self.use_jmpp_input else None
+                    batch_ff = next(batch_iter) if self.use_ff_input else None
                     batch_x = batch_x.to(self.device)
                     batch_jsc = batch_jsc.to(self.device)
                     batch_voc_pred = batch_voc_pred.to(self.device)
                     batch_curves_norm = batch_curves_norm.to(self.device)
+                    if batch_vmpp is not None:
+                        batch_vmpp = batch_vmpp.to(self.device)
+                    if batch_jmpp is not None:
+                        batch_jmpp = batch_jmpp.to(self.device)
+                    if batch_ff is not None:
+                        batch_ff = batch_ff.to(self.device)
 
-                    ctrl = model(batch_x, batch_jsc, batch_voc_pred)
+                    ctrl = model(batch_x, batch_jsc, batch_voc_pred, batch_vmpp, batch_jmpp, batch_ff)
                     pred_curve_norm = reconstruct_curve_shape(
                         batch_voc_pred, ctrl, v_grid, clamp_voc=True
                     )
@@ -1751,6 +1902,22 @@ class ScalarPredictorPipeline:
         X_full = np.hstack([split['X_raw'], split['X_physics']]).astype(np.float32)
         X_full = (X_full - self.curve_feature_mean) / self.curve_feature_std
 
+        # Optional anchor inputs for shape model
+        vmpp_split = jmpp_split = ff_split = None
+        if self.use_vmpp_input or self.use_jmpp_input or self.use_ff_input:
+            anchors_split = split.get('anchors')
+            if anchors_split is None:
+                raise ValueError(
+                    "Anchor inputs enabled but split anchors are missing. "
+                    "Ensure --anchors were provided and preprocessing is aligned."
+                )
+            if self.use_vmpp_input:
+                vmpp_split = anchors_split[:, 2].astype(np.float32)
+            if self.use_jmpp_input:
+                jmpp_split = anchors_split[:, 3].astype(np.float32)
+            if self.use_ff_input:
+                ff_split = anchors_split[:, 4].astype(np.float32)
+
         anchors_true = np.stack(
             [split['targets']['Jsc'], split['targets']['Voc'],
              split['targets']['Vmpp'], split['targets']['Jmpp']],
@@ -1779,7 +1946,7 @@ class ScalarPredictorPipeline:
             if use_shape_net:
                 # DirectCurveShapeNet: needs Jsc AND Voc from pretrained models
                 voc_pred = self._predict_voc_nn(split)
-                ds = torch.utils.data.TensorDataset(
+                tensors = [
                     torch.from_numpy(sample_indices),
                     torch.from_numpy(X_full),
                     torch.from_numpy(jsc_pred.astype(np.float32)),
@@ -1788,7 +1955,14 @@ class ScalarPredictorPipeline:
                     torch.from_numpy(curves_true),
                     torch.from_numpy(curves_true_norm.astype(np.float32)),
                     torch.from_numpy(anchors_true)
-                )
+                ]
+                if self.use_vmpp_input:
+                    tensors.append(torch.from_numpy(vmpp_split.astype(np.float32)))
+                if self.use_jmpp_input:
+                    tensors.append(torch.from_numpy(jmpp_split.astype(np.float32)))
+                if self.use_ff_input:
+                    tensors.append(torch.from_numpy(ff_split.astype(np.float32)))
+                ds = torch.utils.data.TensorDataset(*tensors)
             else:
                 # Legacy DirectCurveNetWithJsc: needs Jsc, predicts Voc
                 ds = torch.utils.data.TensorDataset(
@@ -1899,7 +2073,17 @@ class ScalarPredictorPipeline:
                 if use_direct_curve_model:
                     if use_shape_net:
                         # DirectCurveShapeNet: uses Jsc AND Voc from pretrained models
-                        batch_x, batch_jsc, batch_voc_pred, batch_voc_true, batch_curves, batch_curves_norm, batch_anchors_true = batch
+                        batch_iter = iter(batch)
+                        batch_x = next(batch_iter)
+                        batch_jsc = next(batch_iter)
+                        batch_voc_pred = next(batch_iter)
+                        batch_voc_true = next(batch_iter)
+                        batch_curves = next(batch_iter)
+                        batch_curves_norm = next(batch_iter)
+                        batch_anchors_true = next(batch_iter)
+                        batch_vmpp = next(batch_iter) if self.use_vmpp_input else None
+                        batch_jmpp = next(batch_iter) if self.use_jmpp_input else None
+                        batch_ff = next(batch_iter) if self.use_ff_input else None
                         batch_x = batch_x.to(self.device)
                         batch_jsc = batch_jsc.to(self.device)
                         batch_voc_pred = batch_voc_pred.to(self.device)
@@ -1907,9 +2091,15 @@ class ScalarPredictorPipeline:
                         batch_curves = batch_curves.to(self.device)
                         batch_curves_norm = batch_curves_norm.to(self.device)
                         batch_anchors_true = batch_anchors_true.to(self.device)
+                        if batch_vmpp is not None:
+                            batch_vmpp = batch_vmpp.to(self.device)
+                        if batch_jmpp is not None:
+                            batch_jmpp = batch_jmpp.to(self.device)
+                        if batch_ff is not None:
+                            batch_ff = batch_ff.to(self.device)
 
                         # Model only predicts shape (control points)
-                        ctrl = model(batch_x, batch_jsc, batch_voc_pred)
+                        ctrl = model(batch_x, batch_jsc, batch_voc_pred, batch_vmpp, batch_jmpp, batch_ff)
 
                         # Oracle mode: use true Voc for reconstruction
                         voc_for_curve = batch_voc_true if self.oracle_voc else batch_voc_pred
@@ -2803,6 +2993,18 @@ def main():
     parser.add_argument('--oracle-voc', action='store_true',
                         help='Use true Voc for curve truncation (oracle mode for upper bound evaluation)')
 
+    # Auxiliary anchor files (for additional curve model conditioning)
+    parser.add_argument('--anchors', type=str, default=None,
+                        help='Path to primary anchors file (Jsc,Voc,Vmpp,Jmpp,FF,PCE,Pmpp)')
+    parser.add_argument('--anchors-extra', type=str, nargs='*', default=[],
+                        help='Additional anchor files to concatenate')
+    parser.add_argument('--use-vmpp-input', action='store_true',
+                        help='Use Vmpp from anchor files as curve model input')
+    parser.add_argument('--use-jmpp-input', action='store_true',
+                        help='Use Jmpp from anchor files as curve model input')
+    parser.add_argument('--use-ff-input', action='store_true',
+                        help='Use FF from anchor files as curve model input')
+
     args = parser.parse_args()
 
     # Log input files for debugging
@@ -2864,7 +3066,13 @@ def main():
         filter_min_vmpp=args.filter_min_vmpp,
         filter_min_pce_quantile=args.filter_min_pce_quantile,
         report_trimmed_metrics=args.report_trimmed_metrics,
-        oracle_voc=args.oracle_voc
+        oracle_voc=args.oracle_voc,
+        # Auxiliary anchor inputs
+        anchors_file=args.anchors,
+        anchors_extra=args.anchors_extra,
+        use_vmpp_input=args.use_vmpp_input,
+        use_jmpp_input=args.use_jmpp_input,
+        use_ff_input=args.use_ff_input
     )
 
     metrics = pipeline.run()

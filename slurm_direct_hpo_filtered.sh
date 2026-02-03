@@ -85,6 +85,10 @@ echo ""
 OUT_DIR="$WORK_DIR/outputs_preprocessed_$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="$WORK_DIR/results"
 
+# Anchor files (from preprocessing)
+ANCHORS_PRIMARY="$PREPROCESS_DIR/anchors_clean_100k.txt"
+ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean__300k.txt"
+
 CTRL_POINTS=8
 
 # Use oracle Voc for evaluation (true Voc for truncation)
@@ -103,6 +107,8 @@ echo ""
 echo "Data files (preprocessed):"
 echo "  Primary: $PREPROCESS_DIR/LHS_parameters_m_clean.txt"
 echo "  Extra:   $PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
+echo "  Anchors: $ANCHORS_PRIMARY"
+echo "  Anchors extra: $ANCHORS_EXTRA"
 echo ""
 
 CMD="python train.py \
@@ -110,6 +116,8 @@ CMD="python train.py \
     --iv \"$PREPROCESS_DIR/IV_m_clean.txt\" \
     --params-extra \"$PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt\" \
     --iv-extra \"$PREPROCESS_DIR/IV_m_300k_clean.txt\" \
+    --anchors \"$ANCHORS_PRIMARY\" \
+    --anchors-extra \"$ANCHORS_EXTRA\" \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
@@ -118,7 +126,8 @@ CMD="python train.py \
     --drop-multicollinear \
     --no-hpo \
     --ctrl-points $CTRL_POINTS \
-    --report-trimmed-metrics"
+    --report-trimmed-metrics \
+    --use-vmpp-input"
 
 # Add oracle Voc flag if enabled
 if [ "$USE_ORACLE_VOC" = true ]; then
