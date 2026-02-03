@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=direct_hpo_filtered
+#SBATCH --job-name=direct_no_hpo_filtered
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
@@ -10,7 +10,7 @@
 #SBATCH --account=aip-aspuru
 
 # ============================================================================
-# Direct Curve Pipeline - FILTERED VERSION
+# Direct Curve Pipeline - FILTERED VERSION (NO HPO)
 # ============================================================================
 # This version filters out outlier samples before training to improve
 # model accuracy on well-behaved IV curves.
@@ -20,10 +20,12 @@
 # - Remove samples with Vmpp <= 0.30 (extreme operating conditions)
 #
 # These filters remove ~15% of samples but improve R² by ~4-5%.
+#
+# NO HPO - uses default hyperparameters for fast iteration
 # ============================================================================
 
 echo "==========================================="
-echo "FILTERED VERSION - Outlier Removal"
+echo "FILTERED VERSION (NO HPO) - Outlier Removal"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "Start time: $(date)"
@@ -58,11 +60,8 @@ OUT_DIR="$WORK_DIR/outputs_filtered_$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="$WORK_DIR/results"
 
 # ============================================================================
-# CONFIGURATION - FILTERED
+# CONFIGURATION - FILTERED (NO HPO)
 # ============================================================================
-HPO_TRIALS_NN=5
-HPO_TRIALS_LGBM=100
-HPO_TIMEOUT=14400      # 4 hours per model
 CTRL_POINTS=8
 
 # Filtering thresholds (based on curve error analysis)
@@ -74,12 +73,9 @@ PARAMS_EXTRA="$WORK_DIR/LHS_parameters_m_300k.txt"
 IV_EXTRA="$WORK_DIR/IV_m_300k.txt"
 
 echo ""
-echo "Configuration (FILTERED):"
-echo "  HPO_TRIALS_NN: $HPO_TRIALS_NN"
-echo "  HPO_TRIALS_LGBM: $HPO_TRIALS_LGBM"
-echo "  HPO_TIMEOUT: $HPO_TIMEOUT"
+echo "Configuration (FILTERED - NO HPO):"
 echo "  CTRL_POINTS: $CTRL_POINTS"
-echo "  curve-hpo: ENABLED"
+echo "  HPO: DISABLED"
 echo ""
 echo "Outlier Filtering:"
 echo "  FILTER_MIN_FF: $FILTER_MIN_FF"
@@ -103,12 +99,9 @@ CMD="python train.py \
     --device cuda \
     --train-curves \
     --direct-curve \
-    --curve-hpo \
     --drop-weak-features \
     --drop-multicollinear \
-    --hpo-trials-nn $HPO_TRIALS_NN \
-    --hpo-trials-lgbm $HPO_TRIALS_LGBM \
-    --hpo-timeout $HPO_TIMEOUT \
+    --no-hpo \
     --ctrl-points $CTRL_POINTS \
     --filter-outliers \
     --filter-min-ff $FILTER_MIN_FF \
@@ -133,7 +126,7 @@ cp -f "$OUT_DIR/model_comparison.md" "$RESULTS_DIR/${RUN_TAG}_model_comparison.m
 
 echo ""
 echo "==========================================="
-echo "FILTERED VERSION - Complete"
+echo "FILTERED VERSION (NO HPO) - Complete"
 echo "End time: $(date)"
 echo "==========================================="
 echo ""
