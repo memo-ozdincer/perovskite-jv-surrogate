@@ -146,7 +146,6 @@ CMD="python train.py \
     --output \"$OUT_DIR\" \
     --device cuda \
     --train-curves \
-    --direct-curve \
     --drop-weak-features \
     --drop-multicollinear \
     --no-hpo \
