@@ -71,7 +71,7 @@ From 31 raw input parameters, we compute \textbf{71 candidate physics-informed f
 
 \subsection{Overall System Architecture}
 
-The framework's \textbf{main contribution} is the \textbf{UnifiedSplitSplineNet}: a multi-head neural network that jointly predicts physical anchors and region-specific control points, followed by a differentiable PCHIP reconstruction layer with hard physics projection.
+The framework's \textbf{main contribution} is the \textbf{UnifiedSplitSplineNet}: a multi-head neural network that jointly predicts physical anchors and region-specific control points, followed by a differentiable PCHIP reconstruction layer with Vmpp‑clustered knot placement and hard physics projection.
 
 \begin{equation}
 \text{Input} \rightarrow \text{SharedBackbone} \rightarrow \begin{cases}
@@ -117,7 +117,7 @@ From the 128-dimensional backbone:
     \item \textbf{Region 2 Head}: Linear(128 $\rightarrow$ $K$) $\rightarrow$ Tanh $\rightarrow$ control points for $[V_{mpp}, V_{oc}]$
 \end{itemize}
 
-Default $K = 4$ control points per region (HPO searches $K \in \{2, 4, 6, 8\}$).
+Default $K \approx 5$ control points per region (\textasciitilde 12 knots total including anchors); HPO can adjust $K$.
 
 \subsection{Jacobian-Informed Training (Optional)}
 
@@ -196,7 +196,7 @@ J_{sc} \geq \epsilon, \quad V_{oc} \geq \epsilon \\
 
 \subsubsection{Knot Construction with Monotonicity Guarantee}
 
-Knot voltages via cumulative sigmoid scaling:
+Knot voltages via cumulative sigmoid scaling with Vmpp‑clustered placement (denser near the knee in both regions):
 \begin{equation}
 V_{knot,i} = V_{min} + \sum_{j \leq i} \sigma(\alpha_j) \cdot \frac{V_{max} - V_{min}}{K+1}, \quad \sigma(x) = \frac{1}{1+e^{-x}}
 \end{equation}
@@ -597,6 +597,11 @@ Simple feedforward: $31 \rightarrow 256 \rightarrow 128 \rightarrow 45$ (no phys
     \item \textbf{Split}: 70/15/15 train/val/test (stratified by $V_{oc}$ bins)
 \end{itemize}
 
+Only very unphysical curves are removed as part of data generation quality control
+(Latin Hypercube Sampling over a Bayesian distribution of COMSOL sweeps across 31
+coupled PDE parameters). Filtering is limited to extreme FF/Vmpp cases that violate
+basic device physics.
+
 \subsection{Preprocessing Pipeline}
 
 \begin{enumerate}
@@ -604,6 +609,10 @@ Simple feedforward: $31 \rightarrow 256 \rightarrow 128 \rightarrow 45$ (no phys
     \item \textbf{RobustScaler}: $x'' = (x' - \text{median}) / \text{IQR}$
     \item \textbf{MinMaxScaler}: $x''' \in [0, 1]$
 \end{enumerate}
+
+Scalar inputs ($V_{oc}$, $V_{mpp}$) are consumed from external TXT files so they can
+be swapped with outputs from separate NN/LGBM predictors; the curve pipeline only reads
+these TXT inputs.
 
 \subsection{Curve Preprocessing}
 

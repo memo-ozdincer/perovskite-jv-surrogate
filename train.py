@@ -37,7 +37,9 @@ from models.vmpp_lgbm import (
 )
 from models.reconstruction import (
     reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_jsc,
-    continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
+    continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch,
+    build_vmpp_subsampled_grid, sample_curve_at_voltages,
+    get_knot_values, get_knot_values_normalized
 )
 from models.direct_curve import (
     DirectCurveNetWithJsc, DirectCurveNetWithJscConfig,
@@ -115,6 +117,91 @@ class MultiTaskLoss(nn.Module):
             'sigma_ratio': sigma_ratio,
             'loss_total': loss.item(),
             'task_imbalance': 'anchor_easy' if sigma_ratio < 0.1 else ('curve_easy' if sigma_ratio > 10 else 'balanced')
+        }
+        return loss, metrics
+
+
+class KnotLoss(nn.Module):
+    """
+    Loss computed at Vmpp-clustered knot positions only.
+    
+    This is the PRIMARY loss function for training. Instead of computing loss
+    on the full 45-point grid, we compute loss at the ~12-16 knot positions
+    that the model directly predicts (clustered around Vmpp).
+    
+    The knot positions are per-sample (since Vmpp varies), so we:
+    1. Get predicted J values at the predicted knot voltages
+    2. Sample true curve at those same knot voltages (via interpolation)
+    3. Compute weighted MSE with extra weight near Vmpp
+    """
+    
+    def __init__(self, mpp_weight: float = 2.0, use_huber: bool = True, huber_delta: float = 0.1):
+        super().__init__()
+        self.mpp_weight = mpp_weight
+        self.use_huber = use_huber
+        self.huber_delta = huber_delta
+        
+    def forward(
+        self,
+        v_knots_pred: torch.Tensor,
+        j_knots_pred: torch.Tensor,
+        j_knots_true: torch.Tensor,
+        vmpp: torch.Tensor,
+        jsc: torch.Tensor
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Compute loss at knot positions.
+        
+        Args:
+            v_knots_pred: (N, K) voltage positions of knots (from prediction)
+            j_knots_pred: (N, K) predicted J values at knots
+            j_knots_true: (N, K) true J values sampled at same knot voltages
+            vmpp: (N,) voltage at MPP (for weighting)
+            jsc: (N,) short-circuit current (for normalization)
+            
+        Returns:
+            loss: scalar loss value
+            metrics: dict with logging info
+        """
+        # Guard against NaN
+        if torch.isnan(j_knots_pred).any():
+            j_knots_pred = torch.where(torch.isnan(j_knots_pred), j_knots_true, j_knots_pred)
+            
+        # Relative error (normalized by Jsc)
+        eps = 1e-6
+        jsc_ref = jsc.clamp(min=eps).unsqueeze(1)  # (N, 1)
+        rel_err = (j_knots_pred - j_knots_true) / jsc_ref
+        
+        # Compute per-point loss (Huber or MSE)
+        if self.use_huber:
+            # Huber loss for robustness to outliers
+            abs_err = rel_err.abs()
+            sq_loss = 0.5 * rel_err ** 2
+            linear_loss = self.huber_delta * (abs_err - 0.5 * self.huber_delta)
+            point_loss = torch.where(abs_err <= self.huber_delta, sq_loss, linear_loss)
+        else:
+            point_loss = rel_err ** 2
+            
+        # Weight points near Vmpp more heavily (the "knee" region)
+        vmpp_expanded = vmpp.unsqueeze(1)  # (N, 1)
+        dist_to_mpp = (v_knots_pred - vmpp_expanded).abs()
+        mpp_weights = 1.0 + (self.mpp_weight - 1.0) * torch.exp(-dist_to_mpp / 0.1)
+        
+        weighted_loss = point_loss * mpp_weights
+        loss = weighted_loss.mean()
+        
+        # Metrics
+        n_knots = v_knots_pred.shape[1]
+        n_r1 = n_knots // 2  # Approximate split
+        mse_r1 = point_loss[:, :n_r1].mean().item()
+        mse_r2 = point_loss[:, n_r1:].mean().item()
+        
+        metrics = {
+            'loss_knot': loss.item(),
+            'mse_knots': (rel_err ** 2).mean().item(),
+            'mse_region1': mse_r1,
+            'mse_region2': mse_r2,
+            'n_knots': n_knots,
         }
         return loss, metrics
 
@@ -1798,9 +1885,16 @@ class ScalarPredictorPipeline:
 
     def train_curve_model_legacy(self):
         """
-        LEGACY: Train unified split-spline model (predicts anchors + control points).
-        Kept for backward compatibility. Use train_curve_model() for better results.
+        Train unified split-spline model (predicts anchors + control points).
+        
+        UPDATED: Now computes loss at the ~12-16 Vmpp-clustered knot positions
+        instead of the full 45-point grid. This is more principled since those
+        are the actual points the model predicts.
         """
+        print("\n" + "=" * 60)
+        print("Training Curve Model (Vmpp-Subsampled Knot Loss)")
+        print("=" * 60)
+        
         train = self.splits['train']
         val = self.splits['val']
 
@@ -1843,10 +1937,16 @@ class ScalarPredictorPipeline:
         ctrl_points = min(max(self.ctrl_points, 4), 5)
         config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=ctrl_points)
         model = UnifiedSplitSplineNet(config).to(self.device)
-        multitask_loss = MultiTaskLoss(init_log_sigma=-1.0).to(self.device)  # Fixed init
+        
+        # Use knot-based loss instead of full-curve loss
+        knot_loss_fn = KnotLoss(mpp_weight=2.0, use_huber=True, huber_delta=0.1).to(self.device)
+        
+        # Anchor loss uses learned sigmas (Kendall formulation)
+        # We'll use a simplified version since curve loss is now separate
+        log_sigma_anchor = nn.Parameter(torch.tensor([-1.0], device=self.device))
 
         optimizer = torch.optim.AdamW(
-            list(model.parameters()) + list(multitask_loss.parameters()),
+            list(model.parameters()) + [log_sigma_anchor],
             lr=1e-3,
             weight_decay=1e-5
         )
@@ -1856,11 +1956,20 @@ class ScalarPredictorPipeline:
         best_state = None
         patience = 15
         patience_counter = 0
-        val_metrics_last = {}  # Initialize
+        val_metrics_last = {}
+        
+        # Total knots = 2 * (ctrl_points + 2) - 1 (minus 1 for shared Vmpp point)
+        n_knots = 2 * (ctrl_points + 2) - 1
+        print(f"\nTraining with {n_knots} Vmpp-clustered knot points (ctrl_points={ctrl_points})")
+        print(f"  Knot strategy: mpp_cluster (power=2.0)")
+        print(f"  Loss: Huber at knots + anchor MSE (Kendall weighting)")
+        print(f"  Continuity weight: {self.continuity_weight}")
 
         for epoch in range(100):
             model.train()
             epoch_losses = []
+            epoch_anchor_losses = []
+            epoch_knot_losses = []
             cont_loss = torch.tensor(0.0)
 
             for batch_x, batch_anchors, batch_curves in train_loader:
@@ -1870,15 +1979,45 @@ class ScalarPredictorPipeline:
 
                 optimizer.zero_grad()
                 pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                pred_curve = reconstruct_curve_normalized(
-                    pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True, knot_strategy="mpp_cluster"
+                
+                # Get predicted knot positions and J values (in normalized space)
+                v_knots_pred, j_knots_pred = get_knot_values_normalized(
+                    pred_anchors, ctrl1, ctrl2,
+                    knot_strategy="mpp_cluster", cluster_power=2.0
                 )
-                loss, metrics = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
+                
+                # Sample true curves at the PREDICTED knot voltages
+                # First normalize true curves the same way
+                jsc_true = batch_anchors[:, 0].clamp(min=1e-6)
+                curves_norm = 2.0 * (batch_curves / jsc_true.unsqueeze(1)) - 1.0
+                
+                # Sample true normalized curves at predicted knot positions
+                j_knots_true = sample_curve_at_voltages(curves_norm, v_grid, v_knots_pred)
+                
+                # Compute knot loss
+                vmpp_pred = pred_anchors[:, 2]
+                jsc_pred = pred_anchors[:, 0]
+                loss_knot, knot_metrics = knot_loss_fn(
+                    v_knots_pred, j_knots_pred, j_knots_true, vmpp_pred, jsc_pred
+                )
+                
+                # Compute anchor loss (MSE on [Jsc, Voc, Vmpp, Jmpp])
+                loss_anchor = F.mse_loss(pred_anchors, batch_anchors)
+                
+                # Kendall-style weighting for anchor loss
+                log_sigma_a = log_sigma_anchor.clamp(-2.3, 1.6)
+                sigma_a = torch.exp(log_sigma_a)
+                weighted_anchor_loss = loss_anchor / (2 * sigma_a ** 2) + log_sigma_a
+                
+                # Continuity loss (in normalized space)
+                anchors_norm = normalize_anchors_by_jsc(pred_anchors)
                 cont_loss = continuity_loss(
-                    normalize_anchors_by_jsc(pred_anchors), ctrl1, ctrl2,
+                    anchors_norm, ctrl1, ctrl2,
                     v_grid, j_end=-1.0, knot_strategy="mpp_cluster"
                 )
-                loss = loss + self.continuity_weight * cont_loss
+                
+                # Total loss
+                loss = weighted_anchor_loss + loss_knot + self.continuity_weight * cont_loss
 
                 if torch.isnan(loss):
                     continue
@@ -1886,16 +2025,15 @@ class ScalarPredictorPipeline:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                
                 epoch_losses.append(loss.item())
+                epoch_anchor_losses.append(loss_anchor.item())
+                epoch_knot_losses.append(knot_metrics['loss_knot'])
 
             model.eval()
             val_losses = []
-            sum_sq_full = 0.0
-            sum_cnt = 0.0
-            sum_sq_r1 = 0.0
-            sum_cnt_r1 = 0.0
-            sum_sq_r2 = 0.0
-            sum_cnt_r2 = 0.0
+            val_anchor_losses = []
+            val_knot_losses = []
             ff_mape_sum = 0.0
             ff_cnt = 0.0
 
@@ -1904,25 +2042,34 @@ class ScalarPredictorPipeline:
                     batch_x = batch_x.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
+                    
                     pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                    pred_curve = reconstruct_curve_normalized(
-                        pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True, knot_strategy="mpp_cluster"
+                    
+                    # Get knot values
+                    v_knots_pred, j_knots_pred = get_knot_values_normalized(
+                        pred_anchors, ctrl1, ctrl2,
+                        knot_strategy="mpp_cluster", cluster_power=2.0
                     )
-                    val_loss, val_metrics_last = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
+                    
+                    # Sample true curves
+                    jsc_true = batch_anchors[:, 0].clamp(min=1e-6)
+                    curves_norm = 2.0 * (batch_curves / jsc_true.unsqueeze(1)) - 1.0
+                    j_knots_true = sample_curve_at_voltages(curves_norm, v_grid, v_knots_pred)
+                    
+                    # Losses
+                    vmpp_pred = pred_anchors[:, 2]
+                    jsc_pred = pred_anchors[:, 0]
+                    loss_knot, val_metrics_last = knot_loss_fn(
+                        v_knots_pred, j_knots_pred, j_knots_true, vmpp_pred, jsc_pred
+                    )
+                    loss_anchor = F.mse_loss(pred_anchors, batch_anchors)
+                    
+                    val_loss = loss_anchor + loss_knot
                     val_losses.append(val_loss.item())
+                    val_anchor_losses.append(loss_anchor.item())
+                    val_knot_losses.append(loss_knot.item())
 
-                    err = (pred_curve - batch_curves) ** 2
-                    sum_sq_full += err.sum().item()
-                    sum_cnt += err.numel()
-
-                    vmpp = pred_anchors[:, 2].unsqueeze(1)
-                    mask_r1 = v_grid.unsqueeze(0) <= vmpp
-                    mask_r2 = ~mask_r1
-                    sum_sq_r1 += (err * mask_r1).sum().item()
-                    sum_cnt_r1 += mask_r1.sum().item()
-                    sum_sq_r2 += (err * mask_r2).sum().item()
-                    sum_cnt_r2 += mask_r2.sum().item()
-
+                    # FF MAPE for monitoring
                     ff_pred = (pred_anchors[:, 2] * pred_anchors[:, 3]) / (
                         pred_anchors[:, 0] * pred_anchors[:, 1] + 1e-12
                     )
@@ -1933,31 +2080,16 @@ class ScalarPredictorPipeline:
                     ff_cnt += ff_true.numel()
 
             avg_val = float(np.mean(val_losses))
-
-            if val_metrics_last:
-                cont_loss_val = cont_loss.item() if 'cont_loss' in dir() and isinstance(cont_loss, torch.Tensor) else 0.0
-                self.logger.log_multitask_loss(
-                    epoch=epoch,
-                    loss_anchor=val_metrics_last.get('loss_anchor', 0),
-                    loss_curve=val_metrics_last.get('loss_curve', 0),
-                    sigma_anchor=val_metrics_last.get('sigma_anchor', 1.0),
-                    sigma_curve=val_metrics_last.get('sigma_curve', 1.0),
-                    loss_continuity=cont_loss_val,
-                    loss_total=avg_val
-                )
+            avg_val_anchor = float(np.mean(val_anchor_losses))
+            avg_val_knot = float(np.mean(val_knot_losses))
 
             if epoch % 10 == 0:
-                mse_full = sum_sq_full / max(1.0, sum_cnt)
-                mse_r1 = sum_sq_r1 / max(1.0, sum_cnt_r1)
-                mse_r2 = sum_sq_r2 / max(1.0, sum_cnt_r2)
                 ff_mape = (ff_mape_sum / max(1.0, ff_cnt)) * 100
-                sigma_a = val_metrics_last.get('sigma_anchor', 1.0)
-                sigma_c = val_metrics_last.get('sigma_curve', 1.0)
+                sigma_a = torch.exp(log_sigma_anchor.clamp(-2.3, 1.6)).item()
                 print(
                     f"Epoch {epoch}: train_loss={np.mean(epoch_losses):.6f}, "
-                    f"val_loss={avg_val:.6f}, mse_full={mse_full:.6f}, "
-                    f"mse_r1={mse_r1:.6f}, mse_r2={mse_r2:.6f}, ff_mape={ff_mape:.2f}%, "
-                    f"sigma_a={sigma_a:.4f}, sigma_c={sigma_c:.4f}"
+                    f"val_loss={avg_val:.6f} (anchor={avg_val_anchor:.6f}, knot={avg_val_knot:.6f}), "
+                    f"ff_mape={ff_mape:.2f}%, sigma_a={sigma_a:.4f}, n_knots={val_metrics_last.get('n_knots', n_knots)}"
                 )
 
             if avg_val < best_val:

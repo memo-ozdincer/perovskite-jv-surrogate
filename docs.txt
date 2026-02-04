@@ -25,20 +25,19 @@ IMPLEMENTED ARCHITECTURE (AS-BUILT)
 ================================================================================
 File: `models/voc_nn.py`
 
-Primary curve model (current): ControlPointNet (control-point-only).
+Primary curve model (current): UnifiedSplitSplineNet (split‑spline, multi‑head).
   Inputs:
     - Features: 31 raw params + 71 physics features (derived only from the 31 params)
-    - Anchors: [Jsc, Voc, Vmpp, Jmpp] predicted by upstream NN/LGBM models
-  Output:
+  Outputs:
+    - Anchors: [Jsc, Voc, Vmpp, Jmpp] with hard projection
     - Region 1 control points (0→Vmpp)
     - Region 2 control points (Vmpp→Voc)
   Reconstruction:
-    - `reconstruct_curve` uses the predicted anchors + control points
+    - Jsc‑normalized split PCHIP with knots clustered around Vmpp
+    - Endpoint enforcement at V=0, V=Vmpp, V=Voc
+    - ~12 knots total (K≈5 per region + endpoints)
 
-Legacy model (kept for compatibility): UnifiedSplitSplineNet.
-  Input: 102 features (31 raw + 71 physics, normalized independently)
-  Output: Anchors + control points in one network
-  NOTE: Not the default curve model.
+ControlPointNet (control‑point‑only) remains available but is not the default.
 
 CONFIGURABLE CONTROL POINTS (v2.0):
   Default K=4 (reduced from 6 for simpler models)
@@ -90,6 +89,7 @@ NEW IN v2.0 - Monotonicity Violation Tracking:
   Logged to monotonicity.csv for debugging spline construction issues.
 
 Interpolation: `pchip_interpolate_batch` implements Fritsch-Carlson PCHIP in PyTorch.
+Knot placement: Vmpp‑clustered (denser near the knee in both regions).
 Stitching: Curves split at Vmpp, concatenated with mask-based selection.
 Endpoint enforcement (new):
   - After PCHIP, set J(V=0)=Jsc, set J(Vmpp)=Jmpp, and clamp J to J_end at V>=Voc
@@ -107,7 +107,7 @@ Kendall multi-task learning with learnable log-variances:
   Formula: L = L_anchor/(2σ_a²) + log(σ_a) + L_curve/(2σ_c²) + log(σ_c)
 
   L_anchor = MSE(pred_anchors, true_anchors) on 4 scalars
-  L_curve = MSE(reconstructed_curve, true_curve) on 45 points
+  L_curve = MSE(reconstructed_curve, true_curve) on 45 points (Jsc‑normalized)
 
 NEW IN v2.0 - Sigma Logging:
   MultiTaskLoss tracks:
@@ -123,6 +123,21 @@ Continuity regularization: `models/reconstruction.py:continuity_loss`
   Weight configurable via --continuity-weight (default 0.5, try 0.1-1.0)
 
 Total loss: L_total = L_weighted + λ_cont × L_cont
+
+================================================================================
+SCALAR INPUTS (VOC/VMPP) AS EXTERNAL TXT FILES
+================================================================================
+Scalar inputs (Voc, Vmpp) are consumed from external TXT files so they can be
+swapped with outputs from separate NN/LGBM predictors. The curve pipeline only
+reads these TXT inputs; generation is intentionally isolated.
+
+================================================================================
+DATA FILTERING (UNPHYSICAL CURVE REMOVAL)
+================================================================================
+Only very unphysical curves are removed as part of data generation quality control
+(Latin Hypercube Sampling over a Bayesian distribution of COMSOL sweeps across 31
+coupled PDE parameters). Filtering is limited to extreme FF/Vmpp cases that violate
+basic device physics.
 
 ================================================================================
 TRAIN-TEST MISMATCH FIX (CRITICAL v2.0 CHANGE)

@@ -7,6 +7,88 @@ from __future__ import annotations
 import torch
 
 
+def build_vmpp_subsampled_grid(
+    vmpp: torch.Tensor,
+    voc: torch.Tensor,
+    n_knots_per_region: int = 6,
+    cluster_power: float = 2.0
+) -> torch.Tensor:
+    """
+    Build per-sample voltage grids clustered around Vmpp.
+    
+    This creates the ~12-16 voltage points used for training loss computation.
+    Points are more densely sampled near Vmpp (the knee region).
+    
+    Args:
+        vmpp: (N,) voltage at max power point
+        voc: (N,) open circuit voltage
+        n_knots_per_region: Number of knots per region (total = 2 * n_knots)
+        cluster_power: Higher = more clustering near Vmpp (default 2.0)
+        
+    Returns:
+        v_knots: (N, 2 * n_knots_per_region) voltage positions per sample
+    """
+    device = vmpp.device
+    batch = vmpp.shape[0]
+    
+    # Region 1: 0 -> Vmpp (clustered toward Vmpp at end)
+    t1 = torch.linspace(0, 1, n_knots_per_region, device=device)
+    t1_clustered = 1.0 - (1.0 - t1) ** cluster_power  # More points near Vmpp
+    v1 = t1_clustered.unsqueeze(0) * vmpp.unsqueeze(1)  # (N, n_knots)
+    
+    # Region 2: Vmpp -> Voc (clustered toward Vmpp at start)
+    t2 = torch.linspace(0, 1, n_knots_per_region, device=device)
+    t2_clustered = t2 ** cluster_power  # More points near Vmpp
+    v_range2 = (voc - vmpp).clamp(min=1e-4).unsqueeze(1)
+    v2 = vmpp.unsqueeze(1) + t2_clustered.unsqueeze(0) * v_range2  # (N, n_knots)
+    
+    # Combine: (N, 2 * n_knots_per_region)
+    # Note: first point of v2 is at Vmpp (same as last of v1), but that's fine
+    # for loss computation - we just evaluate at all these positions
+    v_knots = torch.cat([v1, v2[:, 1:]], dim=1)  # Skip duplicate Vmpp
+    
+    return v_knots
+
+
+def sample_curve_at_voltages(
+    curves: torch.Tensor,
+    v_grid_full: torch.Tensor,
+    v_sample: torch.Tensor
+) -> torch.Tensor:
+    """
+    Sample curve values at specified voltage positions using linear interpolation.
+    
+    Args:
+        curves: (N, M) full curves on v_grid_full
+        v_grid_full: (M,) the full voltage grid (e.g., 45 points)
+        v_sample: (N, K) per-sample voltage positions to sample at
+        
+    Returns:
+        j_sampled: (N, K) current values at the sampled positions
+    """
+    batch, n_sample = v_sample.shape
+    n_full = v_grid_full.numel()
+    
+    # Find interpolation indices
+    # searchsorted gives index where v_sample would be inserted
+    idx = torch.searchsorted(v_grid_full, v_sample, right=False) - 1
+    idx = idx.clamp(0, n_full - 2)
+    
+    # Get bracketing values
+    v0 = v_grid_full[idx]  # (N, K)
+    v1 = v_grid_full[idx + 1]  # (N, K)
+    
+    # Gather curve values at those indices
+    j0 = torch.gather(curves, 1, idx)
+    j1 = torch.gather(curves, 1, idx + 1)
+    
+    # Linear interpolation
+    t = (v_sample - v0) / (v1 - v0 + 1e-12)
+    j_sampled = j0 + t * (j1 - j0)
+    
+    return j_sampled
+
+
 def build_knots(
     anchors: torch.Tensor,
     ctrl1: torch.Tensor,
@@ -366,6 +448,73 @@ def reconstruct_curve_normalized(
         j_end=-1.0,
         clamp_voc=clamp_voc,
         validate_monotonicity=validate_monotonicity,
+        knot_strategy=knot_strategy,
+        cluster_power=cluster_power
+    )
+
+
+def get_knot_values(
+    anchors: torch.Tensor,
+    ctrl1: torch.Tensor,
+    ctrl2: torch.Tensor,
+    j_end: float = 0.0,
+    knot_strategy: str = "mpp_cluster",
+    cluster_power: float = 2.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Get the voltage and current values at the spline knot positions.
+    
+    This returns the ~12-16 knot points that the model directly predicts,
+    which should be used for loss computation during training.
+    
+    Args:
+        anchors: (N, 4) [Jsc, Voc, Vmpp, Jmpp]
+        ctrl1: (N, K) control points for region 1
+        ctrl2: (N, K) control points for region 2
+        j_end: Current at Voc (0 for absolute, -1 for normalized)
+        knot_strategy: "uniform" or "mpp_cluster"
+        cluster_power: Clustering power for mpp_cluster strategy
+        
+    Returns:
+        v_knots: (N, 2K+4) voltage positions of all knots (concatenated)
+        j_knots: (N, 2K+4) current values at those knots
+    """
+    v1_knots, j1_knots, v2_knots, j2_knots = build_knots(
+        anchors, ctrl1, ctrl2,
+        j_end=j_end,
+        validate_monotonicity=False,
+        knot_strategy=knot_strategy,
+        cluster_power=cluster_power
+    )
+    
+    # Concatenate knots from both regions
+    # v1_knots: (N, K+2) from 0 to Vmpp
+    # v2_knots: (N, K+2) from Vmpp to Voc
+    # Skip the first point of region 2 (it's the same as last of region 1 = Vmpp)
+    v_knots = torch.cat([v1_knots, v2_knots[:, 1:]], dim=1)
+    j_knots = torch.cat([j1_knots, j2_knots[:, 1:]], dim=1)
+    
+    return v_knots, j_knots
+
+
+def get_knot_values_normalized(
+    anchors: torch.Tensor,
+    ctrl1: torch.Tensor,
+    ctrl2: torch.Tensor,
+    knot_strategy: str = "mpp_cluster",
+    cluster_power: float = 2.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Get knot values in Jsc-normalized space.
+    
+    Returns:
+        v_knots: (N, 2K+3) voltage positions
+        j_knots: (N, 2K+3) current in [-1, 1] normalized by Jsc
+    """
+    anchors_norm = normalize_anchors_by_jsc(anchors)
+    return get_knot_values(
+        anchors_norm, ctrl1, ctrl2,
+        j_end=-1.0,
         knot_strategy=knot_strategy,
         cluster_power=cluster_power
     )
