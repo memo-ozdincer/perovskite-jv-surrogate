@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
-#SBATCH --time=48:00:00
+#SBATCH --time=7:00:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/master_pipeline_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/master_pipeline_%j.err
 #SBATCH --account=aip-aspuru
@@ -78,7 +78,7 @@ SEEDS=(42 123 456)
 
 # Preprocessing thresholds
 MIN_FF=0.30
-MIN_VMPP=0.30
+MIN_VMPP=0.00
 
 # Training configuration
 CTRL_POINTS=8
