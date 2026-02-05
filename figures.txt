@@ -1,0 +1,186 @@
+FIGURES PLAN — PHYSICS-CONSTRAINED SPLIT-SPLINE J-V RECONSTRUCTION
+================================================================================
+
+STATUS KEY:
+  [DONE]  = Full TikZ source provided in figures/<filename>.tex
+  [TMPL]  = pgfplots template provided; needs CSV data from training run
+  [DATA]  = Requires experimental results; format spec given below
+
+================================================================================
+MAIN PAPER FIGURES (5)
+================================================================================
+
+FIG 1 — "Method at a Glance" Pipeline Schematic            [DONE]
+  File:    figures/fig1_pipeline.tex
+  Type:    Full-page-width TikZ diagram (two-column safe)
+  Content: Left-to-right dataflow:
+           x ∈ R^31 → Physics Features (71→m) → Shared Backbone f_θ
+           → 3 heads (Anchors / Ctrl1 / Ctrl2) → Π_C projection
+           → Split PCHIP → J-hat ∈ R^45
+  Style:   Monochrome + dark red accent on Π_C and "Split at MPP"
+           Rounded boxes, mathematical annotations, subtle gradients
+  Notes:   Self-contained; no external data needed.
+
+FIG 2 — "Feasible Set + Projection" Geometric Diagram      [DONE]
+  File:    figures/fig2_feasible_set.tex
+  Type:    Half-width TikZ diagram
+  Content: 2D cartoon of constraint set C with:
+           - Unconstrained point y-tilde outside box
+           - Projected point y = Π_C(y-tilde) on boundary
+           - Formal constraint set definition in annotation box
+           - Violation logging arrow
+  Style:   Clean geometric, blue feasible region, red violation vector
+  Notes:   Self-contained; no external data needed.
+
+FIG 3 — "Split-at-MPP Knot Construction"                   [DONE]
+  File:    figures/fig3_split_mpp.tex
+  Type:    Half-width TikZ + pgfplots hybrid
+  Content: Representative J-V curve with:
+           - Anchor points marked at (0,Jsc), (Vmpp,Jmpp), (Voc,0)
+           - Region 1 / Region 2 shading
+           - Interior knots as dots with annotations
+           - Cumulative sigmoid/cumsum callout
+           - PCHIP monotonicity note
+  Style:   Publication J-V curve style, blue/orange region shading
+  Notes:   Uses synthetic representative curve (hardcoded data).
+
+FIG 4 — "Non-Uniform Voltage Grid + ΔV-Weighted Metric"   [DONE]
+  File:    figures/fig4_voltage_grid.tex
+  Type:    Half-width TikZ + equation annotation
+  Content: Two subpanels:
+           (a) 1D axis with exact V_GRID tick marks showing density change
+           (b) ΔV-weighted loss equation + Gaussian MPP weighting bump
+  Style:   FEM/numerical-methods aesthetic, braces for regions
+  Notes:   Self-contained; grid values hardcoded from config.py.
+
+FIG 5 — "Learning Constraints Over Time" Diagnostic Plot   [TMPL]
+  File:    figures/fig5_learning_curves.tex
+  Type:    pgfplots line chart (dual y-axis)
+  Content:
+           - Line 1: Pre-projection violation rate (log scale, left y-axis)
+           - Line 2: Monotonicity violations (left y-axis)
+           - Line 3: σ_anchor / σ_curve ratio (right y-axis)
+           - X-axis: Training epoch
+  Data needed:
+           CSV file: constraint_violations.csv
+             Columns: epoch, jsc_negative, voc_negative, vmpp_exceeds_voc,
+                      jmpp_exceeds_jsc, total_samples
+           CSV file: multitask_losses.csv
+             Columns: epoch, sigma_anchor, sigma_curve
+           CSV file: monotonicity.csv
+             Columns: epoch, region1_violations, region2_violations, total_samples
+  How to generate:
+           Run: python train.py --train-curves --device cuda
+           Files appear in: <output_dir>/constraint_violations.csv, etc.
+  Notes:   Template reads from CSV via pgfplots \addplot table.
+
+================================================================================
+APPENDIX FIGURES (7)
+================================================================================
+
+FIG A1 — "Multi-Head Network as Equations" Block Diagram   [DONE]
+  File:    figures/fig_a1_equations.tex
+  Type:    Compact TikZ equation-flow diagram
+  Content: Equation chain in decorated boxes with arrows:
+           h = f_θ([x; φ(x)])
+           a = g_A(h), c₁ = g_B(h), c₂ = g_C(h)
+           â = Π_C(a)
+           Ĵ = PCHIP_split(â, c₁, c₂)
+  Style:   Theorem-statement aesthetic, boxed equations, minimal arrows
+  Notes:   Self-contained; no external data needed.
+
+FIG A2 — "Ablation Matrix Heatmap"                         [DATA]
+  Type:    Colored table / heatmap
+  Rows:    T0-1 through T0-7 ablation variants
+  Columns: mean R², Q05 R², safe MAPE, FF MAPE, violations/1000, inference ms
+  Data needed:
+           JSON file: model_comparison.json (or CSV equivalent)
+             Each row: {ablation_name, r2_mean, r2_q05, mape_safe,
+                        mape_ff, violations_per_1000, inference_ms}
+  How to generate:
+           Run ablation experiments (each variant of train.py) and collect
+           metrics.json from each run into a combined table.
+  Recommended tool: Figma or pgfplotstable with cell coloring.
+
+FIG A3 — "Feature Selection Stability"                     [DATA]
+  Type:    Horizontal bar chart
+  Content: Top 10 features by selection frequency across seeds/folds
+  Data needed:
+           CSV file: feature_selection_stability.csv
+             Columns: feature_name, selection_frequency (0-1), avg_correlation
+  How to generate:
+           Run train.py with multiple seeds (--seed 0,1,...,9) and track
+           which features survive the |r|>0.3 filter each time.
+           Collect into CSV: for each feature, fraction of runs selected.
+  Recommended tool: pgfplots bar chart or Figma.
+
+FIG A4 — "Control-Point Sweep Curve"                       [DATA]
+  Type:    pgfplots line + scatter
+  Content: Performance vs K ∈ {2, 3, 4, 5, 6, 8}
+           y-axis: mean weighted R² (and optionally FF MAPE)
+  Data needed:
+           CSV file: ctrl_point_sweep.csv
+             Columns: K, r2_mean, r2_q05, mape_ff, mse_full
+  How to generate:
+           Run train.py --ctrl-points K for each K value.
+           Extract metrics.json from each run.
+
+FIG A5 — "Continuity Weight Tradeoff Curve"                [DATA]
+  Type:    pgfplots line chart
+  Content: Performance vs λ_cont ∈ {0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0}
+  Data needed:
+           CSV file: continuity_sweep.csv
+             Columns: lambda_cont, r2_mean, mse_full, kink_magnitude
+  How to generate:
+           Run train.py --continuity-weight λ for each value.
+           Extract metrics.json from each run.
+
+FIG A6 — "Worst-Case Error Gallery"                        [DATA]
+  Type:    2×3 panel of J-V curve plots
+  Content: Top row: 3 best curves (by R²); Bottom row: 3 worst curves
+           Each panel: true vs predicted + anchor markers
+  Data needed:
+           NPZ or CSV with per-sample predictions:
+             v_grid (45,), true_curves (N, 45), pred_curves (N, 45),
+             r2_scores (N,)
+  How to generate:
+           After train.py completes, save test set predictions.
+           Sort by R², pick top/bottom 3.
+  Recommended tool: matplotlib → PDF or pgfplots.
+
+FIG A7 — "OOD vs ID Error + Uncertainty"                   [DATA]
+  Type:    2-panel figure
+  Content:
+           (a) Violin/histogram of R²_i for ID vs OOD splits
+           (b) Scatter: MC-dropout σ vs |error|
+  Data needed:
+           CSV file: ood_evaluation.csv
+             Columns: sample_id, split (ID/OOD), r2, mc_std, abs_error
+  How to generate:
+           Run inference.py --uncertainty on ID and OOD test sets.
+           Combine results.
+  Recommended tool: matplotlib/seaborn → PDF or pgfplots.
+
+================================================================================
+LATEX COMPILATION
+================================================================================
+
+All [DONE] figures compile standalone:
+  pdflatex figures/fig1_pipeline.tex
+  pdflatex figures/fig2_feasible_set.tex
+  pdflatex figures/fig3_split_mpp.tex
+  pdflatex figures/fig4_voltage_grid.tex
+  pdflatex figures/fig5_learning_curves.tex  (needs CSV data)
+  pdflatex figures/fig_a1_equations.tex
+
+To include in main paper:
+  \input{figures/fig1_pipeline}    % or use \includegraphics on compiled PDF
+
+Required LaTeX packages (all standard):
+  tikz, pgfplots, amsmath, amssymb
+  TikZ libraries: arrows.meta, calc, positioning, decorations.pathreplacing,
+                  patterns, fit, backgrounds, shadows, shapes.geometric
+
+================================================================================
+END OF FIGURES PLAN
+================================================================================
