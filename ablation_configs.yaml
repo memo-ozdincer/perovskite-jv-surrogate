@@ -1,0 +1,409 @@
+# ============================================================================
+# PINN-Coupled-PDE-Solver: Ablation Study Configuration
+# ============================================================================
+# This file defines all experiments for the ICML paper.
+# Run with: python run_all_experiments.py --config ablation_configs.yaml
+# ============================================================================
+
+meta:
+  project: "PINN-Coupled-PDE-Solver"
+  target: "ICML 2025"
+  primary_metric: "r2_mean"
+  seeds: [42, 123, 456]
+  output_base: "outputs/icml_experiments"
+
+# ============================================================================
+# TIER 0: Main Paper Experiments (Must-Have)
+# ============================================================================
+# 7 configurations × 3 seeds = 21 runs
+# Expected runtime: ~24 GPU-hours
+
+tier0:
+  - id: "T0-1-main"
+    name: "Main Model (Full Pipeline)"
+    description: "Full split-spline model with all components enabled"
+    config:
+      train_curves: true
+      use_split: true
+      use_anchors: true
+      use_projection: true
+      use_physics_features: true
+      drop_weak_features: true
+      drop_multicollinear: true
+      ctrl_points: 8
+      continuity_weight: 0.1
+      oracle_voc: false
+      no_hpo: true
+    expected:
+      r2_mean: ">0.99"
+      ff_mape: "<2%"
+      violations_per_1000: "<1"
+
+  - id: "T0-2-no-split"
+    name: "No Split (Single Spline)"
+    description: "Ablation: Single spline over [0, Voc] without MPP split"
+    config:
+      train_curves: true
+      use_split: false
+      use_anchors: true
+      use_projection: true
+      use_physics_features: true
+      drop_weak_features: true
+      drop_multicollinear: true
+      ctrl_points: 12  # More points since no split
+      continuity_weight: 0.0  # No continuity needed
+      no_hpo: true
+    expected:
+      r2_mean: "~0.97"
+      ff_mape: "~5%"
+
+  - id: "T0-3-no-anchors"
+    name: "No Anchors (Direct 45-out)"
+    description: "Ablation: Direct 45-point output without anchor prediction"
+    config:
+      train_curves: true
+      direct_curve: true  # DirectCurveNet instead of split-spline
+      use_anchors: false
+      use_projection: false
+      use_physics_features: true
+      drop_weak_features: true
+      drop_multicollinear: true
+      no_hpo: true
+    expected:
+      r2_mean: "~0.95"
+      ff_mape: "~8%"
+
+  - id: "T0-4-no-projection"
+    name: "No Physics Projection"
+    description: "Ablation: Disable hard constraint projection (soft only)"
+    config:
+      train_curves: true
+      use_split: true
+      use_anchors: true
+      use_projection: false  # Key difference
+      use_physics_features: true
+      drop_weak_features: true
+      drop_multicollinear: true
+      ctrl_points: 8
+      no_hpo: true
+    expected:
+      r2_mean: "~0.98"
+      violations_per_1000: ">10"
+
+  - id: "T0-5-no-physics-features"
+    name: "Raw 31 Parameters Only"
+    description: "Ablation: Use only raw 31 COMSOL parameters, no engineered features"
+    config:
+      train_curves: true
+      use_split: true
+      use_anchors: true
+      use_projection: true
+      use_physics_features: false  # Key difference
+      drop_weak_features: false
+      drop_multicollinear: false
+      ctrl_points: 8
+      no_hpo: true
+    expected:
+      r2_mean: "~0.96"
+
+  - id: "T0-6-cvae-baseline"
+    name: "CVAE Baseline"
+    description: "Conditional VAE generative baseline"
+    config:
+      train_cvae: true
+      train_curves: false
+      cvae_latent_dim: 16
+      cvae_beta: 0.001
+      use_physics_features: true
+      no_hpo: true
+    expected:
+      r2_mean: "~0.95"
+      ff_mape: "~8%"
+
+  - id: "T0-7-mlp-baseline"
+    name: "Direct MLP Baseline"
+    description: "Simple feedforward MLP: 31 → 256 → 128 → 45"
+    config:
+      train_curves: true
+      direct_mlp: true
+      hidden_dims: [256, 128]
+      use_physics_features: false
+      no_hpo: true
+    expected:
+      r2_mean: "~0.90"
+      ff_mape: "~15%"
+
+# ============================================================================
+# TIER 1: Hyperparameter Sweeps (Appendix)
+# ============================================================================
+# 45 runs total across 3 sweeps × 3 seeds
+
+tier1:
+  control_points_sweep:
+    name: "Control Points Sweep"
+    description: "Effect of K control points per region on curve accuracy"
+    base_config:
+      train_curves: true
+      use_split: true
+      use_anchors: true
+      use_projection: true
+      use_physics_features: true
+      drop_weak_features: true
+      drop_multicollinear: true
+      continuity_weight: 0.1
+      no_hpo: true
+    sweep_param: "ctrl_points"
+    values: [2, 4, 6, 8, 10, 12]
+    expected_trend: "Diminishing returns after K=6"
+
+  continuity_sweep:
+    name: "Continuity Weight Sweep"
+    description: "Effect of C1 continuity loss weight on smoothness vs accuracy"
+    base_config:
+      train_curves: true
+      use_split: true
+      use_anchors: true
+      use_projection: true
+      use_physics_features: true
+      drop_weak_features: true
+      drop_multicollinear: true
+      ctrl_points: 8
+      no_hpo: true
+    sweep_param: "continuity_weight"
+    values: [0.0, 0.01, 0.05, 0.1, 0.5, 1.0]
+    expected_trend: "Best around 0.05-0.1"
+
+  feature_count_sweep:
+    name: "Physics Feature Count Sweep"
+    description: "Effect of number of selected physics features"
+    base_config:
+      train_curves: true
+      use_split: true
+      use_anchors: true
+      use_projection: true
+      drop_weak_features: false  # Control manually
+      drop_multicollinear: false
+      ctrl_points: 8
+      no_hpo: true
+    sweep_param: "n_physics_features"
+    values: [0, 4, 8, 16, 32, 71]
+    expected_trend: "Saturation after ~16 features"
+
+# ============================================================================
+# TIER 2: Physics & Sensitivity Analysis (High Impact for Paper)
+# ============================================================================
+
+tier2:
+  jacobian_analysis:
+    name: "Jacobian Sensitivity Analysis"
+    description: "Analyze input-output Jacobian for physics interpretation"
+    config:
+      compute_jacobian: true
+      jacobian_samples: 1000
+      save_jacobian_stats: true
+    outputs:
+      - "jacobian_mean.npy"
+      - "jacobian_std.npy"
+      - "jacobian_heatmap.pdf"
+      - "feature_sensitivity_ranking.csv"
+
+  parameter_sensitivity:
+    name: "31 Input Parameter Sensitivity"
+    description: "One-at-a-time sensitivity analysis for each input parameter"
+    config:
+      sensitivity_analysis: true
+      perturbation_range: [-0.2, 0.2]  # ±20% of normalized range
+      n_perturbation_steps: 21
+    outputs:
+      - "parameter_sensitivity.csv"
+      - "sensitivity_spider_plot.pdf"
+      - "sensitivity_tornado.pdf"
+
+  physics_validation:
+    name: "Physics Constraint Validation"
+    description: "Verify learned relationships match drift-diffusion physics"
+    config:
+      physics_validation: true
+      validate_monotonicity: true
+      validate_boundaries: true
+      validate_fill_factor: true
+    checks:
+      - "J decreases with V (monotonicity)"
+      - "J(0) = Jsc, J(Voc) = 0 (boundary)"
+      - "Vmpp < Voc, Jmpp < Jsc (ordering)"
+      - "FF = Pmpp / (Jsc × Voc) consistency"
+
+# ============================================================================
+# ADDITIONAL HIGH-IMPACT EXPERIMENTS (Max 10 total including above)
+# ============================================================================
+
+additional_experiments:
+  - id: "A1-oracle-voc"
+    name: "Oracle Voc Upper Bound"
+    description: "Use true Voc for curve truncation to show upper bound"
+    config:
+      train_curves: true
+      oracle_voc: true
+      ctrl_points: 8
+      no_hpo: true
+    purpose: "Establish ceiling performance"
+
+  - id: "A2-data-scaling"
+    name: "Data Scaling Study"
+    description: "100k vs 300k vs 400k training samples"
+    variants:
+      - samples: 100000
+      - samples: 300000
+      - samples: 400000  # Combined
+    purpose: "Show data efficiency"
+
+  - id: "A3-ood-bandgap"
+    name: "OOD Bandgap Generalization"
+    description: "Train on Eg < 1.6 eV, test on Eg > 1.6 eV"
+    config:
+      ood_split: "bandgap"
+      ood_threshold: 1.6
+    purpose: "Demonstrate extrapolation capability"
+
+# ============================================================================
+# FIGURE SPECIFICATIONS
+# ============================================================================
+
+figures:
+  main_paper:
+    - id: "fig1_method"
+      type: "schematic"
+      description: "Method schematic: Input → Features → Backbone → Heads → Projection → PCHIP → Curve"
+      note: "Hand-drawn or TikZ"
+
+    - id: "fig2_r2_distribution"
+      type: "violin"
+      experiments: ["T0-1-main", "T0-2-no-split", "T0-6-cvae-baseline", "T0-7-mlp-baseline"]
+      metric: "r2_per_curve"
+      description: "R² distribution comparison across methods"
+
+    - id: "fig3_jv_overlays"
+      type: "grid_3x3"
+      data: "T0-1-main predictions"
+      description: "True vs predicted J-V curves with grid points marked"
+
+    - id: "fig4_ablation_heatmap"
+      type: "heatmap"
+      experiments: ["T0-1", "T0-2", "T0-3", "T0-4", "T0-5", "T0-6", "T0-7"]
+      metrics: ["r2_mean", "mape_mean", "ff_mape", "violations_per_1000"]
+      description: "Ablation results heatmap"
+
+    - id: "fig5_violation_curve"
+      type: "line_logy"
+      data: "constraint_violations.csv"
+      description: "Pre-projection violation rate vs epoch"
+
+  appendix:
+    - id: "fig_a1_voltage_grid"
+      type: "scatter"
+      description: "Non-uniform voltage grid with ΔV annotations"
+
+    - id: "fig_a2_ctrl_points_sweep"
+      type: "line"
+      sweep: "control_points_sweep"
+      description: "R² vs number of control points K"
+
+    - id: "fig_a3_continuity_sweep"
+      type: "line"
+      sweep: "continuity_sweep"
+      description: "R² and smoothness vs continuity weight"
+
+    - id: "fig_a4_feature_importance"
+      type: "bar"
+      description: "Top-20 physics features by importance"
+
+    - id: "fig_a5_jacobian_heatmap"
+      type: "heatmap"
+      description: "Mean |∂J/∂x| across 31 inputs and 45 outputs"
+
+    - id: "fig_a6_error_vs_voltage"
+      type: "line_ribbon"
+      description: "Mean ± std error as function of V/Voc"
+
+    - id: "fig_a7_parameter_sensitivity"
+      type: "tornado"
+      description: "Impact of each of 31 parameters on Voc, FF, PCE"
+
+    - id: "fig_a8_calibration"
+      type: "calibration"
+      description: "Reliability diagram for uncertainty estimates"
+
+# ============================================================================
+# TABLE SPECIFICATIONS
+# ============================================================================
+
+tables:
+  main_paper:
+    - id: "table1_baselines"
+      experiments: ["T0-1-main", "T0-6-cvae-baseline", "T0-7-mlp-baseline"]
+      columns: ["R² mean ± std", "MAPE (%)", "FF MAPE (%)", "Violations/1k", "Time (ms)"]
+      format: "mean ± std over 3 seeds"
+
+    - id: "table2_ablations"
+      experiments: ["T0-1", "T0-2", "T0-3", "T0-4", "T0-5"]
+      columns: ["R² mean", "FF MAPE (%)", "Violations/1k"]
+      format: "mean over 3 seeds"
+
+  appendix:
+    - id: "table_a1_full_metrics"
+      experiments: "all"
+      columns: "all metrics"
+      format: "comprehensive"
+
+    - id: "table_a2_feature_selection"
+      content: "Selected features across seeds with frequency"
+
+    - id: "table_a3_hyperparameters"
+      content: "Final hyperparameters for all models"
+
+# ============================================================================
+# RUNTIME ESTIMATES
+# ============================================================================
+
+runtime:
+  tier0:
+    runs: 21
+    gpu_hours: 24
+    wall_time: "~6 hours with 4 GPUs"
+
+  tier1:
+    runs: 54
+    gpu_hours: 48
+    wall_time: "~12 hours with 4 GPUs"
+
+  tier2:
+    runs: 6
+    gpu_hours: 12
+    wall_time: "~3 hours with 4 GPUs"
+
+  total:
+    runs: 81
+    gpu_hours: 84
+    wall_time: "~21 hours with 4 GPUs"
+
+# ============================================================================
+# QUALITY CHECKS (Assertions)
+# ============================================================================
+
+quality_checks:
+  pre_run:
+    - "Feature selection uses only train indices"
+    - "No data leakage in preprocessing"
+    - "Voltage grid matches config.V_GRID"
+
+  post_run:
+    - "All 81 runs completed successfully"
+    - "Main model R² > 0.99"
+    - "No NaN/inf in any metrics"
+    - "Monotonicity violations = 0 for main model"
+    - "Feature selection stable (>80% overlap across seeds)"
+
+  assertions:
+    main_model_r2_threshold: 0.99
+    max_violations_per_1000: 1.0
+    min_ff_accuracy: 0.98  # FF prediction within 2%

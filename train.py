@@ -324,7 +324,19 @@ class ScalarPredictorPipeline:
         vmpp_anchors_extra: list = None,
         use_vmpp_input: bool = False,
         use_jmpp_input: bool = False,
-        use_ff_input: bool = False
+        use_ff_input: bool = False,
+        # Ablation study options
+        seed: int = 42,
+        use_split: bool = True,  # Use split at MPP (False = single spline)
+        use_physics_projection: bool = True,  # Hard constraint projection
+        use_physics_features: bool = True,  # Use engineered physics features
+        use_direct_mlp: bool = False,  # Simple MLP baseline
+        mlp_hidden_dims: list = None,  # MLP architecture [256, 128]
+        cvae_latent_dim: int = 16,
+        cvae_beta: float = 0.001,
+        n_physics_features: int = None,  # Limit physics features (None = auto)
+        compute_jacobian: bool = False,
+        run_sensitivity_analysis: bool = False,
     ):
         # Build file lists for multi-file loading
         self.params_files = [params_file] + (params_extra or [])
@@ -389,6 +401,28 @@ class ScalarPredictorPipeline:
         self.physics_feature_names = get_feature_names()
         self.v_grid = V_GRID.astype(np.float32)
         self.curve_norm_by_isc = False
+
+        # Ablation study options
+        self.seed = seed
+        self.use_split = use_split
+        self.use_physics_projection = use_physics_projection
+        self.use_physics_features = use_physics_features
+        self.use_direct_mlp = use_direct_mlp
+        self.mlp_hidden_dims = mlp_hidden_dims or [256, 128]
+        self.cvae_latent_dim = cvae_latent_dim
+        self.cvae_beta = cvae_beta
+        self.n_physics_features = n_physics_features
+        self.compute_jacobian = compute_jacobian
+        self.run_sensitivity_analysis = run_sensitivity_analysis
+
+        # Set random seed for reproducibility
+        if seed is not None:
+            import random
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         # Initialize structured logger
         self.logger = TrainingLogger(self.output_dir, verbose=verbose_logging)
@@ -3266,6 +3300,32 @@ def main():
     parser.add_argument('--use-ff-input', action='store_true',
                         help='Use FF from anchor files as curve model input')
 
+    # =========================================================================
+    # ABLATION STUDY FLAGS (for ICML experiments)
+    # =========================================================================
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
+    parser.add_argument('--no-split', action='store_true',
+                        help='Use single spline over [0, Voc] without MPP split (ablation)')
+    parser.add_argument('--no-physics-projection', action='store_true',
+                        help='Disable hard physics constraint projection (soft only)')
+    parser.add_argument('--no-physics-features', action='store_true',
+                        help='Use only raw 31 COMSOL parameters, no engineered features')
+    parser.add_argument('--direct-mlp', action='store_true',
+                        help='Use simple direct MLP baseline (31 → 256 → 128 → 45)')
+    parser.add_argument('--hidden-dims', type=int, nargs='+', default=[256, 128],
+                        help='Hidden layer dimensions for direct MLP (default: 256 128)')
+    parser.add_argument('--cvae-latent-dim', type=int, default=16,
+                        help='Latent dimension for CVAE model')
+    parser.add_argument('--cvae-beta', type=float, default=0.001,
+                        help='Beta weight for KL divergence in CVAE loss')
+    parser.add_argument('--n-physics-features', type=int, default=None,
+                        help='Number of top physics features to keep (None=auto selection)')
+    parser.add_argument('--compute-jacobian', action='store_true',
+                        help='Compute input-output Jacobian for sensitivity analysis')
+    parser.add_argument('--sensitivity-analysis', action='store_true',
+                        help='Run parameter sensitivity analysis after training')
+
     args = parser.parse_args()
 
     # Log input files for debugging
@@ -3337,7 +3397,19 @@ def main():
         vmpp_anchors_extra=args.vmpp_anchors_extra,
         use_vmpp_input=args.use_vmpp_input,
         use_jmpp_input=args.use_jmpp_input,
-        use_ff_input=args.use_ff_input
+        use_ff_input=args.use_ff_input,
+        # Ablation study options
+        seed=args.seed,
+        use_split=not args.no_split,
+        use_physics_projection=not args.no_physics_projection,
+        use_physics_features=not args.no_physics_features,
+        use_direct_mlp=args.direct_mlp,
+        mlp_hidden_dims=args.hidden_dims,
+        cvae_latent_dim=args.cvae_latent_dim,
+        cvae_beta=args.cvae_beta,
+        n_physics_features=args.n_physics_features,
+        compute_jacobian=args.compute_jacobian,
+        run_sensitivity_analysis=args.sensitivity_analysis,
     )
 
     metrics = pipeline.run()
