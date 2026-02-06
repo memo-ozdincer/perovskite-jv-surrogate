@@ -508,6 +508,27 @@ class IVDataModule(pl.LightningDataModule):
             self.scalar_tf = joblib.load(
                 self.cfg["dataset"]["paths"]["scalar_transformer"]
             )
+            # Infer actual param_dim from saved transformers so the model
+            # is sized correctly even when using cached preprocessed data.
+            data = np.load(
+                self.cfg["dataset"]["paths"]["preprocessed_npz"], allow_pickle=True
+            )
+            params_df = pd.read_csv(
+                self.cfg["dataset"]["paths"]["params_csv"], header=None, names=COLNAMES
+            )
+            params_df_valid = params_df.iloc[data["valid_indices"]].reset_index(drop=True)
+            param_dim = self.param_tf.transform(params_df_valid[:1]).shape[1]
+            scalar_cols = ["I_ref", "V_mpp", "I_mpp"]
+            if "ext_voc" in data:
+                scalar_cols.append("ext_Voc")
+            if "ext_vmpp" in data:
+                scalar_cols.append("ext_Vmpp")
+            scalar_dim = len(scalar_cols)
+            self.cfg["model"]["param_dim"] = param_dim + scalar_dim
+            log.info(
+                f"Inferred param_dim from cache: {param_dim + scalar_dim} "
+                f"({param_dim} params + {scalar_dim} scalars)"
+            )
         if stage == "fit" or stage is None:
             self.train_dataset = IVDataset(
                 self.cfg, "train", self.param_tf, self.scalar_tf
