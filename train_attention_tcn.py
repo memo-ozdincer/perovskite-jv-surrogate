@@ -543,7 +543,8 @@ class IVDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, **self.cfg["dataset"]["dataloader"], shuffle=True
+            self.train_dataset, **self.cfg["dataset"]["dataloader"],
+            shuffle=True, drop_last=True,
         )
 
     def val_dataloader(self):
