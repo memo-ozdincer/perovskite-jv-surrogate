@@ -234,7 +234,77 @@ tier2:
       - "FF = Pmpp / (Jsc × Voc) consistency"
 
 # ============================================================================
-# ADDITIONAL HIGH-IMPACT EXPERIMENTS (Max 10 total including above)
+# TCN TIER 0: Main Paper Experiments (Primary Pipeline)
+# ============================================================================
+# 10 configurations × 3 seeds = 30 runs
+# Runs via: sbatch slurm_tcn_master_pipeline.sh
+# Key finding: Dilated TCN without attention is best.
+
+tcn_tier0:
+  - id: "T0-1-DilatedTCN"
+    name: "Dilated TCN, No Attention (MAIN MODEL)"
+    description: "Best performing configuration: causal dilated convolutions, no self-attention"
+    flags: "--architecture tcn --no-attention --use-dilated"
+
+  - id: "T0-2-Conv"
+    name: "Standard Conv, No Attention"
+    description: "Non-causal 1D convolution with symmetric padding"
+    flags: "--architecture conv --no-attention"
+
+  - id: "T0-3-Pointwise"
+    name: "Pointwise (1x1), No Attention"
+    description: "Position-independent baseline (no temporal mixing)"
+    flags: "--architecture pointwise --no-attention"
+
+  - id: "T0-4-DilatedTCN-Attn"
+    name: "Dilated TCN WITH Attention"
+    description: "Tests whether attention adds value on short sequences"
+    flags: "--architecture tcn --use-attention --use-dilated"
+
+  - id: "T0-5-Conv-Attn"
+    name: "Conv WITH Attention"
+    description: "Non-causal conv with self-attention"
+    flags: "--architecture conv --use-attention"
+
+  - id: "T0-6-TCN-NoDilation"
+    name: "TCN Without Dilation"
+    description: "Isolates the contribution of dilated convolutions"
+    flags: "--architecture tcn --no-attention --no-dilated"
+
+  - id: "T0-7-NoScalars"
+    name: "No Scalars (Params Only)"
+    description: "No Voc/Vmpp external scalar inputs — tests conditioning value"
+    note: "No --scalar-files flags passed"
+
+  - id: "T0-8-100kOnly"
+    name: "100k Only (No Extra Data)"
+    description: "Tests data scaling (no 300k extra dataset)"
+    note: "No --params-extra / --iv-extra flags passed"
+
+  - id: "T0-9-200epochs"
+    name: "200 Epochs"
+    description: "Longer training to test convergence"
+    flags: "--architecture tcn --no-attention --use-dilated --max-epochs 200"
+
+  - id: "T0-10-BS512"
+    name: "Batch Size 512"
+    description: "Larger batch size effect"
+    flags: "--architecture tcn --no-attention --use-dilated --batch-size 512"
+
+# TCN Tier 1: Extended Sweeps
+tcn_tier1:
+  batch_size_sweep:
+    name: "Batch Size Sweep"
+    values: [64, 256, 512, 1024]
+    runs_per_value: 3  # seeds
+
+  epoch_sweep:
+    name: "Epoch Sweep"
+    values: [50, 150, 200]
+    runs_per_value: 3
+
+# ============================================================================
+# ADDITIONAL HIGH-IMPACT EXPERIMENTS
 # ============================================================================
 
 additional_experiments:
@@ -257,81 +327,78 @@ additional_experiments:
       - samples: 400000  # Combined
     purpose: "Show data efficiency"
 
-  - id: "A3-ood-bandgap"
-    name: "OOD Bandgap Generalization"
-    description: "Train on Eg < 1.6 eV, test on Eg > 1.6 eV"
-    config:
-      ood_split: "bandgap"
-      ood_threshold: 1.6
-    purpose: "Demonstrate extrapolation capability"
-
 # ============================================================================
 # FIGURE SPECIFICATIONS
 # ============================================================================
 
 figures:
   main_paper:
-    - id: "fig1_method"
-      type: "schematic"
-      description: "Method schematic: Input → Features → Backbone → Heads → Projection → PCHIP → Curve"
-      note: "Hand-drawn or TikZ"
+    - id: "fig1_architecture_comparison"
+      type: "bar"
+      file: "fig_architecture_comparison.pdf"
+      experiments: ["T0-1-DilatedTCN", "T0-2-Conv", "T0-3-Pointwise", "T0-4-DilatedTCN-Attn", "T0-5-Conv-Attn", "T0-6-TCN-NoDilation"]
+      metric: "r2_median"
+      description: "Architecture comparison: R² (mean ± std) across variants"
 
-    - id: "fig2_r2_distribution"
+    - id: "fig2_error_distribution"
       type: "violin"
-      experiments: ["T0-1-main", "T0-2-no-split", "T0-6-cvae-baseline", "T0-7-mlp-baseline"]
-      metric: "r2_per_curve"
-      description: "R² distribution comparison across methods"
+      file: "fig_error_distribution.pdf"
+      experiments: ["T0-1-DilatedTCN", "T0-2-Conv", "T0-3-Pointwise"]
+      metric: "mae_median"
+      description: "Error distribution (MAE) across main architectures"
 
-    - id: "fig3_jv_overlays"
-      type: "grid_3x3"
-      data: "T0-1-main predictions"
-      description: "True vs predicted J-V curves with grid points marked"
-
-    - id: "fig4_ablation_heatmap"
+    - id: "fig3_ablation_heatmap"
       type: "heatmap"
-      experiments: ["T0-1", "T0-2", "T0-3", "T0-4", "T0-5", "T0-6", "T0-7"]
-      metrics: ["r2_mean", "mape_mean", "ff_mape", "violations_per_1000"]
-      description: "Ablation results heatmap"
+      file: "fig_ablation_heatmap.pdf"
+      experiments: ["T0-1 through T0-10"]
+      metrics: ["r2_median", "mae_median", "voc_error", "isc_error"]
+      description: "Full ablation heatmap (normalized per column)"
 
-    - id: "fig5_violation_curve"
-      type: "line_logy"
-      data: "constraint_violations.csv"
-      description: "Pre-projection violation rate vs epoch"
+    - id: "fig4_attention_impact"
+      type: "paired_bar"
+      file: "fig_attention_impact.pdf"
+      experiments: ["T0-1 vs T0-4", "T0-2 vs T0-5"]
+      description: "Paired comparison: with/without attention"
+
+    - id: "fig5_jv_overlays"
+      type: "grid_3x3"
+      data: "T0-1-DilatedTCN predictions"
+      description: "True vs predicted I-V curves (best/median/worst)"
 
   appendix:
-    - id: "fig_a1_voltage_grid"
-      type: "scatter"
-      description: "Non-uniform voltage grid with ΔV annotations"
-
-    - id: "fig_a2_ctrl_points_sweep"
+    - id: "fig_a1_batch_size_sweep"
       type: "line"
-      sweep: "control_points_sweep"
-      description: "R² vs number of control points K"
+      file: "fig_batch_size_sweep.pdf"
+      sweep: "batch_size_sweep"
+      description: "R² vs batch size"
 
-    - id: "fig_a3_continuity_sweep"
+    - id: "fig_a2_epoch_sweep"
       type: "line"
-      sweep: "continuity_sweep"
-      description: "R² and smoothness vs continuity weight"
+      file: "fig_epoch_sweep.pdf"
+      sweep: "epoch_sweep"
+      description: "R² vs training epochs"
 
-    - id: "fig_a4_feature_importance"
+    - id: "fig_a3_data_scaling"
       type: "bar"
-      description: "Top-20 physics features by importance"
+      file: "fig_data_scaling.pdf"
+      description: "100k vs 100k+300k performance comparison"
+
+    - id: "fig_a4_runtime"
+      type: "bar"
+      file: "fig_runtime_comparison.pdf"
+      description: "Training time across architectures"
 
     - id: "fig_a5_jacobian_heatmap"
       type: "heatmap"
-      description: "Mean |∂J/∂x| across 31 inputs and 45 outputs"
+      description: "Mean |∂output/∂input| across features and voltage positions"
 
-    - id: "fig_a6_error_vs_voltage"
-      type: "line_ribbon"
-      description: "Mean ± std error as function of V/Voc"
-
-    - id: "fig_a7_parameter_sensitivity"
+    - id: "fig_a6_sensitivity_tornado"
       type: "tornado"
-      description: "Impact of each of 31 parameters on Voc, FF, PCE"
+      description: "Top-20 most sensitive parameters"
 
-    - id: "fig_a8_calibration"
-      type: "calibration"
-      description: "Reliability diagram for uncertainty estimates"
+    - id: "fig_a7_feature_importance"
+      type: "bar"
+      description: "Feature importance ranking from Jacobian analysis"
 
 # ============================================================================
 # TABLE SPECIFICATIONS
@@ -339,14 +406,16 @@ figures:
 
 tables:
   main_paper:
-    - id: "table1_baselines"
-      experiments: ["T0-1-main", "T0-6-cvae-baseline", "T0-7-mlp-baseline"]
-      columns: ["R² mean ± std", "MAPE (%)", "FF MAPE (%)", "Violations/1k", "Time (ms)"]
+    - id: "table1_main_results"
+      file: "table_main_results.tex"
+      experiments: ["T0-1-DilatedTCN", "T0-2-Conv", "T0-3-Pointwise", "T0-4-DilatedTCN-Attn"]
+      columns: ["R² median ± std", "MAE median", "Voc error", "Isc error"]
       format: "mean ± std over 3 seeds"
 
     - id: "table2_ablations"
-      experiments: ["T0-1", "T0-2", "T0-3", "T0-4", "T0-5"]
-      columns: ["R² mean", "FF MAPE (%)", "Violations/1k"]
+      file: "table_ablations.tex"
+      experiments: ["T0-1 through T0-10"]
+      columns: ["R² median", "MAE median", "Voc error", "Isc error"]
       format: "mean over 3 seeds"
 
   appendix:
@@ -355,36 +424,33 @@ tables:
       columns: "all metrics"
       format: "comprehensive"
 
-    - id: "table_a2_feature_selection"
-      content: "Selected features across seeds with frequency"
-
-    - id: "table_a3_hyperparameters"
-      content: "Final hyperparameters for all models"
+    - id: "table_a2_hyperparameters"
+      content: "TCN architecture hyperparameters for all variants"
 
 # ============================================================================
 # RUNTIME ESTIMATES
 # ============================================================================
 
 runtime:
-  tier0:
+  split_spline_tier0:
     runs: 21
     gpu_hours: 24
     wall_time: "~6 hours with 4 GPUs"
 
-  tier1:
-    runs: 54
-    gpu_hours: 48
-    wall_time: "~12 hours with 4 GPUs"
+  tcn_tier0:
+    runs: 30
+    gpu_hours: 7
+    wall_time: "~7 hours with 1 GPU"
 
-  tier2:
-    runs: 6
+  tcn_tier1:
+    runs: 21
+    gpu_hours: 5
+    wall_time: "~5 hours with 1 GPU"
+
+  total_tcn:
+    runs: 51
     gpu_hours: 12
-    wall_time: "~3 hours with 4 GPUs"
-
-  total:
-    runs: 81
-    gpu_hours: 84
-    wall_time: "~21 hours with 4 GPUs"
+    wall_time: "~12 hours with 1 GPU"
 
 # ============================================================================
 # QUALITY CHECKS (Assertions)
