@@ -17,7 +17,7 @@
 # All scalar features loaded from external txt files (no data leakage).
 #
 # Experiments:
-#   Conv-Dilated-NoAttn     : Non-causal 1D conv with dilation (no TCN)
+#   Pointwise-NoAttn        : 1x1 conv (position-independent baseline)
 #
 # Usage:
 #   sbatch slurm_attention_tcn_pipeline.sh
@@ -203,12 +203,12 @@ STEP_START=$(date +%s)
 
 # Define experiments: NAME -> FLAGS
 declare -A EXP_FLAGS
-EXP_FLAGS["Conv-Dilated-NoAttn"]="--architecture conv --no-attention --use-dilated"
+EXP_FLAGS["Pointwise-NoAttn"]="--architecture pointwise --no-attention"
 
 RESULTS_DIR="$OUTPUT_BASE/results"
 mkdir -p "$RESULTS_DIR"
 
-for EXP_ID in "Conv-Dilated-NoAttn"; do
+for EXP_ID in "Pointwise-NoAttn"; do
     for SEED in "${SEEDS[@]}"; do
         RUN_NAME="${EXP_ID}_seed${SEED}"
         EXP_OUT="$OUTPUT_BASE/$EXP_ID/seed_$SEED"
