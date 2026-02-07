@@ -62,6 +62,27 @@ def collect_results(results_dir: str, output_base: str):
     agg.to_csv(agg_path, index=False)
     print(f"Saved aggregated results to {agg_path}")
 
+    # Champion selection helper for paper assets
+    rank_metric = "mae_mean_mean" if "mae_mean_mean" in agg.columns else None
+    if rank_metric is None and "r2_mean_mean" in agg.columns:
+        rank_metric = "r2_mean_mean"
+    if rank_metric:
+        ascending = rank_metric.startswith("mae")
+        leaderboard = agg.sort_values(rank_metric, ascending=ascending).reset_index(drop=True)
+        leaderboard_path = output_base / "results_leaderboard.csv"
+        leaderboard.to_csv(leaderboard_path, index=False)
+        print(f"Saved leaderboard to {leaderboard_path}")
+
+        champion = leaderboard.iloc[0].to_dict()
+        champion_path = output_base / "champion_model.json"
+        with open(champion_path, "w") as f:
+            json.dump(
+                {k: float(v) if isinstance(v, (np.floating, float)) else v for k, v in champion.items()},
+                f,
+                indent=2,
+            )
+        print(f"Saved champion model summary to {champion_path}")
+
     # ── Print summary ──
     print()
     print("=" * 72)

@@ -28,8 +28,11 @@ import copy
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
+import time
 import typing
+from functools import partial
 from pathlib import Path
 
 import joblib
@@ -67,6 +70,8 @@ import seaborn as sns
 
 # Use Tensor Cores on Ampere+ GPUs
 torch.set_float32_matmul_precision("medium")
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 # ──────────────────────────────────────────────────────────────────────────────
 #   CONSTANTS
@@ -102,6 +107,15 @@ def _resolve_paths(paths: list[str] | None) -> list[str]:
 
 def build_config(args: argparse.Namespace) -> dict:
     data_dir = str(Path(args.data_dir).resolve())
+    dataloader_cfg = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+    }
+    if args.num_workers > 0:
+        dataloader_cfg["persistent_workers"] = True
+        dataloader_cfg["prefetch_factor"] = args.prefetch_factor
+
     return {
         "train": {
             "seed": args.seed,
@@ -157,9 +171,7 @@ def build_config(args: argparse.Namespace) -> dict:
                 "seq_len": 8,
             },
             "dataloader": {
-                "batch_size": args.batch_size,
-                "num_workers": args.num_workers,
-                "pin_memory": True,
+                **dataloader_cfg,
             },
             "curvature_weighting": {
                 "alpha": 4.0,
@@ -170,9 +182,10 @@ def build_config(args: argparse.Namespace) -> dict:
             "max_epochs": args.max_epochs,
             "accelerator": "auto",
             "devices": "auto",
-            "precision": "32-true",
+            "precision": "bf16-mixed",
             "gradient_clip_val": 1.0,
             "log_every_n_steps": 25,
+            "benchmark": True,
         },
     }
 
@@ -414,11 +427,11 @@ class TemporalBlock(nn.Module):
         self.padding = ((kernel_size - 1) * dilation, 0)
         self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
         self.act1 = nn.GELU()
-        self.norm1 = ChannelLayerNorm(out_ch)
+        self.norm1 = nn.BatchNorm1d(out_ch)
         self.drop1 = nn.Dropout(dropout)
         self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, dilation=dilation)
         self.act2 = nn.GELU()
-        self.norm2 = ChannelLayerNorm(out_ch)
+        self.norm2 = nn.BatchNorm1d(out_ch)
         self.drop2 = nn.Dropout(dropout)
         self.downsample = (
             nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
@@ -436,23 +449,29 @@ class TemporalBlock(nn.Module):
 # --- Architecture: Conv (standard non-causal 1D convolutions) ---
 
 class ConvResBlock(nn.Module):
-    """Non-causal 1D convolutional residual block.
+    """Non-causal 1D convolutional residual block with optional dilation.
 
     Uses symmetric (same) padding so every position can attend to
     neighbours in both directions — appropriate for I-V curves where
-    voltage query points have no causal ordering.
+    the underlying drift-diffusion physics is a boundary-value problem
+    with information flow in both voltage directions.
+
+    Dilation expands the receptive field without adding parameters,
+    letting the network capture both local knee curvature and
+    full-curve shape from a single block.
     """
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float,
+                 dilation: int = 1):
         super().__init__()
-        pad = (kernel_size - 1) // 2
-        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad)
+        pad = dilation * (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
         self.act1 = nn.GELU()
-        self.norm1 = ChannelLayerNorm(out_ch)
+        self.norm1 = nn.BatchNorm1d(out_ch)
         self.drop1 = nn.Dropout(dropout)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
         self.act2 = nn.GELU()
-        self.norm2 = ChannelLayerNorm(out_ch)
+        self.norm2 = nn.BatchNorm1d(out_ch)
         self.drop2 = nn.Dropout(dropout)
         self.downsample = (
             nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
@@ -701,15 +720,31 @@ class IVDataModule(pl.LightningDataModule):
             pchip_cfg["v_max"],
             pchip_cfg["n_fine"],
         )
-        for i in tqdm(range(N_raw), desc="PCHIP processing"):
-            res = process_iv_with_pchip(iv_data_raw[i], *pchip_args)
-            if res is not None and res[1][0] > 1e-9:
-                valid_indices.append(i)
-                v_slices.append(res[0])
-                i_slices.append(res[1])
-                v_fine, i_fine = res[2]
-                v_fine_mm[i, : len(v_fine)] = v_fine
-                i_fine_mm[i, : len(i_fine)] = i_fine
+        # Parallel PCHIP processing for speed
+        n_workers = min(mp.cpu_count(), 16)
+        _pchip_fn = partial(
+            process_iv_with_pchip,
+            full_v_grid=full_v_grid,
+            n_pre=pchip_cfg["n_pre_mpp"],
+            n_post=pchip_cfg["n_post_mpp"],
+            v_max=pchip_cfg["v_max"],
+            n_fine=pchip_cfg["n_fine"],
+        )
+        log.info(f"PCHIP processing {N_raw} curves with {n_workers} workers...")
+        with mp.Pool(n_workers) as pool:
+            results_iter = pool.imap(
+                _pchip_fn,
+                iv_data_raw,
+                chunksize=max(1, N_raw // (n_workers * 4)),
+            )
+            for i, res in enumerate(tqdm(results_iter, total=N_raw, desc="PCHIP processing")):
+                if res is not None and res[1][0] > 1e-9:
+                    valid_indices.append(i)
+                    v_slices.append(res[0])
+                    i_slices.append(res[1])
+                    v_fine, i_fine = res[2]
+                    v_fine_mm[i, : len(v_fine)] = v_fine
+                    i_fine_mm[i, : len(i_fine)] = i_fine
 
         v_fine_mm.flush()
         i_fine_mm.flush()
@@ -863,12 +898,14 @@ class PhysicsIVSystem(pl.LightningModule):
             self.block3 = TemporalBlock(filters[0], filters[1], kernel, dropout, dilation=d2)
 
         elif arch == "conv":
-            self.block1 = ConvResBlock(seq_input_dim, filters[0], kernel, dropout)
+            d1 = 2 ** 0 if mcfg["use_dilated_conv"] else 1
+            d2 = 2 ** 1 if mcfg["use_dilated_conv"] else 1
+            self.block1 = ConvResBlock(seq_input_dim, filters[0], kernel, dropout, dilation=d1)
             if mcfg["use_attention"]:
                 self.block2 = SelfAttentionBlock(filters[0], heads, dropout)
             else:
-                self.block2 = ConvResBlock(filters[0], filters[0], kernel, dropout)
-            self.block3 = ConvResBlock(filters[0], filters[1], kernel, dropout)
+                self.block2 = ConvResBlock(filters[0], filters[0], kernel, dropout, dilation=d1)
+            self.block3 = ConvResBlock(filters[0], filters[1], kernel, dropout, dilation=d2)
 
         elif arch == "pointwise":
             self.block1 = PointwiseResBlock(seq_input_dim, filters[0], dropout)
@@ -1167,6 +1204,7 @@ class ExamplePlotsCallback(pl.Callback):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_experiment(cfg: dict) -> dict:
+    total_start = time.perf_counter()
     run_name = cfg["train"]["run_name"]
     log.info(f"--- Starting Experiment: {run_name} ---")
     seed_everything(cfg["train"]["seed"])
@@ -1201,32 +1239,47 @@ def run_experiment(cfg: dict) -> dict:
     )
     logger = TensorBoardLogger(str(output_dir / "tb_logs"), name=run_name)
 
+    callbacks = [
+        checkpoint_cb,
+        LearningRateMonitor(logging_interval="step"),
+        EarlyStopping(monitor="val_loss", patience=20, mode="min"),
+        RichProgressBar(),
+    ]
+    if cfg["train"].get("enable_example_plots", False):
+        callbacks.append(ExamplePlotsCallback(num_samples=8))
+
     trainer = pl.Trainer(
         **cfg["trainer"],
         default_root_dir=run_dir,
         logger=logger,
-        callbacks=[
-            checkpoint_cb,
-            LearningRateMonitor(logging_interval="step"),
-            EarlyStopping(monitor="val_loss", patience=20, mode="min"),
-            RichProgressBar(),
-            ExamplePlotsCallback(num_samples=8),
-        ],
+        callbacks=callbacks,
     )
 
     log.info("--- Starting Training ---")
+    train_start = time.perf_counter()
     trainer.fit(model, datamodule=datamodule)
+    train_time_s = time.perf_counter() - train_start
 
     log.info("--- Testing on Best Checkpoint ---")
     best_ckpt = trainer.checkpoint_callback.best_model_path
+    test_start = time.perf_counter()
     trainer.test(
         model, datamodule=datamodule,
         ckpt_path=best_ckpt if best_ckpt and Path(best_ckpt).exists() else None,
     )
+    test_time_s = time.perf_counter() - test_start
 
     final_stats = model.all_test_stats or {}
     final_stats["run_name"] = run_name
     final_stats["architecture"] = cfg["model"]["architecture"]
+    final_stats["use_attention"] = bool(cfg["model"]["use_attention"])
+    final_stats["use_dilated_conv"] = bool(cfg["model"]["use_dilated_conv"])
+    final_stats["train_time_s"] = float(train_time_s)
+    final_stats["test_time_s"] = float(test_time_s)
+    final_stats["total_time_s"] = float(time.perf_counter() - total_start)
+    final_stats["train_steps"] = int(trainer.global_step)
+    final_stats["max_epochs"] = int(cfg["trainer"]["max_epochs"])
+    final_stats["batch_size"] = int(cfg["dataset"]["dataloader"]["batch_size"])
 
     stats_path = run_dir / "test_stats.json"
     with open(stats_path, "w") as f:
@@ -1315,6 +1368,10 @@ def parse_args() -> argparse.Namespace:
     # ── Experiment ──
     p.add_argument("--run-name", default="TACN-full", help="Experiment run name")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument(
+        "--enable-example-plots", action="store_true",
+        help="Enable expensive qualitative plotting callback at test time",
+    )
 
     # ── Architecture ──
     p.add_argument(
@@ -1322,7 +1379,7 @@ def parse_args() -> argparse.Namespace:
         help="Backbone architecture: tcn (causal dilated), conv (non-causal 1D), pointwise (1x1)",
     )
     p.add_argument(
-        "--use-attention", action="store_true", default=True,
+        "--use-attention", action="store_true", default=False,
         help="Enable self-attention block",
     )
     p.add_argument(
@@ -1347,6 +1404,10 @@ def parse_args() -> argparse.Namespace:
         help="DataLoader workers",
     )
     p.add_argument(
+        "--prefetch-factor", type=int, default=4,
+        help="DataLoader prefetch factor (only used when num_workers > 0)",
+    )
+    p.add_argument(
         "--force-preprocess", action="store_true",
         help="Delete cached preprocessed data and re-run",
     )
@@ -1358,6 +1419,7 @@ def main():
     args = parse_args()
     cfg = build_config(args)
     cfg["_output_dir"] = str(Path(args.output_dir).resolve())
+    cfg["train"]["enable_example_plots"] = bool(args.enable_example_plots)
 
     Path(args.data_dir).mkdir(parents=True, exist_ok=True)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

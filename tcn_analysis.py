@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Physics & sensitivity analysis for the TCN-based I-V reconstruction model.
+Physics & sensitivity analysis for the convolution/TCN I-V reconstruction model.
 
 Runs:
   1. Jacobian sensitivity: ∂output/∂input for each of 31+scalar input features
@@ -11,7 +11,7 @@ Runs:
 Usage:
     python tcn_analysis.py --results-dir outputs/tcn_icml/ \\
                            --output-dir outputs/tcn_icml/analysis \\
-                           --main-model-dir outputs/tcn_icml/T0-1-DilatedTCN/seed_42
+                           --main-model-dir outputs/tcn_icml/T0-1-Conv-Dilated/seed_42
 """
 
 import argparse
@@ -241,7 +241,7 @@ def run_analysis(
     out.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("TCN PHYSICS & SENSITIVITY ANALYSIS")
+    print("CONV/TCN PHYSICS & SENSITIVITY ANALYSIS")
     print("=" * 60)
 
     # ── Try to load model and run Jacobian / perturbation analysis ──

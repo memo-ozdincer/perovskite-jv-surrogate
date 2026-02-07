@@ -1,0 +1,18 @@
+Revert "gitignore"
+
+This reverts commit 228278de26964d3a2aa11f8f538c755385dee6dd.
+
+# Please enter the commit message for your changes. Lines starting
+# with '#' will be ignored, and an empty message aborts the commit.
+#
+# On branch main
+# Your branch is up to date with 'origin/main'.
+#
+# Revert currently in progress.
+#
+# Changes to be committed:
+#	deleted:    .gitignore
+#
+# Untracked files:
+#	atcnresults.csv
+#

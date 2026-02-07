@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate ALL publication figures and LaTeX tables for the ICML paper
-from TCN experiment results.
+from architecture ablation experiment results.
 
 Usage:
     python tcn_generate_figures.py --results all_results.csv --output figures/
@@ -106,7 +106,7 @@ def fig_architecture_comparison(df: pd.DataFrame, out: Path):
 
 def fig_error_distribution(df: pd.DataFrame, out: Path):
     """Histogram of per-curve MAE for the main model."""
-    main = df[df["exp_id"].str.contains("T0-1")]
+    main = df[df["exp_id"].str.contains("T0-1-Conv-Dilated")]
     if main.empty or "mae_mean" not in main.columns:
         print("  skipped (no main-model MAE)")
         return
@@ -115,7 +115,7 @@ def fig_error_distribution(df: pd.DataFrame, out: Path):
             edgecolor="white")
     ax.set_xlabel("Mean Absolute Error (mA/cm²)")
     ax.set_ylabel("Count (across seeds)")
-    ax.set_title("Error Distribution — Dilated TCN (Main Model)")
+    ax.set_title("Error Distribution — Dilated Conv (Main Model)")
     _save(fig, out / "fig_error_distribution.pdf")
 
 
@@ -146,8 +146,8 @@ def fig_ablation_heatmap(df: pd.DataFrame, out: Path):
 def fig_attention_impact(df: pd.DataFrame, out: Path):
     """Paired comparison: with vs without attention."""
     pairs = [
-        ("T0-1-DilatedTCN", "T0-4-DilatedTCN-Attn"),
-        ("T0-2-Conv", "T0-5-Conv-Attn"),
+        ("T0-1-Conv-Dilated", "T0-5-Conv-Attn"),
+        ("T0-3-TCN-Dilated", "T0-6-TCN-Attn"),
     ]
     metric = "r2_median" if "r2_median" in df.columns else "r2_mean"
     if metric not in df.columns:
@@ -160,12 +160,11 @@ def fig_attention_impact(df: pd.DataFrame, out: Path):
         d_yes = df[df["exp_id"] == with_attn]
         if d_no.empty or d_yes.empty:
             continue
+        label = "Conv" if "Conv" in no_attn else "TCN"
         for _, r in d_no.iterrows():
-            rows.append({"arch": no_attn.replace("T0-", "").split("-")[1],
-                         "attention": "No", metric: r[metric]})
+            rows.append({"arch": label, "attention": "No", metric: r[metric]})
         for _, r in d_yes.iterrows():
-            rows.append({"arch": with_attn.replace("T0-", "").split("-")[1],
-                         "attention": "Yes", metric: r[metric]})
+            rows.append({"arch": label, "attention": "Yes", metric: r[metric]})
 
     if not rows:
         print("  skipped (no matching pairs)")
@@ -233,7 +232,7 @@ def fig_epoch_sweep(df: pd.DataFrame, out: Path):
 
 def fig_data_scaling(df: pd.DataFrame, out: Path):
     """Compare 100k-only vs 100k+300k training."""
-    exps = ["T0-1-DilatedTCN", "T0-8-100kOnly"]
+    exps = ["T0-1-Conv-Dilated", "T0-8-100kOnly"]
     sub = df[df["exp_id"].isin(exps)]
     if sub.empty:
         print("  skipped (no data scaling experiments)")
@@ -245,7 +244,7 @@ def fig_data_scaling(df: pd.DataFrame, out: Path):
 
     sub = sub.copy()
     sub["Data"] = sub["exp_id"].map({
-        "T0-1-DilatedTCN": "100k + 300k",
+        "T0-1-Conv-Dilated": "100k + 300k",
         "T0-8-100kOnly": "100k only",
     })
 
@@ -334,11 +333,12 @@ def table_main_results(df: pd.DataFrame, out: Path):
 def table_ablations(df: pd.DataFrame, out: Path):
     """LaTeX table: ablation study (what each component contributes)."""
     ablation_map = {
-        "T0-1-DilatedTCN": "Full Model (dilated TCN)",
-        "T0-2-Conv": "w/o causal dilation (Conv)",
-        "T0-3-Pointwise": "w/o spatial mixing (1×1)",
-        "T0-4-DilatedTCN-Attn": "Full + self-attention",
-        "T0-6-TCN-NoDilation": "w/o dilation (TCN k=1)",
+        "T0-1-Conv-Dilated": "Full Model (dilated Conv)",
+        "T0-2-Conv-NoDilation": "w/o dilation (Conv)",
+        "T0-3-TCN-Dilated": "TCN baseline (dilated)",
+        "T0-4-Pointwise": "w/o spatial mixing (1×1)",
+        "T0-5-Conv-Attn": "Full + self-attention",
+        "T0-6-TCN-Attn": "TCN + self-attention",
         "T0-7-NoScalars": "w/o scalar conditioning",
         "T0-8-100kOnly": "w/o extra data (100k only)",
     }
@@ -397,12 +397,12 @@ def generate_all(results_path: str, output_base: str,
     fig_architecture_comparison(df, main_dir)
     fig_error_distribution(df, main_dir)
     fig_ablation_heatmap(df, main_dir)
-    fig_attention_impact(df, main_dir)
 
     print("\n--- Appendix Figures ---")
     fig_batch_size_sweep(df, app_dir)
     fig_epoch_sweep(df, app_dir)
     fig_data_scaling(df, app_dir)
+    fig_attention_impact(df, app_dir)
     fig_runtime_comparison(df, app_dir)
 
     print("\n--- Tables ---")

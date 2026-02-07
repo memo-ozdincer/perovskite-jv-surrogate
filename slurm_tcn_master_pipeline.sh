@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tcn_icml_master
+#SBATCH --job-name=conv_icml_master
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
@@ -10,9 +10,9 @@
 #SBATCH --account=aip-aspiru
 
 # ============================================================================
-# TCN ICML MASTER PIPELINE
+# CONV/TCN ICML MASTER PIPELINE
 # ============================================================================
-# Complete pipeline for ICML paper using the Dilated-Conv TCN backbone.
+# Complete pipeline for ICML paper using the dilated convolution backbone.
 #
 # Runs:
 #   STEP 1  Data preprocessing (100k + 300k, quality filtering)
@@ -35,7 +35,7 @@
 set -e
 
 echo "=============================================="
-echo "TCN ICML MASTER PIPELINE"
+echo "CONV/TCN ICML MASTER PIPELINE"
 echo "=============================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node:   $SLURM_NODELIST"
@@ -175,7 +175,7 @@ for f in "$PARAMS_CLEAN" "$IV_CLEAN" "$PARAMS_EXTRA_CLEAN" "$IV_EXTRA_CLEAN" \
     fi
 done
 
-# ── Helper: run one TCN experiment ───────────────────────────────────────────
+# ── Helper: run one architecture experiment ──────────────────────────────────
 run_tcn() {
     local EXP_ID="$1"
     local SEED="$2"
@@ -230,40 +230,40 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
     echo "=============================================="
     STEP_START=$(date +%s)
 
-    # ── T0-1  Main model: dilated TCN, no attention ──────────────────────────
+    # ── T0-1  Main model: dilated Conv, no attention ─────────────────────────
     for S in "${SEEDS[@]}"; do
-        run_tcn "T0-1-DilatedTCN" $S \
+        run_tcn "T0-1-Conv-Dilated" $S \
+            "--architecture conv --no-attention --use-dilated"
+    done
+
+    # ── T0-2  Conv without dilation (isolates dilation contribution) ─────────
+    for S in "${SEEDS[@]}"; do
+        run_tcn "T0-2-Conv-NoDilation" $S \
+            "--architecture conv --no-attention --no-dilated"
+    done
+
+    # ── T0-3  Dilated TCN, no attention (temporal baseline) ──────────────────
+    for S in "${SEEDS[@]}"; do
+        run_tcn "T0-3-TCN-Dilated" $S \
             "--architecture tcn --no-attention --use-dilated"
     done
 
-    # ── T0-2  Standard (non-causal) 1D conv, no attention ────────────────────
+    # ── T0-4  Pointwise (1×1 conv, position-independent baseline) ────────────
     for S in "${SEEDS[@]}"; do
-        run_tcn "T0-2-Conv" $S \
-            "--architecture conv --no-attention"
-    done
-
-    # ── T0-3  Pointwise (1×1 conv, position-independent baseline) ────────────
-    for S in "${SEEDS[@]}"; do
-        run_tcn "T0-3-Pointwise" $S \
+        run_tcn "T0-4-Pointwise" $S \
             "--architecture pointwise --no-attention"
     done
 
-    # ── T0-4  Dilated TCN WITH self-attention ────────────────────────────────
-    for S in "${SEEDS[@]}"; do
-        run_tcn "T0-4-DilatedTCN-Attn" $S \
-            "--architecture tcn --use-attention --use-dilated"
-    done
-
-    # ── T0-5  Conv WITH self-attention ───────────────────────────────────────
+    # ── T0-5  Conv WITH self-attention (minimal negative control) ────────────
     for S in "${SEEDS[@]}"; do
         run_tcn "T0-5-Conv-Attn" $S \
-            "--architecture conv --use-attention"
+            "--architecture conv --use-attention --use-dilated"
     done
 
-    # ── T0-6  TCN without dilation (isolates dilation contribution) ──────────
+    # ── T0-6  TCN WITH self-attention (minimal negative control) ─────────────
     for S in "${SEEDS[@]}"; do
-        run_tcn "T0-6-TCN-NoDilation" $S \
-            "--architecture tcn --no-attention --no-dilated"
+        run_tcn "T0-6-TCN-Attn" $S \
+            "--architecture tcn --use-attention --use-dilated"
     done
 
     # ── T0-7  No scalars (params only — no Voc/Vmpp external input) ──────────
@@ -288,7 +288,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
                 --max-epochs $MAX_EPOCHS \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
-                --architecture tcn --no-attention --use-dilated \
+                --architecture conv --no-attention --use-dilated \
                 2>&1 | tee "$EXP_OUT/train.log"
             cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
                   "$RESULTS_DIR/${RUN_NAME}_stats.json" 2>/dev/null || true
@@ -317,7 +317,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
                 --max-epochs $MAX_EPOCHS \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
-                --architecture tcn --no-attention --use-dilated \
+                --architecture conv --no-attention --use-dilated \
                 2>&1 | tee "$EXP_OUT/train.log"
             cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
                   "$RESULTS_DIR/${RUN_NAME}_stats.json" 2>/dev/null || true
@@ -349,7 +349,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
                 --max-epochs 200 \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
-                --architecture tcn --no-attention --use-dilated \
+                --architecture conv --no-attention --use-dilated \
                 2>&1 | tee "$EXP_OUT/train.log"
             cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
                   "$RESULTS_DIR/${RUN_NAME}_stats.json" 2>/dev/null || true
@@ -361,7 +361,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
     # ── T0-10  Larger batch size (512) ───────────────────────────────────────
     for S in "${SEEDS[@]}"; do
         run_tcn "T0-10-BS512" $S \
-            "--architecture tcn --no-attention --use-dilated --batch-size 512"
+            "--architecture conv --no-attention --use-dilated --batch-size 512"
     done
 
     STEP_END=$(date +%s)
@@ -383,7 +383,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER0_ONLY" = false ]; then
     for BS in 64 256 512 1024; do
         for S in "${SEEDS[@]}"; do
             run_tcn "T1-BS${BS}" $S \
-                "--architecture tcn --no-attention --use-dilated --batch-size $BS"
+                "--architecture conv --no-attention --use-dilated --batch-size $BS"
         done
     done
 
@@ -391,7 +391,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER0_ONLY" = false ]; then
     for EP in 50 150 200; do
         for S in "${SEEDS[@]}"; do
             run_tcn "T1-EP${EP}" $S \
-                "--architecture tcn --no-attention --use-dilated --max-epochs $EP"
+                "--architecture conv --no-attention --use-dilated --max-epochs $EP"
         done
     done
 
@@ -410,7 +410,7 @@ if [ "$FIGURES_ONLY" = false ]; then
     echo "=============================================="
     STEP_START=$(date +%s)
 
-    MAIN_MODEL="$OUTPUT_BASE/T0-1-DilatedTCN/seed_42"
+    MAIN_MODEL="$OUTPUT_BASE/T0-1-Conv-Dilated/seed_42"
     ANALYSIS_DIR="$OUTPUT_BASE/analysis"
     mkdir -p "$ANALYSIS_DIR"
 
@@ -470,7 +470,7 @@ fi
 
 echo ""
 echo "=============================================="
-echo "TCN ICML PIPELINE COMPLETE"
+echo "CONV/TCN ICML PIPELINE COMPLETE"
 echo "=============================================="
 echo "End:  $(date)"
 echo ""
