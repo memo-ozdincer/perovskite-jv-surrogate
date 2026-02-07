@@ -1,162 +1,26 @@
-%DIF 1-3c1-4
-%DIF LATEXDIFF DIFFERENCE FILE
-%DIF DEL /Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/figures/fig4_voltage_grid.tex           Sat Feb  7 17:17:36 2026
-%DIF < \documentclass[tikz,border=8pt]{standalone}
-%DIF < % Shared visual style for ICML figures
-%DIF -------
- %DIF > 
-% Figure 4: Non-Uniform Voltage Grid + ΔV-Weighted Metric %DIF > 
-% Compile: pdflatex fig4_voltage_grid.tex %DIF > 
-\documentclass[border=4pt]{standalone} %DIF > 
-%DIF -------
 
+% Figure 4: Non-Uniform Voltage Grid + ΔV-Weighted Metric
+% Compile: pdflatex fig4_voltage_grid.tex
+\documentclass[border=4pt]{standalone}
 \usepackage{tikz}
 \usepackage{amsmath,amssymb}
-
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
-%DIF 8c9
+\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing}
 
-%DIF < \usetikzlibrary{arrows.meta,calc,positioning,fit,backgrounds,shadows.blur,decorations.pathreplacing,matrix}
-%DIF -------
-
-\usetikzlibrary{arrows.meta,calc,decorations.pathreplacing} %DIF > 
-%DIF -------
-
-%DIF < \definecolor{figInk}{HTML}{1F2937}
-%DIF -------
-% ── ICML Global Colour System ── %DIF > 
-%DIF < \definecolor{figBlue}{HTML}{2563EB}
-\definecolor{ink}{HTML}{1F2937} %DIF > 
-%DIF < \definecolor{figAmber}{HTML}{D97706}
-\definecolor{flagship}{HTML}{2563EB} %DIF > 
-%DIF < \definecolor{figGreen}{HTML}{059669}
-\definecolor{secondary}{HTML}{D97706} %DIF > 
-%DIF < \definecolor{figRose}{HTML}{BE123C}
-\definecolor{physgood}{HTML}{059669} %DIF > 
-%DIF < \definecolor{figMuted}{HTML}{64748B}
-\definecolor{errbad}{HTML}{BE123C} %DIF > 
-%DIF < \definecolor{figBg}{HTML}{F8FAFC}
-\definecolor{muted}{HTML}{64748B} %DIF > 
-%DIF < \definecolor{figGrid}{HTML}{E2E8F0}
-\definecolor{panelbg}{HTML}{F8FAFC} %DIF > 
-%DIF < \definecolor{figMpp}{HTML}{F59E0B}
-\definecolor{gridline}{HTML}{E2E8F0} %DIF > 
-%DIF < 
-\definecolor{mppgold}{HTML}{F59E0B} %DIF > 
-%DIF < \tikzset{
-%DIF <   figbox/.style={draw=figInk!55, fill=figBg, rounded corners=4pt, line width=0.7pt,
-%DIF <                  blur shadow={shadow blur steps=2, shadow xshift=0.4pt, shadow yshift=-0.4pt}},
-%DIF <   fignote/.style={font=\sffamily\scriptsize, text=figMuted, align=left},
-%DIF <   figtitle/.style={font=\sffamily\small\bfseries, text=figInk},
-%DIF <   figlabel/.style={font=\sffamily\scriptsize\bfseries, text=figInk},
-%DIF <   figarrow/.style={->, >=Stealth, line width=0.85pt, draw=figInk!70}
-%DIF < }
-%DIF PREAMBLE EXTENSION ADDED BY LATEXDIFF
-%DIF UNDERLINE PREAMBLE %DIF PREAMBLE
-
-\RequirePackage[normalem]{ulem} %DIF PREAMBLE
-
-\RequirePackage{color}\definecolor{RED}{rgb}{1,0,0}\definecolor{BLUE}{rgb}{0,0,1} %DIF PREAMBLE
-
-\providecommand{\DIFadd}[1]{{\protect\color{blue}\uwave{#1}}} %DIF PREAMBLE
-\providecommand{\DIFdel}[1]{{\protect\color{red}\sout{#1}}} %DIF PREAMBLE
-%DIF SAFE PREAMBLE %DIF PREAMBLE
-
-\providecommand{\DIFaddbegin}{} %DIF PREAMBLE
-\providecommand{\DIFaddend}{} %DIF PREAMBLE
-\providecommand{\DIFdelbegin}{} %DIF PREAMBLE
-\providecommand{\DIFdelend}{} %DIF PREAMBLE
-\providecommand{\DIFmodbegin}{} %DIF PREAMBLE
-\providecommand{\DIFmodend}{} %DIF PREAMBLE
-%DIF FLOATSAFE PREAMBLE %DIF PREAMBLE
-\providecommand{\DIFaddFL}[1]{\DIFadd{#1}} %DIF PREAMBLE
-\providecommand{\DIFdelFL}[1]{\DIFdel{#1}} %DIF PREAMBLE
-\providecommand{\DIFaddbeginFL}{} %DIF PREAMBLE
-\providecommand{\DIFaddendFL}{} %DIF PREAMBLE
-\providecommand{\DIFdelbeginFL}{} %DIF PREAMBLE
-\providecommand{\DIFdelendFL}{} %DIF PREAMBLE
-%DIF AMSMATHULEM PREAMBLE %DIF PREAMBLE
-\makeatletter %DIF PREAMBLE
-\let\sout@orig\sout %DIF PREAMBLE
-\renewcommand{\sout}[1]{\ifmmode\text{\sout@orig{\ensuremath{#1}}}\else\sout@orig{#1}\fi} %DIF PREAMBLE
-\makeatother %DIF PREAMBLE
-%DIF COLORLISTINGS PREAMBLE %DIF PREAMBLE
-\RequirePackage{listings} %DIF PREAMBLE
-
-\RequirePackage{color} %DIF PREAMBLE
-
-\lstdefinelanguage{DIFcode}{ %DIF PREAMBLE
-%DIF DIFCODE_UNDERLINE %DIF PREAMBLE
-  moredelim=[il][\color{red}\sout]{\%DIF\ <\ }, %DIF PREAMBLE
-  moredelim=[il][\color{blue}\uwave]{\%DIF\ >\ } %DIF PREAMBLE
-} %DIF PREAMBLE
-\lstdefinestyle{DIFverbatimstyle}{ %DIF PREAMBLE
-	language=DIFcode, %DIF PREAMBLE
-	basicstyle=\ttfamily, %DIF PREAMBLE
-	columns=fullflexible, %DIF PREAMBLE
-	keepspaces=true %DIF PREAMBLE
-} %DIF PREAMBLE
-\lstnewenvironment{DIFverbatim}{\lstset{style=DIFverbatimstyle}}{} %DIF PREAMBLE
-\lstnewenvironment{DIFverbatim*}{\lstset{style=DIFverbatimstyle,showspaces=true}}{} %DIF PREAMBLE
-\lstset{extendedchars=\true,inputencoding=utf8}
-
-%DIF END PREAMBLE EXTENSION ADDED BY LATEXDIFF
+% ── ICML Global Colour System ──
+\definecolor{ink}{HTML}{1F2937}
+\definecolor{flagship}{HTML}{2563EB}
+\definecolor{secondary}{HTML}{D97706}
+\definecolor{physgood}{HTML}{059669}
+\definecolor{errbad}{HTML}{BE123C}
+\definecolor{muted}{HTML}{64748B}
+\definecolor{panelbg}{HTML}{F8FAFC}
+\definecolor{gridline}{HTML}{E2E8F0}
+\definecolor{mppgold}{HTML}{F59E0B}
 
 \begin{document}
-\DIFdelbegin %DIFDELCMD < \begin{tikzpicture}[every node/.style={font=\sffamily\scriptsize}]
-%DIFDELCMD < 
-
-%DIFDELCMD < \node[figlabel] at (-0.3,2.8) {(a)};
-%DIFDELCMD < \node[figtitle, anchor=west] at (0,2.55) {Non-uniform voltage grid design};
-%DIFDELCMD < 
-
-%DIFDELCMD < \draw[->, line width=0.75pt, draw=figMuted] (0,1.8) -- (16.7,1.8) node[right] {$V$ (V)};
-%DIFDELCMD < % coarse region 0..0.4
-%DIFDELCMD < \foreach \v in {0.0,0.1,0.2,0.3,0.4} {
-%DIFDELCMD <   \pgfmathsetmacro{\x}{\v*10.8}
-%DIFDELCMD <   \draw[draw=figBlue, line width=1.0pt] (\x,1.55) -- (\x,2.05);
-%DIFDELCMD < }
-%DIFDELCMD < % dense region 0.425..1.4
-%DIFDELCMD < \foreach \i in {0,...,39} {
-%DIFDELCMD <   \pgfmathsetmacro{\v}{0.425 + 0.025*\i}
-%DIFDELCMD <   \pgfmathsetmacro{\x}{\v*10.8}
-%DIFDELCMD <   \draw[draw=figAmber, line width=0.45pt] (\x,1.65) -- (\x,1.95);
-%DIFDELCMD < }
-%DIFDELCMD < \fill[figMpp!20] (7.4,1.4) rectangle (10.7,2.2);
-%DIFDELCMD < \draw[draw=figMpp, line width=0.9pt, dashed] (8.85,1.45) -- (8.85,2.15);
-%DIFDELCMD < \node[text=figMpp] at (8.85,2.3) {$V_{mpp}$ zone};
-%DIFDELCMD < \draw[decorate, decoration={brace, amplitude=4pt}, draw=figBlue] (0,2.08) -- (4.32,2.08);
-%DIFDELCMD < \node[text=figBlue, anchor=south] at (2.16,2.22) {coarse: $\Delta V=0.1$};
-%DIFDELCMD < \draw[decorate, decoration={brace, amplitude=4pt}, draw=figAmber] (4.59,2.0) -- (15.12,2.0);
-%DIFDELCMD < \node[text=figAmber, anchor=south] at (9.85,2.12) {dense: $\Delta V=0.025$};
-%DIFDELCMD < \node[fignote, anchor=west] at (0,1.2)
-%DIFDELCMD < {Dense sampling is intentionally placed where curve shape changes fastest (knee/MPP).};
-%DIFDELCMD < 
-
-%DIFDELCMD < \node[figlabel] at (-0.3,-0.1) {(b)};
-%DIFDELCMD < \node[figtitle, anchor=west] at (0,-0.35) {Weighted error definition aligned with physical sensitivity};
-%DIFDELCMD < 
-
-%DIFDELCMD < \node[figbox, minimum width=16.6cm, minimum height=3.3cm, anchor=north west] (eq) at (0,-0.55) {};
-%DIFDELCMD < \node[anchor=north west, font=\sffamily\small] at (0.25,-0.85)
-%DIFDELCMD < {$\Delta V_j = V_{j+1}-V_j,\qquad
-%DIFDELCMD < w_j = 1 + (w_{mpp}-1)\exp\!\left(-\frac{(V_j-V_{mpp})^2}{2\sigma_w^2}\right)$};
-%DIFDELCMD < \node[anchor=north west, font=\sffamily\small] at (0.25,-1.65)
-%DIFDELCMD < {$\mathcal{L}_{curve}=\frac{\sum_j \Delta V_j\,w_j\,(\hat I_j-I_j)^2}{\sum_j \Delta V_j\,w_j}$};
-%DIFDELCMD < \node[fignote, anchor=north west, text width=16.0cm] at (0.25,-2.3)
-%DIFDELCMD < {- $\Delta V_j$ compensates for non-uniform grid spacing so sparse regions do not dominate numerically.\\
-%DIFDELCMD < - $w_j$ can emphasize the knee/MPP regime, where power-output sensitivity is highest.\\
-%DIFDELCMD < - Net effect: objective prioritizes physically critical voltage ranges rather than uniform point-count weighting.};
-%DIFDELCMD < 
-
-%DIFDELCMD < \node[figbox, minimum width=6.8cm, minimum height=0.95cm, draw=figGreen!65, anchor=north west] at (9.65,-3.48)
-%DIFDELCMD < {\textbf{Takeaway:} resolution + weighting are both focused on the MPP-critical region.};
-%DIFDELCMD < 
-
-%DIFDELCMD < \end{tikzpicture}
-%DIFDELCMD <  %%%
-\DIFdelend \DIFaddbegin \begin{tikzpicture}[every node/.style={font=\sffamily,text=ink}]
+\begin{tikzpicture}[every node/.style={font=\sffamily,text=ink}]
 
 % ── Canvas: 17.0 cm × 8.2 cm ──
 \useasboundingbox (0,0) rectangle (17,8.2);
@@ -193,7 +57,7 @@
 }
 \node[below=3pt,font=\sffamily\scriptsize,text=flagship]
   at (\axL,{\axY-0.28}) {0};
-\node[below=3pt,font=\sffamily\scriptsize,text=flagship]
+\node[below=8pt,font=\sffamily\scriptsize,text=flagship]
   at ({\axL+0.4*\vs},{\axY-0.28}) {0.4};
 
 % Coarse brace - single-line spec
@@ -212,8 +76,8 @@
   \draw[secondary,line width=0.5pt]
     (\xp,{\axY-0.18}) -- (\xp,{\axY+0.18});
 }
-\node[below=3pt,font=\sffamily\scriptsize,text=secondary]
-  at ({\axL+0.425*\vs},{\axY-0.18}) {0.425};
+\node[below=1pt,font=\sffamily\scriptsize,text=secondary]
+  at ({\axL+0.425*\vs},{\axY-0.10}) {0.425};
 \node[below=3pt,font=\sffamily\scriptsize,text=secondary]
   at ({\axL+1.0*\vs},{\axY-0.18}) {1.0};
 \node[below=3pt,font=\sffamily\scriptsize,text=secondary]
@@ -327,7 +191,7 @@
   };
 
 % ── Right column: mini Gaussian-weight plot ──
-\begin{scope}[shift={(12.0,0.55)}]
+\begin{scope}[shift={(12.0,1.55)}]
   \begin{axis}[
     width=4.6cm,height=2.2cm,
     at={(0,0)},anchor=south west,
@@ -343,17 +207,13 @@
     ytick={1.0,1.5,2.0},
     grid=none,clip=false,
   ]
-    % Gaussian bump centred at Vmpp = 0.82
     \addplot[physgood,line width=1.4pt,smooth,samples=80,domain=0:1.4]
       {1.0 + 1.0*exp(-((x-0.82)^2)/(2*0.1^2))};
-    % Baseline w = 1
     \addplot[muted!40,line width=0.4pt,dashed,domain=0:1.4] {1.0};
-    % Vmpp guide line
     \draw[mppgold,line width=0.6pt,dashed]
       (axis cs:0.82,0.8) -- (axis cs:0.82,2.15);
     \node[font=\sffamily\scriptsize,text=mppgold]
       at (axis cs:0.82,2.30) {$V_{\!\mathrm{mpp}}$};
-    % w_mpp label
     \node[font=\sffamily\scriptsize,text=physgood]
       at (axis cs:1.12,1.82) {$w_{\!\mathrm{mpp}}\!=\!2$};
   \end{axis}
@@ -374,4 +234,4 @@
 };
 
 \end{tikzpicture}
- \DIFaddend\end{document}
+\end{document}
