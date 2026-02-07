@@ -1,202 +1,50 @@
-% Figure 4: Non-Uniform Voltage Grid + ΔV-Weighted Metric
-% Compile: pdflatex fig4_voltage_grid.tex
-\documentclass[border=8pt]{standalone}
-\usepackage{tikz}
-\usepackage{amsmath,amssymb}
-\usepackage{pgfplots}
-\pgfplotsset{compat=1.18}
-\usetikzlibrary{
-  arrows.meta,
-  calc,
-  positioning,
-  decorations.pathreplacing,
-  patterns,
-  backgrounds,
-  shadows.blur
-}
-
-\definecolor{coarseblue}{HTML}{2980B9}
-\definecolor{denseorange}{HTML}{E67E22}
-\definecolor{annotgray}{HTML}{7F8C8D}
-\definecolor{bgcard}{HTML}{FDFEFE}
-\definecolor{eqnpurple}{HTML}{8E44AD}
-\definecolor{gaussgrn}{HTML}{27AE60}
-\definecolor{mppgold}{HTML}{F39C12}
-
+% Figure 4: Voltage Grid + Weighted Error Rationale
+\documentclass[tikz,border=8pt]{standalone}
+\input{_style.tex}
 \begin{document}
-\begin{tikzpicture}[
-  every node/.style={font=\sffamily\small},
-  annot/.style={font=\sffamily\scriptsize, text=annotgray},
-]
+\begin{tikzpicture}[every node/.style={font=\sffamily\scriptsize}]
 
-% ═══════════════════════════════════════════
-% PANEL (a): Voltage Grid Axis
-% ═══════════════════════════════════════════
-\node[font=\sffamily\small\bfseries, text=annotgray!80] at (-0.8, 1.8) {(a)};
+\node[figlabel] at (-0.3,2.8) {(a)};
+\node[figtitle, anchor=west] at (0,2.55) {Non-uniform voltage grid design};
 
-% Main axis line
-\draw[->, line width=0.8pt, annotgray!80] (0, 0) -- (14.5, 0)
-  node[right, font=\sffamily\small] {$V$ (V)};
-
-% ─── Coarse region: 0 to 0.4 V (step 0.1) ───
-% Positions: 0.0, 0.1, 0.2, 0.3, 0.4
-% Scale: 10 cm per 1.4V → each 0.1V = ~0.714 cm
-\pgfmathsetmacro{\scale}{10.0/1.4}
-
-% Coarse ticks (all 5 drawn, labels at endpoints only)
-\foreach \v in {0.0, 0.1, 0.2, 0.3, 0.4} {
-  \pgfmathsetmacro{\xpos}{\v * \scale}
-  \draw[coarseblue, line width=1.0pt] (\xpos, -0.35) -- (\xpos, 0.35);
+\draw[->, line width=0.75pt, draw=figMuted] (0,1.8) -- (16.7,1.8) node[right] {$V$ (V)};
+% coarse region 0..0.4
+\foreach \v in {0.0,0.1,0.2,0.3,0.4} {
+  \pgfmathsetmacro{\x}{\v*10.8}
+  \draw[draw=figBlue, line width=1.0pt] (\x,1.55) -- (\x,2.05);
 }
-% Labels at coarse endpoints
-\node[below=5pt, font=\sffamily\tiny, text=coarseblue] at (0, -0.35) {0};
-\node[below=5pt, font=\sffamily\tiny, text=coarseblue] at ({0.4*\scale}, -0.35) {0.4};
-
-% Coarse region brace
-\draw[
-  decorate, decoration={brace, amplitude=5pt, raise=6pt},
-  line width=0.5pt, coarseblue
-] (0, 0.35) -- ({0.4*\scale}, 0.35)
-  node[midway, above=12pt, font=\sffamily\scriptsize, text=coarseblue, text width=2cm, align=center] {
-    \textbf{Coarse}\\[-1pt]
-    $\Delta V = 0.1$ V\\[-1pt]
-    5 points
-  };
-
-% ─── Dense region: 0.425 to 1.4 V (step 0.025) ───
-% 40 ticks
-\foreach \i in {0, 1, ..., 39} {
-  \pgfmathsetmacro{\v}{0.425 + \i * 0.025}
-  \pgfmathsetmacro{\xpos}{\v * \scale}
-  \draw[denseorange, line width=0.5pt] (\xpos, -0.2) -- (\xpos, 0.2);
+% dense region 0.425..1.4
+\foreach \i in {0,...,39} {
+  \pgfmathsetmacro{\v}{0.425 + 0.025*\i}
+  \pgfmathsetmacro{\x}{\v*10.8}
+  \draw[draw=figAmber, line width=0.45pt] (\x,1.65) -- (\x,1.95);
 }
+\fill[figMpp!20] (7.4,1.4) rectangle (10.7,2.2);
+\draw[draw=figMpp, line width=0.9pt, dashed] (8.85,1.45) -- (8.85,2.15);
+\node[text=figMpp] at (8.85,2.3) {$V_{mpp}$ zone};
+\draw[decorate, decoration={brace, amplitude=4pt}, draw=figBlue] (0,2.08) -- (4.32,2.08);
+\node[text=figBlue, anchor=south] at (2.16,2.22) {coarse: $\Delta V=0.1$};
+\draw[decorate, decoration={brace, amplitude=4pt}, draw=figAmber] (4.59,2.0) -- (15.12,2.0);
+\node[text=figAmber, anchor=south] at (9.85,2.12) {dense: $\Delta V=0.025$};
+\node[fignote, anchor=west] at (0,1.2)
+{Dense sampling is intentionally placed where curve shape changes fastest (knee/MPP).};
 
-% Key labels in dense region
-\pgfmathsetmacro{\xfour}{{0.425*\scale}}
-\node[below=5pt, font=\sffamily\tiny, text=denseorange] at (\xfour, -0.2) {0.425};
-\pgfmathsetmacro{\xone}{{1.0*\scale}}
-\node[below=5pt, font=\sffamily\tiny, text=denseorange] at (\xone, -0.2) {1.0};
-\pgfmathsetmacro{\xend}{{1.4*\scale}}
-\node[below=5pt, font=\sffamily\tiny, text=denseorange] at (\xend, -0.2) {1.4};
+\node[figlabel] at (-0.3,-0.1) {(b)};
+\node[figtitle, anchor=west] at (0,-0.35) {Weighted error definition aligned with physical sensitivity};
 
-% Dense region brace
-\draw[
-  decorate, decoration={brace, amplitude=5pt, raise=6pt},
-  line width=0.5pt, denseorange
-] ({0.425*\scale}, 0.2) -- ({1.4*\scale}, 0.2)
-  node[midway, above=12pt, font=\sffamily\scriptsize, text=denseorange, text width=2.5cm, align=center] {
-    \textbf{Dense (knee region)}\\[-1pt]
-    $\Delta V = 0.025$ V\\[-1pt]
-    40 points
-  };
+\node[figbox, minimum width=16.6cm, minimum height=3.3cm, anchor=north west] (eq) at (0,-0.55) {};
+\node[anchor=north west, font=\sffamily\small] at (0.25,-0.85)
+{$\Delta V_j = V_{j+1}-V_j,\qquad
+w_j = 1 + (w_{mpp}-1)\exp\!\left(-\frac{(V_j-V_{mpp})^2}{2\sigma_w^2}\right)$};
+\node[anchor=north west, font=\sffamily\small] at (0.25,-1.65)
+{$\mathcal{L}_{curve}=\frac{\sum_j \Delta V_j\,w_j\,(\hat I_j-I_j)^2}{\sum_j \Delta V_j\,w_j}$};
+\node[fignote, anchor=north west, text width=16.0cm] at (0.25,-2.3)
+{- $\Delta V_j$ compensates for non-uniform grid spacing so sparse regions do not dominate numerically.\\
+- $w_j$ can emphasize the knee/MPP regime, where power-output sensitivity is highest.\\
+- Net effect: objective prioritizes physically critical voltage ranges rather than uniform point-count weighting.};
 
-% Total count
-\node[
-  draw=annotgray!40, fill=bgcard, rounded corners=2pt,
-  font=\sffamily\scriptsize, text=annotgray!90,
-  inner sep=3pt
-] at ({0.7*\scale}, -1.1) {
-  $N_V = 45$ total evaluation points
-};
-
-% ─── Typical Vmpp marker ───
-\pgfmathsetmacro{\xmpp}{{0.82*\scale}}
-\draw[mppgold, line width=1.2pt] (\xmpp, -0.5) -- (\xmpp, 0.5);
-\node[above=3pt, font=\sffamily\tiny\bfseries, text=mppgold] at (\xmpp, 0.5) {$V_{\text{mpp}}$};
-% Typical Voc marker
-\pgfmathsetmacro{\xvoc}{{1.1*\scale}}
-\draw[annotgray, line width=0.8pt, dashed] (\xvoc, -0.4) -- (\xvoc, 0.4);
-\node[above=3pt, font=\sffamily\tiny, text=annotgray] at (\xvoc, 0.4) {$V_{\text{oc}}$};
-
-% ═══════════════════════════════════════════
-% PANEL (b): ΔV-Weighted Loss Equation
-% ═══════════════════════════════════════════
-\node[font=\sffamily\small\bfseries, text=annotgray!80] at (-0.8, -2.3) {(b)};
-
-\node[
-  draw=eqnpurple!40,
-  fill=eqnpurple!4,
-  rounded corners=5pt,
-  line width=0.6pt,
-  text width=13cm,
-  align=left,
-  font=\small,
-  inner sep=8pt,
-  blur shadow={shadow blur steps=2, shadow xshift=0.3pt, shadow yshift=-0.3pt, shadow opacity=12}
-] (eqnbox) at (7.0, -3.0) {
-  \textbf{Grid-spacing weights:}
-  \vspace{2pt}
-  \[
-    \Delta V_j =
-    \begin{cases}
-      V_{j+1} - V_j, & j < N_V \\[2pt]
-      V_{N_V} - V_{N_V\!-1}, & j = N_V
-    \end{cases}
-  \]
-  \vspace{-6pt}
-
-  \textbf{MPP-focused Gaussian weighting:}
-  \vspace{2pt}
-  \[
-    w_j = 1 + (w_{\text{mpp}} - 1)\,\exp\!\Bigl(-\frac{(V_j - V_{\text{mpp}})^2}{2\sigma_w^2}\Bigr),
-    \qquad w_{\text{mpp}} = 2.0,\;\; \sigma_w = 0.1\text{ V}
-  \]
-  \vspace{-4pt}
-
-  \textbf{$\Delta V$-weighted curve loss:}
-  \vspace{2pt}
-  \[
-    \boxed{\;
-    \mathcal{L}_{\text{curve}}
-    = \frac{\displaystyle\sum_{j=1}^{N_V} \Delta V_j \, w_j \,
-      \bigl(\hat{J}_j - J_j\bigr)^2}
-      {\displaystyle\sum_{j=1}^{N_V} \Delta V_j \, w_j}
-    \;}
-  \]
-};
-
-% ═══════════════════════════════════════════
-% PANEL (c): Gaussian weighting bump (mini plot)
-% ═══════════════════════════════════════════
-\begin{scope}[shift={(11.0, -2.0)}]
-  \node[font=\sffamily\scriptsize\bfseries, text=annotgray!80] at (-0.3, 2.3) {(c)};
-
-  \begin{axis}[
-    width=4.5cm,
-    height=3.0cm,
-    at={(0cm,0cm)},
-    anchor=south west,
-    xlabel={$V$ (V)},
-    ylabel={$w_j$},
-    xlabel style={font=\sffamily\tiny},
-    ylabel style={font=\sffamily\tiny},
-    tick label style={font=\sffamily\tiny},
-    xmin=0, xmax=1.4,
-    ymin=0.8, ymax=2.2,
-    axis lines=left,
-    axis line style={line width=0.4pt, color=annotgray},
-    every tick/.style={annotgray, line width=0.3pt},
-    grid=none,
-    clip=false,
-  ]
-
-  % Gaussian bump centered at Vmpp=0.82
-  \addplot[
-    gaussgrn, line width=1.2pt, smooth, samples=80, domain=0:1.4
-  ] {1.0 + 1.0 * exp(-((x - 0.82)^2) / (2 * 0.1^2))};
-
-  % Baseline w=1 line
-  \addplot[annotgray!40, line width=0.4pt, dashed, domain=0:1.4] {1.0};
-
-  % Vmpp marker
-  \draw[mppgold, line width=0.8pt, dashed] (axis cs:0.82, 0.8) -- (axis cs:0.82, 2.15);
-  \node[font=\sffamily\tiny, text=mppgold] at (axis cs:0.82, 2.25) {$V_{\text{mpp}}$};
-
-  % w_mpp annotation
-  \node[font=\sffamily\tiny, text=gaussgrn!80] at (axis cs:1.05, 1.85) {$w_{\text{mpp}}\!=\!2$};
-
-  \end{axis}
-\end{scope}
+\node[figbox, minimum width=6.8cm, minimum height=0.95cm, draw=figGreen!65, anchor=north west] at (9.65,-3.48)
+{\textbf{Takeaway:} resolution + weighting are both focused on the MPP-critical region.};
 
 \end{tikzpicture}
 \end{document}

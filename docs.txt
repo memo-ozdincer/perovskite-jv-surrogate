@@ -523,6 +523,51 @@ Experimental validation: NREL database curves, published J-V data.
 Sensitivity analysis: Jacobians via autograd, physics sign validation (tcn_analysis.py).
 
 ================================================================================
+FIGURE ROADMAP (v2 — PAPER ASSETS)
+================================================================================
+Main figures (high-impact):
+  - FIG 1: End-to-end pipeline (COMSOL params + scalar TXT -> preprocessing -> Dilated Conv -> curve)
+  - FIG 2: Why dilated convolution works (receptive field + short-sequence inductive bias + metric panel)
+  - FIG 3: Side-by-side interpolation fidelity pair using:
+    `jv_curve_8_point_reconstruction_example.png` (left) and
+    `reconstruction_number_vs_number_of_points.png` (right)
+  - FIG 4: Voltage-grid + weighted-error rationale (why knee/MPP region is emphasized)
+  - FIG 5: Ablation + attention negative control (paired no-attn->attn degradation)
+  - FIG 6: Scalar-to-curve error propagation robustness (Voc/Vmpp noise -> curve MAE/R2)
+
+Figure 3 caption/discussion (ready to use):
+  - Caption: "Left: Example J-V curve reconstruction using an 8-point PCHIP
+    representation against a 1000-point reference, showing close overlap
+    (R^2=0.9939). Right: Reconstruction performance as a function of
+    interpolation-point count (4 significant digits). Accuracy saturates rapidly:
+    around 10 points reaches approximately 0.999, and 12 points reaches about
+    0.9997. This margin is over an order of magnitude beyond the smallest error
+    scale and supports robust generalization."
+  - Discussion cue: point-budget choice is justified by saturation behavior, not
+    by maximal interpolation complexity.
+
+Appendix figures:
+  - Layer-level architecture detail
+  - Preprocessing decision flow
+  - Feature streamlining (71 -> m)
+  - Jacobian sensitivity heatmap
+  - Parameter perturbation tornado
+  - Runtime/throughput breakdown (including optimization effects)
+  - Data scaling (100k vs 100k+300k)
+  - Best/median/worst reconstruction gallery
+  - OOD/ID + uncertainty
+  - COMSOL coupled PDE context placeholder (Drift-Diffusion-Poisson; header/shell to fill)
+  - Curve representation fidelity (good bowed J-V vs bad concave-up curve; interpolation comparison)
+
+Auto-generated (not bespoke design work):
+  - Training/learning curves generated directly from run logs by existing code.
+
+Legacy visuals to de-emphasize/remove:
+  - Feasible-set projection geometry tied to split-spline projection
+  - Split-spline multi-head equation flow figure
+  - Control-point and continuity sweeps as core figures
+
+================================================================================
 KEY IMPLEMENTATION DETAILS FOR REPLICATION
 ================================================================================
 Voltage grid: `config.py` hardcodes `V_GRID` (45 points)
