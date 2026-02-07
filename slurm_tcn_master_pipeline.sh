@@ -7,7 +7,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/tcn_master_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/tcn_master_%j.err
-#SBATCH --account=aip-aspiru
+#SBATCH --account=aip-aspuru
 
 # ============================================================================
 # CONV/TCN ICML MASTER PIPELINE
