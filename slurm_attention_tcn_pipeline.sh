@@ -13,10 +13,12 @@
 # ATTENTION-TCN I-V RECONSTRUCTION PIPELINE
 # ============================================================================
 # Parallel pipeline to slurm_master_pipeline.sh.
-# Trains 1 architecture variant × 1 seed = 1 run on 100k+300k data.
+# Trains 3 architecture variants × 3 seeds = 9 runs on 100k+300k data.
 # All scalar features loaded from external txt files (no data leakage).
 #
 # Experiments:
+#   TCN-DilatedConv-NoAttn  : Causal dilated TCN (original Colab arch)
+#   Conv-NoAttn             : Non-causal 1D conv (symmetric padding)
 #   Pointwise-NoAttn        : 1x1 conv (position-independent baseline)
 #
 # Usage:
@@ -68,8 +70,8 @@ IV_EXTRA="$WORK_DIR/IV_m_300k.txt"
 MIN_FF=0.30
 MIN_VMPP=0.00
 
-# Experiment seeds
-SEEDS=(42)
+# Experiment seeds (same as master pipeline)
+SEEDS=(42 123 456)
 
 # Training configuration
 MAX_EPOCHS=100
@@ -189,7 +191,7 @@ for f in "$PARAMS_CLEAN" "$IV_CLEAN" "$PARAMS_EXTRA_CLEAN" "$IV_EXTRA_CLEAN" \
 done
 
 # ============================================================================
-# STEP 2: ARCHITECTURE EXPERIMENTS (1 arch × 1 seed = 1 run)
+# STEP 2: ARCHITECTURE EXPERIMENTS (3 archs × 3 seeds = 9 runs)
 # ============================================================================
 
 echo ""
@@ -203,12 +205,14 @@ STEP_START=$(date +%s)
 
 # Define experiments: NAME -> FLAGS
 declare -A EXP_FLAGS
+EXP_FLAGS["TCN-DilatedConv-NoAttn"]="--architecture tcn --no-attention --use-dilated"
+EXP_FLAGS["Conv-NoAttn"]="--architecture conv --no-attention"
 EXP_FLAGS["Pointwise-NoAttn"]="--architecture pointwise --no-attention"
 
 RESULTS_DIR="$OUTPUT_BASE/results"
 mkdir -p "$RESULTS_DIR"
 
-for EXP_ID in "Pointwise-NoAttn"; do
+for EXP_ID in "TCN-DilatedConv-NoAttn" "Conv-NoAttn" "Pointwise-NoAttn"; do
     for SEED in "${SEEDS[@]}"; do
         RUN_NAME="${EXP_ID}_seed${SEED}"
         EXP_OUT="$OUTPUT_BASE/$EXP_ID/seed_$SEED"
