@@ -439,93 +439,13 @@ After training, verify:
   [ ] metrics.json shows MSE < 0.001, FF MAPE < 5%
 
 ================================================================================
-TCN-BASED I-V RECONSTRUCTION (v4.0 — PRIMARY MODEL)
-================================================================================
-File: `train_attention_tcn.py`, Pipeline: `slurm_tcn_master_pipeline.sh`
-
-KEY FINDING: The Temporal Convolutional Network (TCN) approach significantly
-outperforms the Split-Spline architecture. Dilated causal convolutions with
-NO self-attention is the best-performing configuration.
-
-Architecture overview (PhysicsIVSystem, PyTorch Lightning):
-  1. param_mlp: 31 raw params + 2 scalars (Voc, Vmpp from TXT) → dense [256→128→128]
-  2. Gaussian RBF positional encoding of 8-point PCHIP voltage positions
-  3. Conditioning: param embedding broadcast across sequence, concatenated with RBF
-  4. Temporal blocks (2 layers):
-     - Dilated causal 1D convolution (kernel=5, dilation=[1,2], filters=[128,64])
-     - BatchNorm1d + GELU + Dropout(0.036)
-  5. Output head: Conv1d(64→1) → per-position current prediction
-
-Three architecture variants tested (all PyTorch Lightning):
-  TCN (causal dilated):    Best performer. Dilation captures multi-scale voltage patterns.
-  Conv (non-causal 1D):    Symmetric padding. Slightly worse than causal TCN.
-  Pointwise (1×1 conv):    Position-independent baseline. Weakest.
-
-Attention: Optional multi-head self-attention (4 heads) AFTER conv blocks.
-  Result: Attention HURTS performance — TCN without attention is consistently better.
-  Hypothesis: The 8-point PCHIP sequence is too short for attention to add value;
-  dilation already provides sufficient receptive field.
-
-Physics loss components:
-  L_total = MSE + λ_mono × L_monotonicity + λ_conv × L_convexity + λ_curv × L_curvature
-  - MSE: Standard reconstruction loss on 8-point I-V predictions
-  - Monotonicity: penalizes ΔI > 0 (current should decrease with voltage)
-  - Convexity: penalizes second derivative violations in knee region
-  - Excess curvature: penalizes unrealistic oscillations
-
-Data pipeline:
-  - Combined 100k + 300k COMSOL datasets (concatenated after filtering)
-  - Scalars (Voc, Vmpp) loaded from external TXT files (swappable with predicted)
-  - PCHIP-based 8-point voltage slices focused around MPP region
-  - Fine-grid (1000-point) ground truth stored as float16 memmaps for plotting
-  - Preprocessing: Log1p → RobustScaler → MinMaxScaler (same as Split-Spline)
-  - Train/val/test split: 70/15/15, stratified by Voc bins
-
-Training config:
-  - Optimizer: AdamW, lr=1e-3, weight_decay=1e-4
-  - Scheduler: CosineAnnealingLR (T_max=100)
-  - Epochs: 100 (sufficient — 200 gives minimal improvement)
-  - Batch size: 128, gradient clip: 1.0
-  - Early stopping: patience=20 on val_loss
-
-TCN vs Split-Spline comparison:
-  TCN advantage:
-    - Directly operates on sequence → no anchor/spline indirection
-    - Physics loss embedded in training (monotonicity, convexity)
-    - Simpler architecture, fewer heads, fewer failure modes
-    - Dilation handles multi-scale voltage dependencies naturally
-  Split-Spline advantage:
-    - Hard physics constraints (Jsc>0, Voc>0, ordering) guaranteed
-    - PCHIP monotonicity guaranteed by construction
-    - More interpretable intermediate outputs (anchors)
-
-TCN Ablation experiments (Tier 0, 10 configs × 3 seeds = 30 runs):
-  T0-1:  Dilated TCN, no attention      — MAIN MODEL (best)
-  T0-2:  Standard Conv, no attention     — Tests causality effect
-  T0-3:  Pointwise (1×1), no attention   — Position-independent baseline
-  T0-4:  Dilated TCN WITH attention      — Tests attention value
-  T0-5:  Conv WITH attention             — Tests attention on conv
-  T0-6:  TCN without dilation            — Isolates dilation contribution
-  T0-7:  No scalars (params only)        — Tests scalar conditioning value
-  T0-8:  100k only (no 300k extra data)  — Tests data scaling
-  T0-9:  200 epochs                      — Tests convergence
-  T0-10: Batch size 512                  — Tests batch size effect
-
-TCN Pipeline files:
-  slurm_tcn_master_pipeline.sh  — Master SLURM script (all experiments + figures)
-  train_attention_tcn.py        — Training script (PyTorch Lightning)
-  tcn_collect_results.py        — Aggregate results across experiments
-  tcn_generate_figures.py       — Generate all paper figures and tables
-  tcn_analysis.py               — Physics/Jacobian/sensitivity analysis
-
-================================================================================
 WHAT REMAINS (NEXT STEPS FOR PUBLICATION)
 ================================================================================
-Ablation studies: TCN Tier 0 experiments (10 configs × 3 seeds via slurm_tcn_master_pipeline.sh).
+Ablation studies: No-split, no-continuity, no-anchors, no-physics-features, direct-MLP baselines.
 OOD evaluation: Bandgap-based extrapolation, leave-one-material-out.
 Uncertainty calibration: MC-Dropout intervals, calibration plots.
 Experimental validation: NREL database curves, published J-V data.
-Sensitivity analysis: Jacobians via autograd, physics sign validation (tcn_analysis.py).
+Sensitivity analysis: Jacobians via autograd, physics sign validation.
 
 ================================================================================
 KEY IMPLEMENTATION DETAILS FOR REPLICATION

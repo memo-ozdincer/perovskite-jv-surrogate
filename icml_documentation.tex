@@ -12,9 +12,9 @@
 \usepackage{multirow}
 \usepackage{longtable}
 
-\title{Physics-Constrained Neural Networks for \\
+\title{Physics-Constrained Split-Spline Neural Networks for \\
 J-V Curve Reconstruction in Perovskite Solar Cells: \\
-\large Comprehensive Technical Documentation (v4.0 --- TCN Primary Model)}
+\large Comprehensive Technical Documentation (v3.0)}
 
 \author{Technical Documentation for ICML Submission}
 \date{}
@@ -586,146 +586,6 @@ Decouples endpoint prediction from shape:
 Simple feedforward: $31 \rightarrow 256 \rightarrow 128 \rightarrow 45$ (no physics structure).
 
 %=============================================================================
-\section{TCN-Based I-V Reconstruction (Primary Model)}
-\label{sec:tcn}
-%=============================================================================
-
-\textbf{Key Finding:} The Temporal Convolutional Network (TCN) approach \textbf{significantly outperforms} the Split-Spline architecture. Dilated causal convolutions \textbf{without} self-attention is the best-performing configuration.
-
-\subsection{TCN Architecture (PhysicsIVSystem)}
-
-The TCN model is implemented in PyTorch Lightning (\texttt{train\_attention\_tcn.py}). It operates directly on 8-point PCHIP voltage slices focused around the MPP region.
-
-\begin{equation}
-\mathbf{x} \xrightarrow{\text{ParamMLP}} \mathbf{h} \xrightarrow{\text{broadcast}} [\mathbf{h}; \text{RBF}(V)] \xrightarrow{\text{DilatedTCN}} \xrightarrow{\text{OutHead}} \hat{I}(V)
-\end{equation}
-
-\subsubsection{Parameter Embedding (ParamMLP)}
-
-\begin{table}[h]
-\centering
-\caption{TCN Parameter MLP Architecture}
-\begin{tabular}{lccccc}
-\toprule
-\textbf{Layer} & \textbf{Input} & \textbf{Output} & \textbf{Activation} & \textbf{Norm} & \textbf{Dropout} \\
-\midrule
-Dense 1 & $31 + n_s$ & 256 & GELU & BatchNorm1d & 0.036 \\
-Dense 2 & 256 & 128 & GELU & BatchNorm1d & 0.036 \\
-Dense 3 & 128 & 128 & GELU & BatchNorm1d & 0.036 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-where $n_s$ is the number of scalar inputs (Voc, Vmpp from external TXT files; $n_s = 2$ by default).
-
-\subsubsection{Gaussian RBF Positional Encoding}
-
-Voltage positions are encoded using learnable Gaussian radial basis functions:
-\begin{equation}
-\text{RBF}(V_j) = \exp\left(-\frac{(V_j - \mu_k)^2}{2\sigma_k^2}\right), \quad k = 1, \ldots, n_{rbf}
-\end{equation}
-
-where $\mu_k$ and $\sigma_k$ are learnable parameters, and $n_{rbf}$ matches the ParamMLP output dimension (128).
-
-\subsubsection{Temporal Convolution Blocks}
-
-The sequence representation $[\mathbf{h}; \text{RBF}(V)] \in \mathbb{R}^{8 \times (128+128)}$ passes through dilated causal 1D convolution blocks:
-
-\begin{table}[h]
-\centering
-\caption{TCN Block Architecture}
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Block} & \textbf{Filters} & \textbf{Kernel} & \textbf{Dilation} & \textbf{Padding} \\
-\midrule
-Block 1 & 128 & 5 & 1 & Causal (left-padded) \\
-Block 2 & 64 & 5 & 2 & Causal (left-padded) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Each block: Conv1d $\rightarrow$ BatchNorm1d $\rightarrow$ GELU $\rightarrow$ Dropout(0.036).
-
-\textbf{Causal padding}: Left-only zero-padding of size $(k-1) \times d$ ensures each output position depends only on current and previous voltage positions.
-
-\subsubsection{Architecture Variants}
-
-Three variants were evaluated:
-\begin{itemize}
-    \item \textbf{TCN (causal dilated)}: Best performer. Dilation captures multi-scale voltage dependencies. Causal structure reflects the physical monotonic relationship.
-    \item \textbf{Conv (non-causal 1D)}: Symmetric padding. Slightly worse than causal TCN.
-    \item \textbf{Pointwise (1$\times$1 conv)}: Position-independent baseline. Weakest performer.
-\end{itemize}
-
-\subsubsection{Self-Attention (Optional --- Disabled by Default)}
-
-An optional multi-head self-attention block (4 heads, $d_{model} = 64$) can be placed after the conv blocks. \textbf{Result: Attention consistently hurts performance.} Hypothesis: the 8-point PCHIP sequence is too short for attention to add value; dilation already provides sufficient receptive field.
-
-\subsection{TCN Physics Loss}
-
-\begin{equation}
-\mathcal{L}_{TCN} = \mathcal{L}_{MSE} + \lambda_{mono} \mathcal{L}_{mono} + \lambda_{conv} \mathcal{L}_{conv} + \lambda_{curv} \mathcal{L}_{curv}
-\end{equation}
-
-\begin{itemize}
-    \item $\mathcal{L}_{MSE}$: Reconstruction loss on 8-point I-V predictions
-    \item $\mathcal{L}_{mono} = \sum_j \text{ReLU}(\Delta I_j)$: Penalizes non-monotonic current (should decrease with voltage)
-    \item $\mathcal{L}_{conv}$: Penalizes second-derivative sign violations in the knee region
-    \item $\mathcal{L}_{curv}$: Penalizes excess curvature / unrealistic oscillations
-\end{itemize}
-
-\subsection{TCN Data Pipeline}
-
-\begin{itemize}
-    \item Combined 100k + 300k COMSOL datasets (concatenated after quality filtering)
-    \item Scalars (Voc, Vmpp) loaded from \textbf{external TXT files} --- swappable with predicted values
-    \item PCHIP-based 8-point voltage slices focused around MPP
-    \item Fine-grid (1000-point) ground truth stored as float16 memmaps for visualization
-    \item Train/val/test: 70/15/15, stratified by $V_{oc}$ bins
-\end{itemize}
-
-\subsection{TCN Training Configuration}
-
-\begin{table}[h]
-\centering
-\caption{TCN Training Configuration}
-\begin{tabular}{lll}
-\toprule
-\textbf{Component} & \textbf{Parameter} & \textbf{Value} \\
-\midrule
-Optimizer & AdamW & $\beta = (0.9, 0.999)$ \\
-Learning rate & & $10^{-3}$ \\
-Weight decay & & $10^{-4}$ \\
-Scheduler & CosineAnnealingLR & $T_{max} = 100$ \\
-Early stopping & patience & 20 epochs \\
-Gradient clipping & max\_norm & 1.0 \\
-Max epochs & & 100 \\
-Batch size & & 128 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{TCN vs Split-Spline Comparison}
-
-\begin{table}[h]
-\centering
-\caption{TCN vs Split-Spline Trade-offs}
-\begin{tabular}{lll}
-\toprule
-\textbf{Aspect} & \textbf{TCN} & \textbf{Split-Spline} \\
-\midrule
-Performance & Significantly better & Baseline \\
-Architecture & Direct sequence prediction & Anchor + control point heads \\
-Physics enforcement & Soft loss (mono, conv, curv) & Hard projection $\Pi_\mathcal{C}$ \\
-Monotonicity & Via loss penalty & PCHIP guarantees \\
-Interpretability & End-to-end & Intermediate anchors \\
-Framework & PyTorch Lightning & Raw PyTorch \\
-Sequence length & 8 PCHIP points & 45 grid points \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-%=============================================================================
 \section{Dataset \& Preprocessing}
 %=============================================================================
 
@@ -802,44 +662,42 @@ Inference time & ms/sample & Efficiency & $< 1$ ms \\
 \section{Ablation Study Design}
 %=============================================================================
 
-\subsection{Tier 0: Must-Have Ablations (Main Paper --- TCN Pipeline)}
+\subsection{Tier 0: Must-Have Ablations (Main Paper)}
 
 \begin{table}[h]
 \centering
-\caption{Tier 0 TCN Ablation Matrix (3 seeds each)}
+\caption{Tier 0 Ablation Matrix (3 seeds each)}
 \begin{tabular}{llp{6cm}}
 \toprule
 \textbf{ID} & \textbf{Configuration} & \textbf{Tests Claim} \\
 \midrule
-T0-1 & Dilated TCN, no attention & \textbf{Main model} (best configuration) \\
-T0-2 & Standard Conv, no attention & Effect of causality \\
-T0-3 & Pointwise (1$\times$1), no attention & Position-independent baseline \\
-T0-4 & Dilated TCN WITH attention & Whether attention adds value \\
-T0-5 & Conv WITH attention & Attention on non-causal conv \\
-T0-6 & TCN without dilation & Isolates dilation contribution \\
-T0-7 & No scalars (params only) & Value of scalar conditioning (Voc, Vmpp) \\
-T0-8 & 100k only (no 300k extra) & Data scaling effect \\
-T0-9 & 200 epochs & Convergence / longer training \\
-T0-10 & Batch size 512 & Batch size effect \\
+T0-1 & Main model (full) & Baseline performance \\
+T0-2 & No split (single spline) & Why split at MPP matters \\
+T0-3 & No anchors (direct 45-out) & Why anchoring helps FF \\
+T0-4 & No projection & Hard constraints prevent violations \\
+T0-5 & No physics features (raw 31) & Value of feature engineering \\
+T0-6 & CVAE baseline & Structured vs generative \\
+T0-7 & Direct MLP baseline & vs end-to-end black box \\
 \midrule
-\multicolumn{3}{l}{\textbf{Total: 10 configs $\times$ 3 seeds = 30 runs}} \\
+\multicolumn{3}{l}{\textbf{Total: 7 configs $\times$ 3 seeds = 21 runs}} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Tier 1: Extended Sweeps (Appendix)}
+\subsection{Tier 1: Strongly Recommended (Appendix)}
 
 \begin{table}[h]
 \centering
-\caption{Tier 1 TCN Sweeps (3 seeds each)}
+\caption{Tier 1 Sweeps (3 seeds each)}
 \begin{tabular}{lll}
 \toprule
 \textbf{Sweep} & \textbf{Values} & \textbf{Runs} \\
 \midrule
-Batch size & \{64, 256, 512, 1024\} & 12 \\
-Epochs & \{50, 150, 200\} & 9 \\
+Control points $K$ & \{2, 4, 6, 8\} & 12 \\
+Continuity $\lambda_{cont}$ & \{0, 0.01, 0.1, 0.5, 1.0\} & 15 \\
+Feature count $m$ & \{0, 2, 4, 8, 16, 71\} & 18 \\
 \midrule
-\textbf{Total} & & 21 runs \\
+\textbf{Total} & & 45 runs \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -849,25 +707,23 @@ Epochs & \{50, 150, 200\} & 9 \\
 \begin{itemize}
     \item OOD splits by bandgap regime, thickness regime
     \item Uncertainty calibration (MC-Dropout, ensemble)
-    \item Kernel size ablation: $k \in \{3, 5, 7, 9\}$
-    \item Number of conv blocks: $\{1, 2, 3, 4\}$
-    \item Jacobian sensitivity analysis (via \texttt{tcn\_analysis.py})
+    \item Jacobian weight ablation: $\lambda_{jac} \in \{0, 10^{-5}, 10^{-4}, 10^{-3}\}$
 \end{itemize}
 
 \subsection{Total Experiment Budget}
 
 \begin{table}[h]
 \centering
-\caption{Experiment Budget Summary (TCN Pipeline)}
+\caption{Experiment Budget Summary}
 \begin{tabular}{lcc}
 \toprule
 \textbf{Tier} & \textbf{Runs} & \textbf{Compute Est.} \\
 \midrule
-Tier 0 (must-have) & 30 & $\sim$7 hours (1 GPU) \\
-Tier 1 (recommended) & 21 & $\sim$5 hours (1 GPU) \\
+Tier 0 (must-have) & 21 & $\sim$2 days (24 GPU-hours) \\
+Tier 1 (recommended) & 45 & $\sim$4 days (48 GPU-hours) \\
 Tier 2 (optional) & variable & as time permits \\
 \midrule
-\textbf{Total minimum} & 51 & $\sim$12 GPU-hours \\
+\textbf{Total minimum} & 66 & $\sim$6 days \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -879,35 +735,36 @@ Tier 2 (optional) & variable & as time permits \\
 \subsection{Main Paper Figures (5)}
 
 \begin{enumerate}
-    \item \textbf{Architecture comparison} (\texttt{fig\_architecture\_comparison.pdf}): Bar chart of $R^2$ (mean$\pm$std) across all TCN architecture variants (T0-1 through T0-6). Clearly shows dilated TCN without attention as best.
+    \item \textbf{Method schematic}: Input $\rightarrow$ feature selection $\rightarrow$ backbone $\rightarrow$ heads $\rightarrow$ $\Pi_\mathcal{C}$ $\rightarrow$ split PCHIP $\rightarrow$ curve. Show split at MPP.
 
-    \item \textbf{Error distribution} (\texttt{fig\_error\_distribution.pdf}): Violin/box plot of per-curve MAE across main architectures. Shows tail behavior and robustness.
+    \item \textbf{$R^2$ distribution (violin)}: Main model vs baselines (Direct MLP, CVAE, no-split). Shows tail behavior.
 
-    \item \textbf{J-V overlays (3$\times$3 grid)}: 9 representative curves, true vs predicted, showing best/median/worst reconstruction quality.
+    \item \textbf{J-V overlays (3$\times$3 grid)}: 9 curves, true vs predicted, markers at 45 grid points, anchors marked.
 
-    \item \textbf{Ablation heatmap} (\texttt{fig\_ablation\_heatmap.pdf}): Rows = T0-1 through T0-10. Columns = $R^2$ median, MAE median, Voc error, Isc error. Normalized per column.
+    \item \textbf{Ablation heatmap}: Rows = T0-1 through T0-7. Columns = mean $R^2$, MAPE, violations/1000, ms.
 
-    \item \textbf{Attention impact} (\texttt{fig\_attention\_impact.pdf}): Paired comparison (with/without attention) for TCN and Conv architectures.
+    \item \textbf{Violation learning curve}: Pre-projection violation rate vs epoch (log y-axis). The ``physics learning'' money plot.
 \end{enumerate}
 
 \subsection{Main Paper Tables (2)}
 
 \begin{enumerate}
-    \item \textbf{Table 1} (\texttt{table\_main\_results.tex}): Architecture comparison (mean$\pm$std over 3 seeds): $R^2$, MAE, Voc error, Isc error, inference time.
+    \item \textbf{Table 1}: Baselines comparison (mean$\pm$std over 3 seeds): $R^2$, MAPE, FF MAPE, violations, inference time.
 
-    \item \textbf{Table 2} (\texttt{table\_ablations.tex}): All ablation results (T0-1 through T0-10).
+    \item \textbf{Table 2}: Key ablations (same metrics).
 \end{enumerate}
 
 \subsection{Appendix Figures}
 
 \begin{enumerate}
-    \item Batch size sweep: $R^2$ vs batch size (\texttt{fig\_batch\_size\_sweep.pdf})
-    \item Epoch sweep: $R^2$ vs training epochs (\texttt{fig\_epoch\_sweep.pdf})
-    \item Data scaling: 100k vs 100k+300k (\texttt{fig\_data\_scaling.pdf})
-    \item Runtime comparison across architectures (\texttt{fig\_runtime\_comparison.pdf})
-    \item Jacobian sensitivity heatmap: $|\partial\text{output}/\partial\text{input}|$ (features $\times$ voltage positions)
-    \item Parameter perturbation tornado diagram (top-20 most sensitive parameters)
-    \item Feature importance bar chart (Jacobian-based ranking)
+    \item Non-uniform voltage grid visualization with $\Delta V$ annotations
+    \item Feature selection stability (frequency bar chart across 10 seeds)
+    \item $K$ sweep: $R^2$ vs control points
+    \item $\lambda_{cont}$ sweep: $R^2$ vs continuity weight
+    \item Metric robustness: unweighted vs $\Delta V$-weighted evaluation
+    \item Error concentration: weighted squared error vs $V/V_{oc}$
+    \item CVAE $\beta$ sweep
+    \item Feature importance (SHAP or permutation)
 \end{enumerate}
 
 %=============================================================================
@@ -1022,19 +879,18 @@ Input perturbation test & Low & minutes & TODO \\
 \section{Conclusion}
 %=============================================================================
 
-This document provides comprehensive technical documentation for the physics-constrained J-V curve reconstruction framework. Key contributions:
+This document provides comprehensive technical documentation for the physics-constrained split-spline framework. Key contributions:
 
 \begin{enumerate}
-    \item \textbf{Dilated Causal TCN} (primary model): Significantly outperforms Split-Spline and standard NN approaches. Causal dilated convolutions on 8-point PCHIP voltage slices with Gaussian RBF positional encoding.
-    \item \textbf{Key architectural finding}: Self-attention \textbf{hurts} performance on short (8-point) sequences; dilation provides sufficient receptive field.
-    \item \textbf{Physics-constrained loss}: Monotonicity + convexity + curvature penalties embedded in training.
-    \item \textbf{UnifiedSplitSplineNet} (baseline): Multi-head architecture with anchor prediction and hard physics projection $\Pi_\mathcal{C}$.
-    \item \textbf{$\Delta V$-weighted metrics}: Proper evaluation for non-uniform voltage grid.
-    \item \textbf{71 physics features}: Drift-diffusion-derived feature engineering with train-only selection.
-    \item \textbf{Scalars from external TXT}: Voc/Vmpp loaded from separate files (swappable with predicted values, no data leakage).
+    \item \textbf{UnifiedSplitSplineNet}: Multi-head architecture with joint anchor and control point prediction
+    \item \textbf{Hard physics projection} $\Pi_\mathcal{C}$: Differentiable, guarantees physical validity
+    \item \textbf{PCHIP reconstruction}: Monotonicity-preserving via Fritsch-Carlson slopes
+    \item \textbf{$\Delta V$-weighted metrics}: Proper evaluation for non-uniform voltage grid
+    \item \textbf{71 physics features}: Comprehensive drift-diffusion-derived feature engineering
+    \item \textbf{Train-only selection}: Leak-free reduction to $m \approx 4$ features
 \end{enumerate}
 
-The experiment plan (51 TCN runs + Split-Spline baselines) and figure list provide a clear roadmap for ICML submission. All experiments are compiled into a single SLURM script (\texttt{slurm\_tcn\_master\_pipeline.sh}).
+The experiment plan (66 runs minimum) and figure list provide a clear roadmap for ICML submission.
 
 \appendix
 
