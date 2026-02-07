@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 """
-Physics-Informed Attention-TCN for I-V Curve Reconstruction.
+Physics-Informed Neural Network for I-V Curve Reconstruction.
 
 Adapted from Google Colab notebook for SLURM/CLI execution.
-Accepts external scalar txt files (Voc, Vmpp) as additional input features
-to integrate with the existing preprocessing pipeline.
+All scalar features are loaded exclusively from external txt files
+(no internal scalar computation) so that true scalars can be swapped
+for predicted ones without code changes.
 
-Architecture:
-  - Hybrid Attention-Augmented Temporal Convolutional Network (TCN)
-  - Swappable positional embeddings (Fourier, Clipped Fourier, Gaussian RBF)
-  - Physics-informed loss (MSE, Monotonicity, Convexity, Curvature)
+Architectures (--architecture):
+  tcn       : Causal dilated temporal convolutions (original Colab)
+  conv      : Standard (non-causal) 1D convolutions
+  pointwise : Position-independent 1x1 convolutions
 
 Usage:
   python train_attention_tcn.py \\
       --params LHS_parameters_m.txt --iv iV_m.txt \\
-      --voc-file voc_clean_100k.txt --vmpp-file vmpp_clean_100k.txt \\
-      --output-dir ./lightning_output --run-name TACN-full --seed 42
+      --params-extra LHS_parameters_m_300k.txt --iv-extra iV_m_300k.txt \\
+      --scalar-files voc_clean_100k.txt vmpp_clean_100k.txt \\
+      --scalar-files-extra voc_clean_300k.txt vmpp_clean_300k.txt \\
+      --architecture conv --no-attention \\
+      --output-dir ./lightning_output --run-name Conv-NoAttn --seed 42
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import logging
 import math
 import os
 import typing
-from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -38,7 +42,7 @@ import pytorch_lightning as pl
 from PIL import Image
 from scipy.interpolate import PchipInterpolator
 from sklearn.compose import ColumnTransformer
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -60,6 +64,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+# Use Tensor Cores on Ampere+ GPUs
+torch.set_float32_matmul_precision("medium")
 
 # ──────────────────────────────────────────────────────────────────────────────
 #   CONSTANTS
@@ -83,11 +90,17 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#   DEFAULT CONFIG  (overridden by CLI args)
+#   CONFIG BUILDER
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _resolve_paths(paths: list[str] | None) -> list[str]:
+    """Resolve a list of paths, filtering None."""
+    if not paths:
+        return []
+    return [str(Path(p).resolve()) for p in paths]
+
+
 def build_config(args: argparse.Namespace) -> dict:
-    """Build the full CONFIG dict from CLI arguments."""
     data_dir = str(Path(args.data_dir).resolve())
     return {
         "train": {
@@ -95,7 +108,7 @@ def build_config(args: argparse.Namespace) -> dict:
             "run_name": args.run_name,
         },
         "model": {
-            "param_dim": 34,  # updated during preprocessing
+            "param_dim": 31,  # updated during preprocessing
             "dense_units": [256, 128, 128],
             "filters": [128, 64],
             "kernel": 5,
@@ -104,6 +117,7 @@ def build_config(args: argparse.Namespace) -> dict:
             "embedding_type": "gaussian",
             "gaussian_bands": 18,
             "gaussian_sigma": 0.07749512610240868,
+            "architecture": args.architecture,
             "use_attention": args.use_attention,
             "use_dilated_conv": args.use_dilated,
             "loss_weights": {
@@ -124,8 +138,10 @@ def build_config(args: argparse.Namespace) -> dict:
             "paths": {
                 "params_csv": str(Path(args.params).resolve()),
                 "iv_raw_txt": str(Path(args.iv).resolve()),
-                "voc_txt": str(Path(args.voc_file).resolve()) if args.voc_file else None,
-                "vmpp_txt": str(Path(args.vmpp_file).resolve()) if args.vmpp_file else None,
+                "params_csv_extra": str(Path(args.params_extra).resolve()) if args.params_extra else None,
+                "iv_raw_txt_extra": str(Path(args.iv_extra).resolve()) if args.iv_extra else None,
+                "scalar_files": _resolve_paths(args.scalar_files),
+                "scalar_files_extra": _resolve_paths(args.scalar_files_extra),
                 "output_dir": data_dir,
                 "preprocessed_npz": os.path.join(data_dir, "atcn_preprocessed.npz"),
                 "param_transformer": os.path.join(data_dir, "atcn_param_transformer.joblib"),
@@ -259,6 +275,14 @@ def get_param_transformer(colnames: list[str]) -> ColumnTransformer:
     return ColumnTransformer(transformers, remainder="passthrough")
 
 
+def load_scalar_txt(path: str) -> tuple[str, np.ndarray]:
+    """Load a scalar txt file.  Returns (column_name, values_array)."""
+    with open(path) as f:
+        header = f.readline().strip().strip(",")
+    values = np.loadtxt(path, delimiter=",", skiprows=1)
+    return header, values.ravel()
+
+
 def denormalize(scaled_current, isc):
     if isinstance(scaled_current, torch.Tensor):
         isc = isc.unsqueeze(1)
@@ -380,6 +404,8 @@ class ChannelLayerNorm(nn.Module):
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 
+# --- Architecture: TCN (causal dilated convolutions) ---
+
 class TemporalBlock(nn.Module):
     def __init__(
         self, in_ch: int, out_ch: int, kernel_size: int, dropout: float, dilation: int
@@ -407,6 +433,68 @@ class TemporalBlock(nn.Module):
         return out + res
 
 
+# --- Architecture: Conv (standard non-causal 1D convolutions) ---
+
+class ConvResBlock(nn.Module):
+    """Non-causal 1D convolutional residual block.
+
+    Uses symmetric (same) padding so every position can attend to
+    neighbours in both directions — appropriate for I-V curves where
+    voltage query points have no causal ordering.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float):
+        super().__init__()
+        pad = (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad)
+        self.act1 = nn.GELU()
+        self.norm1 = ChannelLayerNorm(out_ch)
+        self.drop1 = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad)
+        self.act2 = nn.GELU()
+        self.norm2 = ChannelLayerNorm(out_ch)
+        self.drop2 = nn.Dropout(dropout)
+        self.downsample = (
+            nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.downsample(x)
+        out = self.drop1(self.norm1(self.act1(self.conv1(x))))
+        out = self.drop2(self.norm2(self.act2(self.conv2(out))))
+        return out + res
+
+
+# --- Architecture: Pointwise (1x1 convolutions, position-independent) ---
+
+class PointwiseResBlock(nn.Module):
+    """Position-independent residual block using 1x1 convolutions.
+
+    Each voltage query point is processed independently through the
+    feature dimension — no spatial mixing at all.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, dropout: float):
+        super().__init__()
+        self.fc1 = nn.Conv1d(in_ch, out_ch, 1)
+        self.act1 = nn.GELU()
+        self.norm1 = ChannelLayerNorm(out_ch)
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Conv1d(out_ch, out_ch, 1)
+        self.act2 = nn.GELU()
+        self.norm2 = ChannelLayerNorm(out_ch)
+        self.drop2 = nn.Dropout(dropout)
+        self.downsample = (
+            nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.downsample(x)
+        out = self.drop1(self.norm1(self.act1(self.fc1(x))))
+        out = self.drop2(self.norm2(self.act2(self.fc2(out))))
+        return out + res
+
+
 class SelfAttentionBlock(nn.Module):
     def __init__(self, dim: int, heads: int, dropout: float):
         super().__init__()
@@ -430,13 +518,11 @@ class SelfAttentionBlock(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#   DATA & MODEL MODULES
+#   DATA MODULES
 # ──────────────────────────────────────────────────────────────────────────────
 
 class IVDataset(Dataset):
     def __init__(self, cfg: dict, split: str, param_tf, scalar_tf):
-        self.cfg = cfg
-        self.split = split
         paths = cfg["dataset"]["paths"]
         data = np.load(paths["preprocessed_npz"], allow_pickle=True)
         split_labels = data["split_labels"]
@@ -446,30 +532,32 @@ class IVDataset(Dataset):
         self.i_slices = torch.from_numpy(data["i_slices"][indices])
         self.i_slices_scaled = torch.from_numpy(data["i_slices_scaled"][indices])
         self.sample_weights = torch.from_numpy(data["sample_weights"][indices])
+        self.isc_vals = torch.from_numpy(data["isc_vals"][indices])
 
+        # Device parameters
         params_df = pd.read_csv(
             paths["params_csv"], header=None, names=COLNAMES
         )
+        if paths.get("params_csv_extra") and Path(paths["params_csv_extra"]).exists():
+            params_df_extra = pd.read_csv(
+                paths["params_csv_extra"], header=None, names=COLNAMES
+            )
+            params_df = pd.concat([params_df, params_df_extra], ignore_index=True)
         params_df_valid = params_df.iloc[data["valid_indices"]].reset_index(drop=True)
+        X_params = param_tf.transform(params_df_valid).astype(np.float32)
 
-        # Build scalar dataframe: internal scalars + external txt scalars
-        scalar_dict: dict[str, np.ndarray] = {
-            "I_ref": data["i_slices"][:, 0],
-            "V_mpp": data["v_slices"][:, 3],
-            "I_mpp": data["i_slices"][:, 3],
-        }
-        if "ext_voc" in data:
-            scalar_dict["ext_Voc"] = data["ext_voc"]
-        if "ext_vmpp" in data:
-            scalar_dict["ext_Vmpp"] = data["ext_vmpp"]
-        scalar_df = pd.DataFrame(scalar_dict)
-
-        X_params_full = param_tf.transform(params_df_valid).astype(np.float32)
-        X_scalar_full = scalar_tf.transform(scalar_df).astype(np.float32)
-        X_combined = np.concatenate([X_params_full, X_scalar_full], axis=1)
+        # Scalar features from txt files (NO internal computation)
+        scalar_names = list(data["scalar_names"]) if "scalar_names" in data else []
+        if scalar_names:
+            scalar_data = data["scalar_data"].astype(np.float32)
+            X_scalar = scalar_tf.transform(
+                pd.DataFrame(scalar_data, columns=scalar_names)
+            ).astype(np.float32)
+            X_combined = np.concatenate([X_params, X_scalar], axis=1)
+        else:
+            X_combined = X_params
 
         self.X = torch.from_numpy(X_combined[indices])
-        self.isc_vals = torch.from_numpy(data["isc_vals"][indices])
 
     def __len__(self):
         return len(self.v_slices)
@@ -505,30 +593,38 @@ class IVDataModule(pl.LightningDataModule):
             self.param_tf = joblib.load(
                 self.cfg["dataset"]["paths"]["param_transformer"]
             )
-            self.scalar_tf = joblib.load(
-                self.cfg["dataset"]["paths"]["scalar_transformer"]
-            )
-            # Infer actual param_dim from saved transformers so the model
-            # is sized correctly even when using cached preprocessed data.
+            # Infer param_dim from saved transformers + cached scalar count
             data = np.load(
                 self.cfg["dataset"]["paths"]["preprocessed_npz"], allow_pickle=True
             )
             params_df = pd.read_csv(
                 self.cfg["dataset"]["paths"]["params_csv"], header=None, names=COLNAMES
             )
+            if (self.cfg["dataset"]["paths"].get("params_csv_extra")
+                    and Path(self.cfg["dataset"]["paths"]["params_csv_extra"]).exists()):
+                params_df_extra = pd.read_csv(
+                    self.cfg["dataset"]["paths"]["params_csv_extra"],
+                    header=None, names=COLNAMES,
+                )
+                params_df = pd.concat([params_df, params_df_extra], ignore_index=True)
             params_df_valid = params_df.iloc[data["valid_indices"]].reset_index(drop=True)
             param_dim = self.param_tf.transform(params_df_valid[:1]).shape[1]
-            scalar_cols = ["I_ref", "V_mpp", "I_mpp"]
-            if "ext_voc" in data:
-                scalar_cols.append("ext_Voc")
-            if "ext_vmpp" in data:
-                scalar_cols.append("ext_Vmpp")
-            scalar_dim = len(scalar_cols)
+
+            scalar_names = list(data["scalar_names"]) if "scalar_names" in data else []
+            scalar_dim = len(scalar_names)
+            if scalar_dim > 0:
+                self.scalar_tf = joblib.load(
+                    self.cfg["dataset"]["paths"]["scalar_transformer"]
+                )
+            else:
+                self.scalar_tf = None
+
             self.cfg["model"]["param_dim"] = param_dim + scalar_dim
             log.info(
                 f"Inferred param_dim from cache: {param_dim + scalar_dim} "
-                f"({param_dim} params + {scalar_dim} scalars)"
+                f"({param_dim} device params + {scalar_dim} scalars: {scalar_names})"
             )
+
         if stage == "fit" or stage is None:
             self.train_dataset = IVDataset(
                 self.cfg, "train", self.param_tf, self.scalar_tf
@@ -559,8 +655,23 @@ class IVDataModule(pl.LightningDataModule):
         paths = cfg["dataset"]["paths"]
         pchip_cfg = cfg["dataset"]["pchip"]
 
+        # ── Load & concatenate primary + extra datasets ──
         params_df = pd.read_csv(paths["params_csv"], header=None, names=COLNAMES)
         iv_data_raw = np.loadtxt(paths["iv_raw_txt"], delimiter=",")
+        n_primary = len(iv_data_raw)
+
+        if paths.get("params_csv_extra") and paths.get("iv_raw_txt_extra"):
+            log.info("Loading extra (300k) dataset...")
+            params_df_extra = pd.read_csv(
+                paths["params_csv_extra"], header=None, names=COLNAMES
+            )
+            iv_extra = np.loadtxt(paths["iv_raw_txt_extra"], delimiter=",")
+            params_df = pd.concat([params_df, params_df_extra], ignore_index=True)
+            iv_data_raw = np.vstack([iv_data_raw, iv_extra])
+            log.info(
+                f"Combined dataset: {n_primary} + {len(iv_extra)} = {len(iv_data_raw)}"
+            )
+            del iv_extra, params_df_extra
 
         full_v_grid = np.concatenate([
             np.arange(0, 0.4 + 1e-8, 0.1),
@@ -568,20 +679,15 @@ class IVDataModule(pl.LightningDataModule):
         ]).astype(np.float32)
 
         N_raw = len(iv_data_raw)
-        log.info(f"Raw dataset size: {N_raw}")
-
+        log.info(f"Total raw dataset size: {N_raw}")
         Path(paths["output_dir"]).mkdir(parents=True, exist_ok=True)
 
         v_fine_mm = np.memmap(
-            paths["v_fine_memmap"],
-            dtype=np.float16,
-            mode="w+",
+            paths["v_fine_memmap"], dtype=np.float16, mode="w+",
             shape=(N_raw, pchip_cfg["n_fine"]),
         )
         i_fine_mm = np.memmap(
-            paths["i_fine_memmap"],
-            dtype=np.float16,
-            mode="w+",
+            paths["i_fine_memmap"], dtype=np.float16, mode="w+",
             shape=(N_raw, pchip_cfg["n_fine"]),
         )
         v_fine_mm[:] = np.nan
@@ -595,7 +701,6 @@ class IVDataModule(pl.LightningDataModule):
             pchip_cfg["v_max"],
             pchip_cfg["n_fine"],
         )
-
         for i in tqdm(range(N_raw), desc="PCHIP processing"):
             res = process_iv_with_pchip(iv_data_raw[i], *pchip_args)
             if res is not None and res[1][0] > 1e-9:
@@ -611,7 +716,7 @@ class IVDataModule(pl.LightningDataModule):
         del v_fine_mm, i_fine_mm
 
         log.info(
-            f"Retained {len(valid_indices)} / {N_raw} valid curves after PCHIP filtering."
+            f"Retained {len(valid_indices)} / {N_raw} valid curves after PCHIP."
         )
         if not valid_indices:
             raise RuntimeError("No valid curves found after preprocessing.")
@@ -629,51 +734,60 @@ class IVDataModule(pl.LightningDataModule):
             i_slices_scaled, **cfg["dataset"]["curvature_weighting"]
         )
 
-        # Fit parameter transformer
+        # ── Fit parameter transformer ──
         params_df_valid = params_df.iloc[valid_indices].reset_index(drop=True)
         param_transformer = get_param_transformer(COLNAMES)
         param_transformer.fit(params_df_valid)
         joblib.dump(param_transformer, paths["param_transformer"])
-
-        # Build scalar features: internal + external txt scalars
-        scalar_dict: dict[str, np.ndarray] = {
-            "I_ref": i_slices[:, 0],
-            "V_mpp": v_slices[:, pchip_cfg["n_pre_mpp"]],
-            "I_mpp": i_slices[:, pchip_cfg["n_pre_mpp"]],
-        }
-
-        save_extras: dict[str, np.ndarray] = {}
-
-        if paths.get("voc_txt"):
-            log.info(f"Loading external Voc from: {paths['voc_txt']}")
-            voc_all = np.loadtxt(paths["voc_txt"], delimiter=",", skiprows=1)
-            voc_valid = voc_all[valid_indices]
-            scalar_dict["ext_Voc"] = voc_valid
-            save_extras["ext_voc"] = voc_valid
-
-        if paths.get("vmpp_txt"):
-            log.info(f"Loading external Vmpp from: {paths['vmpp_txt']}")
-            vmpp_all = np.loadtxt(paths["vmpp_txt"], delimiter=",", skiprows=1)
-            vmpp_valid = vmpp_all[valid_indices]
-            scalar_dict["ext_Vmpp"] = vmpp_valid
-            save_extras["ext_vmpp"] = vmpp_valid
-
-        scalar_df = pd.DataFrame(scalar_dict)
-        scalar_transformer = Pipeline([
-            ("scaler", MinMaxScaler(feature_range=(-1, 1)))
-        ])
-        scalar_transformer.fit(scalar_df)
-        joblib.dump(scalar_transformer, paths["scalar_transformer"])
-
         param_dim = param_transformer.transform(params_df_valid).shape[1]
-        scalar_dim = scalar_transformer.transform(scalar_df).shape[1]
+
+        # ── Load scalar features exclusively from txt files ──
+        scalar_files = paths.get("scalar_files", [])
+        scalar_files_extra = paths.get("scalar_files_extra", [])
+        scalar_names: list[str] = []
+        scalar_columns: list[np.ndarray] = []
+
+        if scalar_files:
+            for sf, sf_extra in zip(scalar_files, scalar_files_extra or [None] * len(scalar_files)):
+                name, vals_primary = load_scalar_txt(sf)
+                if sf_extra:
+                    _, vals_extra = load_scalar_txt(sf_extra)
+                    vals_all = np.concatenate([vals_primary, vals_extra])
+                else:
+                    vals_all = vals_primary
+                if len(vals_all) < N_raw:
+                    log.warning(
+                        f"Scalar file '{name}' has {len(vals_all)} rows but "
+                        f"expected {N_raw}. Padding with NaN."
+                    )
+                    vals_all = np.pad(
+                        vals_all, (0, N_raw - len(vals_all)),
+                        constant_values=np.nan,
+                    )
+                scalar_names.append(name)
+                scalar_columns.append(vals_all[valid_indices])
+
+        scalar_dim = len(scalar_names)
+        if scalar_dim > 0:
+            scalar_data = np.column_stack(scalar_columns).astype(np.float32)
+            scalar_df = pd.DataFrame(scalar_data, columns=scalar_names)
+            scalar_transformer = Pipeline([
+                ("scaler", MinMaxScaler(feature_range=(-1, 1)))
+            ])
+            scalar_transformer.fit(scalar_df)
+            joblib.dump(scalar_transformer, paths["scalar_transformer"])
+            log.info(f"Scalar features from txt: {scalar_names}")
+        else:
+            scalar_data = np.empty((len(valid_indices), 0), dtype=np.float32)
+            log.info("No scalar files provided. Using device parameters only.")
+
         self.cfg["model"]["param_dim"] = param_dim + scalar_dim
         log.info(
-            f"Total input dimension: {self.cfg['model']['param_dim']} "
-            f"({param_dim} params + {scalar_dim} scalars)"
+            f"Total input dimension: {param_dim + scalar_dim} "
+            f"({param_dim} device params + {scalar_dim} scalars)"
         )
 
-        # Train / val / test split
+        # ── Train / val / test split ──
         all_idx = np.arange(len(valid_indices))
         train_val_idx, test_idx = train_test_split(
             all_idx, test_size=0.2, random_state=cfg["train"]["seed"]
@@ -686,7 +800,8 @@ class IVDataModule(pl.LightningDataModule):
         split_labels[val_idx] = "val"
         split_labels[test_idx] = "test"
 
-        save_kwargs = dict(
+        np.savez(
+            paths["preprocessed_npz"],
             v_slices=v_slices,
             i_slices=i_slices,
             i_slices_scaled=i_slices_scaled,
@@ -694,9 +809,9 @@ class IVDataModule(pl.LightningDataModule):
             isc_vals=isc_vals,
             valid_indices=valid_indices,
             split_labels=split_labels,
-            **save_extras,
+            scalar_names=np.array(scalar_names),
+            scalar_data=scalar_data,
         )
-        np.savez(paths["preprocessed_npz"], **save_kwargs)
         log.info(f"Saved preprocessed data to {paths['preprocessed_npz']}")
 
 
@@ -713,7 +828,7 @@ class PhysicsIVSystem(pl.LightningModule):
         self.hparams.total_steps = total_steps
         mcfg = self.hparams.model
 
-        # Parameter MLP
+        # ── Parameter MLP ──
         mlp_layers = []
         in_dim = mcfg["param_dim"]
         for units in mcfg["dense_units"]:
@@ -726,7 +841,7 @@ class PhysicsIVSystem(pl.LightningModule):
             in_dim = units
         self.param_mlp = nn.Sequential(*mlp_layers)
 
-        # Positional embedding
+        # ── Positional embedding ──
         self.pos_embed = make_positional_embedding(self.hparams)
         seq_input_dim = mcfg["dense_units"][-1] + self.pos_embed.out_dim
 
@@ -734,24 +849,38 @@ class PhysicsIVSystem(pl.LightningModule):
         kernel = mcfg["kernel"]
         dropout = mcfg["dropout"]
         heads = mcfg["heads"]
+        arch = mcfg["architecture"]
 
-        dilation1 = 2 ** 0 if mcfg["use_dilated_conv"] else 1
-        dilation2 = 2 ** 1 if mcfg["use_dilated_conv"] else 1
+        # ── Build backbone blocks based on architecture choice ──
+        if arch == "tcn":
+            d1 = 2 ** 0 if mcfg["use_dilated_conv"] else 1
+            d2 = 2 ** 1 if mcfg["use_dilated_conv"] else 1
+            self.block1 = TemporalBlock(seq_input_dim, filters[0], kernel, dropout, dilation=d1)
+            if mcfg["use_attention"]:
+                self.block2 = SelfAttentionBlock(filters[0], heads, dropout)
+            else:
+                self.block2 = TemporalBlock(filters[0], filters[0], kernel, dropout, dilation=d1)
+            self.block3 = TemporalBlock(filters[0], filters[1], kernel, dropout, dilation=d2)
 
-        self.tcn1 = TemporalBlock(
-            seq_input_dim, filters[0], kernel, dropout, dilation=dilation1
-        )
+        elif arch == "conv":
+            self.block1 = ConvResBlock(seq_input_dim, filters[0], kernel, dropout)
+            if mcfg["use_attention"]:
+                self.block2 = SelfAttentionBlock(filters[0], heads, dropout)
+            else:
+                self.block2 = ConvResBlock(filters[0], filters[0], kernel, dropout)
+            self.block3 = ConvResBlock(filters[0], filters[1], kernel, dropout)
 
-        if mcfg["use_attention"]:
-            self.context_block = SelfAttentionBlock(filters[0], heads, dropout)
+        elif arch == "pointwise":
+            self.block1 = PointwiseResBlock(seq_input_dim, filters[0], dropout)
+            if mcfg["use_attention"]:
+                self.block2 = SelfAttentionBlock(filters[0], heads, dropout)
+            else:
+                self.block2 = PointwiseResBlock(filters[0], filters[0], dropout)
+            self.block3 = PointwiseResBlock(filters[0], filters[1], dropout)
+
         else:
-            self.context_block = TemporalBlock(
-                filters[0], filters[0], kernel, dropout, dilation=dilation1
-            )
+            raise ValueError(f"Unknown architecture: {arch}")
 
-        self.tcn2 = TemporalBlock(
-            filters[0], filters[1], kernel, dropout, dilation=dilation2
-        )
         self.out_head = nn.Linear(filters[1], 1)
         self.apply(self._init_weights)
 
@@ -759,7 +888,6 @@ class PhysicsIVSystem(pl.LightningModule):
         self.test_preds: list = []
         self.test_trues: list = []
         self.test_v_slices: list = []
-        self.test_i_trues: list = []
         self.all_test_preds_np = None
         self.all_test_trues_np = None
         self.all_test_v_slices_np = None
@@ -777,9 +905,9 @@ class PhysicsIVSystem(pl.LightningModule):
         v_emb = self.pos_embed(voltage)
         p_rep = p.unsqueeze(1).expand(-1, L, -1)
         x = torch.cat([p_rep, v_emb], dim=-1).transpose(1, 2)
-        x = self.tcn1(x)
-        x = self.context_block(x)
-        x = self.tcn2(x).transpose(1, 2)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x).transpose(1, 2)
         return self.out_head(x).squeeze(-1)
 
     def _step(self, batch, stage: str):
@@ -792,16 +920,13 @@ class PhysicsIVSystem(pl.LightningModule):
         )
         self.log_dict(
             {f"{stage}_{k}": v for k, v in comps.items()},
-            on_step=False,
-            on_epoch=True,
+            on_step=False, on_epoch=True,
             batch_size=len(batch["voltage"]),
         )
         self.log(
-            f"{stage}_loss",
-            loss,
+            f"{stage}_loss", loss,
             prog_bar=(stage == "val"),
-            on_step=False,
-            on_epoch=True,
+            on_step=False, on_epoch=True,
             batch_size=len(batch["voltage"]),
         )
         return loss
@@ -818,13 +943,12 @@ class PhysicsIVSystem(pl.LightningModule):
         self.test_trues.append(batch["i_true_slice"].cpu())
         self.test_v_slices.append(batch["v_true_slice"].cpu())
         loss, _ = physics_loss(
-            pred_scaled,
-            batch["current_scaled"],
-            batch["sample_w"],
+            pred_scaled, batch["current_scaled"], batch["sample_w"],
             self.hparams.model["loss_weights"],
         )
         self.log(
-            "test_loss", loss, on_step=False, on_epoch=True, batch_size=len(batch["voltage"])
+            "test_loss", loss, on_step=False, on_epoch=True,
+            batch_size=len(batch["voltage"]),
         )
 
     def on_test_epoch_start(self):
@@ -853,9 +977,7 @@ class PhysicsIVSystem(pl.LightningModule):
         if not np.any(valid_mask):
             return {"error": 1.0}
         preds, trues, v_slices = (
-            preds[valid_mask],
-            trues[valid_mask],
-            v_slices[valid_mask],
+            preds[valid_mask], trues[valid_mask], v_slices[valid_mask],
         )
         per_curve_mae = np.mean(np.abs(preds - trues), axis=1)
         per_curve_rmse = np.sqrt(np.mean((preds - trues) ** 2, axis=1))
@@ -864,14 +986,14 @@ class PhysicsIVSystem(pl.LightningModule):
             r2_score(trues[i], preds[i]) if var_mask[i] else -1.0
             for i in range(len(trues))
         ])
-        for name, data in [
+        for name, arr in [
             ("mae", per_curve_mae),
             ("rmse", per_curve_rmse),
             ("r2", per_curve_r2[var_mask]),
         ]:
-            stats[f"{name}_mean"] = np.mean(data)
-            stats[f"{name}_std"] = np.std(data)
-            stats[f"{name}_median"] = np.median(data)
+            stats[f"{name}_mean"] = np.mean(arr)
+            stats[f"{name}_std"] = np.std(arr)
+            stats[f"{name}_median"] = np.median(arr)
 
         isc_true, isc_pred = trues[:, 0], preds[:, 0]
         stats["isc_error_abs_mean"] = np.mean(np.abs(isc_true - isc_pred))
@@ -932,9 +1054,7 @@ class ExamplePlotsCallback(pl.Callback):
 
         preds = pl_module.all_test_preds_np
         trues = pl_module.all_test_trues_np
-        valid_mask = [
-            i for i in range(len(trues)) if np.var(trues[i]) > 1e-6
-        ]
+        valid_mask = [i for i in range(len(trues)) if np.var(trues[i]) > 1e-6]
         if not valid_mask:
             return
 
@@ -992,7 +1112,8 @@ class ExamplePlotsCallback(pl.Callback):
         n_samples = len(indices)
         nrows, ncols = (n_samples + 3) // 4, 4
         fig, axes = plt.subplots(
-            nrows, ncols, figsize=(20, 5 * nrows), squeeze=False, constrained_layout=True
+            nrows, ncols, figsize=(20, 5 * nrows),
+            squeeze=False, constrained_layout=True,
         )
         fig.suptitle(title.replace("_", " "), fontsize=20, weight="bold")
 
@@ -1069,16 +1190,14 @@ def run_experiment(cfg: dict) -> dict:
         total_steps=total_steps,
     )
     log.info(
-        f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters"
+        f"Model [{cfg['model']['architecture']}]: "
+        f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters"
     )
 
     run_dir = output_dir / run_name
     checkpoint_cb = ModelCheckpoint(
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        dirpath=run_dir / "checkpoints",
-        filename="best-model",
+        monitor="val_loss", mode="min", save_top_k=1,
+        dirpath=run_dir / "checkpoints", filename="best-model",
     )
     logger = TensorBoardLogger(str(output_dir / "tb_logs"), name=run_name)
 
@@ -1101,22 +1220,22 @@ def run_experiment(cfg: dict) -> dict:
     log.info("--- Testing on Best Checkpoint ---")
     best_ckpt = trainer.checkpoint_callback.best_model_path
     trainer.test(
-        model,
-        datamodule=datamodule,
+        model, datamodule=datamodule,
         ckpt_path=best_ckpt if best_ckpt and Path(best_ckpt).exists() else None,
     )
 
     final_stats = model.all_test_stats or {}
     final_stats["run_name"] = run_name
+    final_stats["architecture"] = cfg["model"]["architecture"]
 
-    # Save stats as JSON
-    import json
     stats_path = run_dir / "test_stats.json"
     with open(stats_path, "w") as f:
-        json.dump({k: float(v) if isinstance(v, (np.floating, float)) else v
-                    for k, v in final_stats.items()}, f, indent=2)
+        json.dump(
+            {k: float(v) if isinstance(v, (np.floating, float)) else v
+             for k, v in final_stats.items()},
+            f, indent=2,
+        )
     log.info(f"Saved test stats to {stats_path}")
-
     log.info(f"--- Experiment Finished: {run_name} ---")
     return final_stats
 
@@ -1169,67 +1288,66 @@ def generate_summary_plots(results: list[dict], output_dir: Path):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Attention-TCN I-V Curve Reconstruction (SLURM/CLI)",
+        description="Physics-Informed I-V Curve Reconstruction (SLURM/CLI)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # Data paths
+    # ── Data paths ──
     p.add_argument("--params", required=True, help="Path to LHS_parameters_m.txt")
     p.add_argument("--iv", required=True, help="Path to IV curves txt file")
-    p.add_argument("--voc-file", default=None, help="External Voc scalar txt file")
-    p.add_argument("--vmpp-file", default=None, help="External Vmpp scalar txt file")
+    p.add_argument("--params-extra", default=None, help="Extra params file (e.g. 300k)")
+    p.add_argument("--iv-extra", default=None, help="Extra IV file (e.g. 300k)")
+    p.add_argument(
+        "--scalar-files", nargs="*", default=None,
+        help="Scalar txt files for primary data (e.g. voc_100k.txt vmpp_100k.txt)",
+    )
+    p.add_argument(
+        "--scalar-files-extra", nargs="*", default=None,
+        help="Scalar txt files for extra data (must match --scalar-files order)",
+    )
 
-    # Output
+    # ── Output ──
     p.add_argument("--output-dir", default="./lightning_output", help="Output root")
     p.add_argument(
-        "--data-dir",
-        default="./data/atcn_processed",
+        "--data-dir", default="./data/atcn_processed",
         help="Directory for preprocessed data cache",
     )
 
-    # Experiment
+    # ── Experiment ──
     p.add_argument("--run-name", default="TACN-full", help="Experiment run name")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # Architecture flags
+    # ── Architecture ──
     p.add_argument(
-        "--use-attention",
-        action="store_true",
-        default=True,
+        "--architecture", choices=["tcn", "conv", "pointwise"], default="conv",
+        help="Backbone architecture: tcn (causal dilated), conv (non-causal 1D), pointwise (1x1)",
+    )
+    p.add_argument(
+        "--use-attention", action="store_true", default=True,
         help="Enable self-attention block",
     )
     p.add_argument(
-        "--no-attention",
-        dest="use_attention",
-        action="store_false",
-        help="Disable self-attention (replace with TCN block)",
+        "--no-attention", dest="use_attention", action="store_false",
+        help="Disable self-attention",
     )
     p.add_argument(
-        "--use-dilated",
-        action="store_true",
-        default=True,
-        help="Enable dilated convolutions",
+        "--use-dilated", action="store_true", default=True,
+        help="Enable dilated convolutions (TCN architecture only)",
     )
     p.add_argument(
-        "--no-dilated",
-        dest="use_dilated",
-        action="store_false",
-        help="Disable dilated convolutions (dilation=1)",
+        "--no-dilated", dest="use_dilated", action="store_false",
+        help="Disable dilated convolutions",
     )
 
-    # Training
+    # ── Training ──
     p.add_argument("--max-epochs", type=int, default=100, help="Maximum epochs")
     p.add_argument("--batch-size", type=int, default=128, help="Batch size")
     p.add_argument(
-        "--num-workers",
-        type=int,
+        "--num-workers", type=int,
         default=max(1, (os.cpu_count() or 2) // 2),
         help="DataLoader workers",
     )
-
-    # Force re-preprocessing
     p.add_argument(
-        "--force-preprocess",
-        action="store_true",
+        "--force-preprocess", action="store_true",
         help="Delete cached preprocessed data and re-run",
     )
 

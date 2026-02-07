@@ -12,20 +12,16 @@
 # ============================================================================
 # ATTENTION-TCN I-V RECONSTRUCTION PIPELINE
 # ============================================================================
-# Parallel pipeline to slurm_master_pipeline.sh for the Attention-TCN model.
-# Uses the same preprocessed scalar txt files (Voc, Vmpp) as additional
-# input features alongside the 31 device parameters.
+# Parallel pipeline to slurm_master_pipeline.sh.
+# Trains 1 architecture variant × 1 seed = 1 run on 100k+300k data.
+# All scalar features loaded from external txt files (no data leakage).
 #
-# Experiments (4 architecture configs × 3 seeds = 12 runs):
-#   TACN-full:          Dilated Conv + Self-Attention (full model)
-#   TACN-no-attention:  Dilated Conv only (no attention block)
-#   TACN-no-dilated:    Self-Attention only (dilation=1)
-#   TACN-plain:         Plain TCN (no attention, no dilation)
+# Experiments:
+#   Conv-Dilated-NoAttn     : Non-causal 1D conv with dilation (no TCN)
 #
 # Usage:
-#   sbatch slurm_attention_tcn_pipeline.sh                     # Full pipeline
+#   sbatch slurm_attention_tcn_pipeline.sh
 #   sbatch slurm_attention_tcn_pipeline.sh --skip-preprocessing
-#   sbatch slurm_attention_tcn_pipeline.sh --experiments-only
 #   sbatch slurm_attention_tcn_pipeline.sh --dry-run
 # ============================================================================
 
@@ -62,7 +58,7 @@ OUTPUT_BASE="$WORK_DIR/outputs/atcn_experiments_$(date +%Y%m%d)"
 ATCN_DATA_DIR="$OUTPUT_BASE/atcn_processed"
 LOGS_DIR="$WORK_DIR/logs"
 
-# Raw data files
+# Raw data files (100k + 300k)
 PARAMS_PRIMARY="$WORK_DIR/LHS_parameters_m.txt"
 IV_PRIMARY="$WORK_DIR/IV_m.txt"
 PARAMS_EXTRA="$WORK_DIR/LHS_parameters_m_300k.txt"
@@ -115,19 +111,19 @@ TIMING_LOG="$OUTPUT_BASE/timing.log"
 echo "ATCN Pipeline started: $(date)" > $TIMING_LOG
 
 # ============================================================================
-# STEP 1: DATA PREPROCESSING (shared with master pipeline)
+# STEP 1: DATA PREPROCESSING (100k + 300k)
 # ============================================================================
 
 if [ "$SKIP_PREPROCESSING" = false ]; then
     echo ""
     echo "=============================================="
-    echo "STEP 1: Data Preprocessing"
+    echo "STEP 1: Data Preprocessing (100k + 300k)"
     echo "=============================================="
     STEP_START=$(date +%s)
 
     mkdir -p $PREPROCESS_DIR
 
-    # Preprocess primary dataset (100k)
+    # --- 100k dataset ---
     echo "Processing primary dataset (100k)..."
     python scripts/preprocess_data.py \
         --params "$PARAMS_PRIMARY" \
@@ -137,12 +133,27 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
         --min-vmpp $MIN_VMPP \
         --suffix "_clean"
 
-    # Generate scalar txt files (Voc, Vmpp)
-    echo "Generating scalar txt files..."
+    echo "Generating scalar txt files (100k)..."
     python scripts/generate_scalar_txt.py \
         --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
         --output-dir "$PREPROCESS_DIR" \
         --tag 100k --suffix "_clean"
+
+    # --- 300k dataset ---
+    echo "Processing extra dataset (300k)..."
+    python scripts/preprocess_data.py \
+        --params "$PARAMS_EXTRA" \
+        --iv "$IV_EXTRA" \
+        --output-dir "$PREPROCESS_DIR" \
+        --min-ff $MIN_FF \
+        --min-vmpp $MIN_VMPP \
+        --suffix "_clean"
+
+    echo "Generating scalar txt files (300k)..."
+    python scripts/generate_scalar_txt.py \
+        --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
+        --output-dir "$PREPROCESS_DIR" \
+        --tag 300k --suffix "_clean"
 
     STEP_END=$(date +%s)
     echo "Preprocessing time: $((STEP_END - STEP_START))s" >> $TIMING_LOG
@@ -152,15 +163,22 @@ fi
 # Preprocessed data paths
 PARAMS_CLEAN="$PREPROCESS_DIR/LHS_parameters_m_clean.txt"
 IV_CLEAN="$PREPROCESS_DIR/IV_m_clean.txt"
-VOC_FILE="$PREPROCESS_DIR/voc_clean_100k.txt"
-VMPP_FILE="$PREPROCESS_DIR/vmpp_clean_100k.txt"
+PARAMS_EXTRA_CLEAN="$PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
+IV_EXTRA_CLEAN="$PREPROCESS_DIR/IV_m_300k_clean.txt"
+
+# Scalar txt files (true scalars from preprocessing)
+VOC_100K="$PREPROCESS_DIR/voc_clean_100k.txt"
+VMPP_100K="$PREPROCESS_DIR/vmpp_clean_100k.txt"
+VOC_300K="$PREPROCESS_DIR/voc_clean_300k.txt"
+VMPP_300K="$PREPROCESS_DIR/vmpp_clean_300k.txt"
 
 # Verify input files exist
 echo ""
 echo "Input files:"
-for f in "$PARAMS_CLEAN" "$IV_CLEAN" "$VOC_FILE" "$VMPP_FILE"; do
+for f in "$PARAMS_CLEAN" "$IV_CLEAN" "$PARAMS_EXTRA_CLEAN" "$IV_EXTRA_CLEAN" \
+         "$VOC_100K" "$VMPP_100K" "$VOC_300K" "$VMPP_300K"; do
     if [ -f "$f" ]; then
-        echo "  [OK] $f ($(wc -l < "$f") lines)"
+        echo "  [OK] $(basename $f) ($(wc -l < "$f") lines)"
     else
         echo "  [MISSING] $f"
         if [ "$DRY_RUN" = false ]; then
@@ -171,30 +189,30 @@ for f in "$PARAMS_CLEAN" "$IV_CLEAN" "$VOC_FILE" "$VMPP_FILE"; do
 done
 
 # ============================================================================
-# STEP 2: ATTENTION-TCN EXPERIMENTS (4 configs × 3 seeds)
+# STEP 2: ARCHITECTURE EXPERIMENTS (1 arch × 1 seed = 1 run)
 # ============================================================================
 
 echo ""
 echo "=============================================="
-echo "STEP 2: Attention-TCN Experiments"
+echo "STEP 2: Architecture Experiments"
 echo "=============================================="
 STEP_START=$(date +%s)
 
-# Define architecture ablation experiments
+# All experiments share the same preprocessed PCHIP cache (same seed → same split).
+# Only the model architecture differs, so we can reuse one data cache per seed.
+
+# Define experiments: NAME -> FLAGS
 declare -A EXP_FLAGS
-EXP_FLAGS["TACN-full"]="--use-attention --use-dilated"
-EXP_FLAGS["TACN-no-attention"]="--no-attention --use-dilated"
-EXP_FLAGS["TACN-no-dilated"]="--use-attention --no-dilated"
-EXP_FLAGS["TACN-plain"]="--no-attention --no-dilated"
+EXP_FLAGS["Conv-Dilated-NoAttn"]="--architecture conv --no-attention --use-dilated"
 
 RESULTS_DIR="$OUTPUT_BASE/results"
 mkdir -p "$RESULTS_DIR"
 
-for EXP_ID in "TACN-full" "TACN-no-attention" "TACN-no-dilated" "TACN-plain"; do
+for EXP_ID in "Conv-Dilated-NoAttn"; do
     for SEED in "${SEEDS[@]}"; do
         RUN_NAME="${EXP_ID}_seed${SEED}"
         EXP_OUT="$OUTPUT_BASE/$EXP_ID/seed_$SEED"
-        EXP_DATA="$ATCN_DATA_DIR/${EXP_ID}_seed${SEED}"
+        EXP_DATA="$ATCN_DATA_DIR/seed_${SEED}"
         mkdir -p "$EXP_OUT" "$EXP_DATA"
 
         echo ""
@@ -203,13 +221,15 @@ for EXP_ID in "TACN-full" "TACN-no-attention" "TACN-no-dilated" "TACN-plain"; do
         echo "  Flags:  ${EXP_FLAGS[$EXP_ID]}"
 
         if [ "$DRY_RUN" = true ]; then
-            echo "[DRY RUN] python train_attention_tcn.py --params $PARAMS_CLEAN --iv $IV_CLEAN ... ${EXP_FLAGS[$EXP_ID]} --seed $SEED"
+            echo "[DRY RUN] python train_attention_tcn.py ... ${EXP_FLAGS[$EXP_ID]} --seed $SEED"
         else
             python train_attention_tcn.py \
                 --params "$PARAMS_CLEAN" \
                 --iv "$IV_CLEAN" \
-                --voc-file "$VOC_FILE" \
-                --vmpp-file "$VMPP_FILE" \
+                --params-extra "$PARAMS_EXTRA_CLEAN" \
+                --iv-extra "$IV_EXTRA_CLEAN" \
+                --scalar-files "$VOC_100K" "$VMPP_100K" \
+                --scalar-files-extra "$VOC_300K" "$VMPP_300K" \
                 --output-dir "$EXP_OUT" \
                 --data-dir "$EXP_DATA" \
                 --run-name "$RUN_NAME" \
@@ -240,7 +260,7 @@ echo "STEP 3: Collecting Results"
 echo "=============================================="
 
 if [ "$DRY_RUN" = false ]; then
-    echo "Aggregating all ATCN experiment results..."
+    echo "Aggregating all experiment results..."
     python -c "
 import json
 import pandas as pd
@@ -270,8 +290,9 @@ if results:
         sub = df[df['exp_id'] == exp_id]
         r2 = sub.get('r2_median')
         mae = sub.get('mae_median')
+        arch = sub.get('architecture', pd.Series(['?'])).iloc[0]
         if r2 is not None:
-            print(f'  {exp_id}: R2_median={r2.mean():.4f} (+/- {r2.std():.4f}), MAE_median={mae.mean():.6f} (+/- {mae.std():.6f})')
+            print(f'  {exp_id} [{arch}]: R2_med={r2.mean():.4f}+/-{r2.std():.4f}  MAE_med={mae.mean():.6f}+/-{mae.std():.6f}')
 else:
     print('No results found.')
 "
@@ -289,8 +310,8 @@ echo "End time: $(date)"
 echo ""
 echo "Outputs:"
 echo "  Results CSV:  $OUTPUT_BASE/atcn_all_results.csv"
-echo "  Experiments:  $OUTPUT_BASE/TACN-*/"
-echo "  TB Logs:      $OUTPUT_BASE/TACN-*/*/tb_logs/"
+echo "  Experiments:  $OUTPUT_BASE/{TCN-DilatedConv-NoAttn,Conv-NoAttn,Pointwise-NoAttn}/"
+echo "  TB Logs:      $OUTPUT_BASE/*/seed_*/tb_logs/"
 echo "  Timing:       $TIMING_LOG"
 echo ""
 echo "Timing summary:"
@@ -299,6 +320,6 @@ echo ""
 
 # Count completed experiments
 N_COMPLETED=$(find $OUTPUT_BASE -name "test_stats.json" 2>/dev/null | wc -l)
-N_EXPECTED=$((4 * ${#SEEDS[@]}))
+N_EXPECTED=$((3 * ${#SEEDS[@]}))
 echo "Completed experiments: $N_COMPLETED / $N_EXPECTED"
 echo "=============================================="
