@@ -140,6 +140,7 @@ def build_config(args: argparse.Namespace) -> dict:
                 "convex": 0.005,
                 "excurv": 0.01,
                 "excess_threshold": 0.8,
+                "jacobian": args.jacobian_weight,
             },
         },
         "optimizer": {
@@ -160,6 +161,7 @@ def build_config(args: argparse.Namespace) -> dict:
                 "preprocessed_npz": os.path.join(data_dir, "atcn_preprocessed.npz"),
                 "param_transformer": os.path.join(data_dir, "atcn_param_transformer.joblib"),
                 "scalar_transformer": os.path.join(data_dir, "atcn_scalar_transformer.joblib"),
+                "physics_transformer": os.path.join(data_dir, "atcn_physics_transformer.joblib"),
                 "v_fine_memmap": os.path.join(data_dir, "atcn_v_fine_curves.mmap"),
                 "i_fine_memmap": os.path.join(data_dir, "atcn_i_fine_curves.mmap"),
             },
@@ -173,6 +175,7 @@ def build_config(args: argparse.Namespace) -> dict:
             "dataloader": {
                 **dataloader_cfg,
             },
+            "use_physics_features": args.use_physics_features,
             "curvature_weighting": {
                 "alpha": 4.0,
                 "power": 1.5,
@@ -576,6 +579,16 @@ class IVDataset(Dataset):
         else:
             X_combined = X_params
 
+        # Physics features (if computed during preprocessing)
+        physics_names = list(data["physics_feature_names"]) if "physics_feature_names" in data else []
+        if physics_names:
+            physics_tf = joblib.load(paths["physics_transformer"])
+            physics_data_raw = data["physics_data"].astype(np.float32)
+            X_physics = physics_tf.transform(
+                pd.DataFrame(physics_data_raw, columns=physics_names)
+            ).astype(np.float32)
+            X_combined = np.concatenate([X_combined, X_physics], axis=1)
+
         self.X = torch.from_numpy(X_combined[indices])
 
     def __len__(self):
@@ -638,10 +651,19 @@ class IVDataModule(pl.LightningDataModule):
             else:
                 self.scalar_tf = None
 
-            self.cfg["model"]["param_dim"] = param_dim + scalar_dim
+            # Physics features dimension
+            physics_names = list(data["physics_feature_names"]) if "physics_feature_names" in data else []
+            physics_dim = len(physics_names)
+            if self.cfg["dataset"].get("use_physics_features", False) and physics_dim == 0:
+                raise RuntimeError(
+                    "Physics features requested but not in cache. "
+                    "Re-run with --force-preprocess."
+                )
+
+            self.cfg["model"]["param_dim"] = param_dim + scalar_dim + physics_dim
             log.info(
-                f"Inferred param_dim from cache: {param_dim + scalar_dim} "
-                f"({param_dim} device params + {scalar_dim} scalars: {scalar_names})"
+                f"Inferred param_dim from cache: {param_dim + scalar_dim + physics_dim} "
+                f"({param_dim} device params + {scalar_dim} scalars + {physics_dim} physics)"
             )
 
         if stage == "fit" or stage is None:
@@ -816,10 +838,33 @@ class IVDataModule(pl.LightningDataModule):
             scalar_data = np.empty((len(valid_indices), 0), dtype=np.float32)
             log.info("No scalar files provided. Using device parameters only.")
 
-        self.cfg["model"]["param_dim"] = param_dim + scalar_dim
+        # ── Compute physics features from raw params (if enabled) ──
+        physics_feature_names: list[str] = []
+        if cfg["dataset"].get("use_physics_features", False):
+            from features import compute_all_physics_features, get_feature_names
+            log.info("Computing physics features from raw parameters...")
+            raw_params_tensor = torch.from_numpy(
+                params_df_valid.values.astype(np.float32)
+            )
+            with torch.no_grad():
+                physics_features = compute_all_physics_features(raw_params_tensor)
+            physics_data = physics_features.numpy().astype(np.float32)
+            physics_feature_names = get_feature_names()
+            physics_df = pd.DataFrame(physics_data, columns=physics_feature_names)
+            physics_transformer = Pipeline([
+                ("scaler", MinMaxScaler(feature_range=(-1, 1)))
+            ])
+            physics_transformer.fit(physics_df)
+            joblib.dump(physics_transformer, paths["physics_transformer"])
+            log.info(f"Physics features: {len(physics_feature_names)} features computed and scaled")
+        else:
+            physics_data = np.empty((len(valid_indices), 0), dtype=np.float32)
+
+        physics_dim = len(physics_feature_names)
+        self.cfg["model"]["param_dim"] = param_dim + scalar_dim + physics_dim
         log.info(
-            f"Total input dimension: {param_dim + scalar_dim} "
-            f"({param_dim} device params + {scalar_dim} scalars)"
+            f"Total input dimension: {param_dim + scalar_dim + physics_dim} "
+            f"({param_dim} device params + {scalar_dim} scalars + {physics_dim} physics)"
         )
 
         # ── Train / val / test split ──
@@ -846,6 +891,8 @@ class IVDataModule(pl.LightningDataModule):
             split_labels=split_labels,
             scalar_names=np.array(scalar_names),
             scalar_data=scalar_data,
+            physics_feature_names=np.array(physics_feature_names),
+            physics_data=physics_data,
         )
         log.info(f"Saved preprocessed data to {paths['preprocessed_npz']}")
 
@@ -947,6 +994,49 @@ class PhysicsIVSystem(pl.LightningModule):
         x = self.block3(x).transpose(1, 2)
         return self.out_head(x).squeeze(-1)
 
+    def compute_jacobian_norm(
+        self,
+        X_combined: torch.Tensor,
+        voltage: torch.Tensor,
+        n_hutchinson_samples: int = 4,
+    ) -> torch.Tensor:
+        """Approximate ||J||_F^2 where J = d(output)/d(X_combined).
+        Uses Hutchinson trace estimator in fp32 for numerical stability.
+        Returns scalar: mean Jacobian Frobenius norm squared, normalized by input dim.
+        """
+        x = X_combined.detach().float().requires_grad_(True)
+        v = voltage.detach()
+
+        dev_type = x.device.type if x.device.type in ("cuda", "cpu") else "cpu"
+        with torch.amp.autocast(device_type=dev_type, enabled=False):
+            y_pred = self.forward(x, v)
+
+        if torch.isnan(y_pred).any():
+            return torch.tensor(0.0, device=X_combined.device, requires_grad=True)
+
+        jac_norm_accum = torch.tensor(0.0, device=X_combined.device)
+        for _ in range(n_hutchinson_samples):
+            v_rand = torch.randn_like(y_pred)
+            try:
+                vjp = torch.autograd.grad(
+                    outputs=y_pred,
+                    inputs=x,
+                    grad_outputs=v_rand,
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]
+                jac_norm_accum = jac_norm_accum + (vjp ** 2).sum(dim=1).mean()
+            except RuntimeError:
+                return torch.tensor(0.0, device=X_combined.device, requires_grad=True)
+
+        jac_norm = jac_norm_accum / n_hutchinson_samples
+        jac_norm = jac_norm / max(1, X_combined.shape[1])
+
+        if torch.isnan(jac_norm) or torch.isinf(jac_norm):
+            return torch.tensor(0.0, device=X_combined.device, requires_grad=True)
+
+        return jac_norm.clamp(max=10.0)
+
     def _step(self, batch, stage: str):
         y_pred = self(batch["X_combined"], batch["voltage"])
         loss, comps = physics_loss(
@@ -955,6 +1045,16 @@ class PhysicsIVSystem(pl.LightningModule):
             batch["sample_w"],
             self.hparams.model["loss_weights"],
         )
+
+        # Jacobian regularization (training only, when weight > 0)
+        jac_weight = self.hparams.model["loss_weights"].get("jacobian", 0.0)
+        if stage == "train" and jac_weight > 0:
+            jac_norm = self.compute_jacobian_norm(
+                batch["X_combined"], batch["voltage"]
+            )
+            loss = loss + jac_weight * jac_norm
+            comps["jacobian"] = jac_norm
+
         self.log_dict(
             {f"{stage}_{k}": v for k, v in comps.items()},
             on_step=False, on_epoch=True,
@@ -1269,6 +1369,24 @@ def run_experiment(cfg: dict) -> dict:
     )
     test_time_s = time.perf_counter() - test_start
 
+    # Persist test predictions for downstream diagnostics/parity plotting.
+    if model.all_test_preds_np is not None and model.all_test_trues_np is not None:
+        preds_path = run_dir / "test_predictions.npz"
+        np.savez_compressed(
+            preds_path,
+            y_pred=model.all_test_preds_np.astype(np.float32, copy=False),
+            y_true=model.all_test_trues_np.astype(np.float32, copy=False),
+            v_slice=(
+                model.all_test_v_slices_np.astype(np.float32, copy=False)
+                if model.all_test_v_slices_np is not None
+                else np.array([], dtype=np.float32)
+            ),
+            run_name=run_name,
+        )
+        log.info(f"Saved test predictions to {preds_path}")
+    else:
+        log.warning("No test predictions found to save.")
+
     final_stats = model.all_test_stats or {}
     final_stats["run_name"] = run_name
     final_stats["architecture"] = cfg["model"]["architecture"]
@@ -1393,6 +1511,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-dilated", dest="use_dilated", action="store_false",
         help="Disable dilated convolutions",
+    )
+
+    # ── Physics features & Jacobian ──
+    p.add_argument(
+        "--use-physics-features", action="store_true", default=False,
+        help="Compute and use 71 physics-derived features from raw parameters",
+    )
+    p.add_argument(
+        "--jacobian-weight", type=float, default=0.0,
+        help="Weight for Jacobian norm regularization (0 = disabled). Recommended: 1e-4 to 1e-2",
     )
 
     # ── Training ──

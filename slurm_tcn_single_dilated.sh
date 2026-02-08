@@ -70,6 +70,10 @@ MIN_VMPP=0.00
 MAX_EPOCHS=100
 BATCH_SIZE=128
 
+# Physics features & Jacobian regularization
+USE_PHYSICS_FEATURES=true
+JACOBIAN_WEIGHT=0.0
+
 # ── Environment setup ────────────────────────────────────────────────────────
 cd $WORK_DIR
 mkdir -p $LOGS_DIR $OUTPUT_BASE $ATCN_DATA_DIR $RESULTS_DIR $DIAGNOSTICS_DIR
@@ -175,6 +179,7 @@ if [ "$FIGURES_ONLY" = false ]; then
 
     if [ "$DRY_RUN" = true ]; then
         echo "  [DRY RUN] train_attention_tcn.py --architecture conv --no-attention --use-dilated"
+        echo "            physics_features=$USE_PHYSICS_FEATURES  jacobian_weight=$JACOBIAN_WEIGHT"
     else
         python train_attention_tcn.py \
             --params "$PARAMS_CLEAN" \
@@ -192,6 +197,9 @@ if [ "$FIGURES_ONLY" = false ]; then
             --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
             --enable-example-plots \
             --architecture conv --no-attention --use-dilated \
+            ${USE_PHYSICS_FEATURES:+--use-physics-features} \
+            --jacobian-weight $JACOBIAN_WEIGHT \
+            --force-preprocess \
             2>&1 | tee "$EXP_OUT/train.log"
 
         cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
@@ -251,6 +259,18 @@ else:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_theme(style="whitegrid", context="talk")
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "#fbfbfb",
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "grid.linewidth": 0.7,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
 
 # ── 1.  Training curves from TensorBoard ────────────────────────────────
 try:
@@ -351,6 +371,29 @@ pred_files = glob.glob(os.path.join(run_dir, "**", "*.npz"), recursive=True) + \
 
 # Also check for cached preprocessed data that has test indices
 data_cache_npz = glob.glob(os.path.join(out_dir, "..", "..", "data_cache", "**", "*.npz"), recursive=True)
+pred_files.extend(data_cache_npz)
+
+pred_files = sorted(set(pred_files), key=os.path.getmtime, reverse=True)
+pred_files = sorted(
+    pred_files,
+    key=lambda p: (
+        "pred" not in os.path.basename(p).lower(),
+        "test" not in os.path.basename(p).lower(),
+    ),
+)
+print(f"\nPrediction npz candidates found: {len(pred_files)}")
+
+def _extract_pred_arrays(npz_data):
+    for pred_key, true_key in [
+        ("y_pred", "y_true"),
+        ("test_pred", "test_true"),
+        ("pred", "true"),
+        ("preds", "trues"),
+        ("predictions", "targets"),
+    ]:
+        if pred_key in npz_data and true_key in npz_data:
+            return npz_data[pred_key], npz_data[true_key], pred_key, true_key
+    return None, None, None, None
 
 # The trainer stores test predictions in the checkpoint callback or we can
 # reconstruct from the test loop.  Check if test_stats has the arrays:
@@ -358,19 +401,21 @@ parity_done = False
 try:
     # Try loading from any npz that contains predictions
     for npz_path in pred_files:
-        data = np.load(npz_path, allow_pickle=True)
-        keys = list(data.keys())
-        if "y_pred" in keys and "y_true" in keys:
-            y_pred = data["y_pred"]
-            y_true = data["y_true"]
-            break
-        if "test_pred" in keys and "test_true" in keys:
-            y_pred = data["test_pred"]
-            y_true = data["test_true"]
+        with np.load(npz_path, allow_pickle=True) as data:
+            y_pred, y_true, pred_key, true_key = _extract_pred_arrays(data)
+        if y_pred is not None and y_true is not None:
+            print(f"  Using predictions from: {npz_path} ({pred_key}, {true_key})")
             break
     else:
         # Check if trainer saved per-sample R² values we can use
         raise FileNotFoundError("No prediction arrays found in npz files")
+
+    y_pred = np.asarray(y_pred)
+    y_true = np.asarray(y_true)
+    if y_pred.ndim != 2 or y_true.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got y_pred={y_pred.shape}, y_true={y_true.shape}")
+    if y_pred.shape != y_true.shape:
+        raise ValueError(f"Prediction/target shape mismatch: {y_pred.shape} vs {y_true.shape}")
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
@@ -385,21 +430,27 @@ try:
     # 2b. Flatten for point-level parity
     yt_flat = y_true.flatten()
     yp_flat = y_pred.flatten()
+    ss_res = np.sum((yt_flat - yp_flat) ** 2)
+    ss_tot = np.sum((yt_flat - np.mean(yt_flat)) ** 2)
+    global_r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
     ax = axes[0]
-    ax.hexbin(yt_flat, yp_flat, gridsize=80, cmap="viridis", mincnt=1)
+    hb = ax.hexbin(yt_flat, yp_flat, gridsize=90, cmap="viridis", mincnt=1, bins="log")
     lims = [min(yt_flat.min(), yp_flat.min()), max(yt_flat.max(), yp_flat.max())]
-    ax.plot(lims, lims, "r--", linewidth=1)
+    ax.plot(lims, lims, "r--", linewidth=1.2, label="Ideal")
     ax.set_xlabel("True current (norm)")
     ax.set_ylabel("Predicted current (norm)")
-    ax.set_title("Point-level Parity")
+    ax.set_title(f"Point-level Parity (R²={global_r2:.4f})")
     ax.set_aspect("equal")
+    fig.colorbar(hb, ax=ax, label="log10(count)")
 
     # 2c. R² histogram
     ax = axes[1]
-    ax.hist(r2_per_sample, bins=60, edgecolor="black", alpha=0.8)
+    ax.hist(r2_per_sample, bins=60, edgecolor="black", alpha=0.85, color="#4C72B0")
     ax.axvline(np.median(r2_per_sample), color="red", linestyle="--",
                label=f"median = {np.median(r2_per_sample):.4f}")
+    ax.axvline(np.mean(r2_per_sample), color="#1b9e77", linestyle="-.",
+               label=f"mean = {np.mean(r2_per_sample):.4f}")
     ax.set_xlabel("Per-curve R²")
     ax.set_ylabel("Count")
     ax.set_title("R² Distribution")
@@ -409,9 +460,9 @@ try:
     ax = axes[2]
     isc_true = y_true[:, 0]
     isc_pred = y_pred[:, 0]
-    ax.scatter(isc_true, isc_pred, s=2, alpha=0.3)
+    ax.scatter(isc_true, isc_pred, s=5, alpha=0.25, color="#dd8452", edgecolors="none")
     lims = [min(isc_true.min(), isc_pred.min()), max(isc_true.max(), isc_pred.max())]
-    ax.plot(lims, lims, "r--", linewidth=1)
+    ax.plot(lims, lims, "r--", linewidth=1.2)
     ax.set_xlabel("True ISc (norm)")
     ax.set_ylabel("Predicted ISc (norm)")
     ax.set_title("Short-circuit Current Parity")
@@ -458,8 +509,11 @@ if parity_done:
         # Sort by R² for visualization
         sort_idx = np.argsort(r2_per_sample)
         subset = sort_idx[::max(1, len(sort_idx)//200)]  # ~200 rows
+        heat = residuals[subset]
+        vmax = np.percentile(np.abs(heat), 98)
+        vmax = max(vmax, 1e-6)
         im = ax.imshow(residuals[subset], aspect="auto", cmap="RdBu_r",
-                        vmin=-0.05, vmax=0.05, interpolation="nearest")
+                        vmin=-vmax, vmax=vmax, interpolation="nearest")
         ax.set_xlabel("Voltage index")
         ax.set_ylabel("Sample (sorted by R²)")
         ax.set_title("Residual Heatmap")

@@ -547,6 +547,8 @@ if torch.isnan(loss) or torch.isinf(loss):
 \section{Baseline Models}
 %=============================================================================
 
+For this part, just compare it to the other papers in literature in a table and talk about it.
+
 \subsection{CVAE Baseline (Conditional Variational Autoencoder)}
 
 \begin{table}[h]
@@ -600,7 +602,7 @@ Conv-dilated is kept as the flagship pending balanced 3-seed reruns for each top
 
 \subsection{Primary Architecture (PhysicsIVSystem)}
 
-The model is implemented in PyTorch Lightning (\texttt{train\_attention\_tcn.py}) and operates directly on 8-point PCHIP voltage slices centered around the MPP region.
+The model is implemented in PyTorch (\texttt{train\_attention\_tcn.py}) and operates directly on 8-point PCHIP voltage slices centered around the MPP region.
 
 \begin{equation}
 \mathbf{x} \xrightarrow{\text{ParamMLP}} \mathbf{h} \xrightarrow{\text{broadcast}} [\mathbf{h}; \text{RBF}(V)] \xrightarrow{\text{DilatedConv1D}} \xrightarrow{\text{OutHead}} \hat{I}(V)
@@ -662,6 +664,7 @@ Three variants were evaluated:
 \end{itemize}
 
 \subsubsection{Self-Attention (Optional --- Disabled by Default)}
+Talk about it as an experiment that proved to reduce performance.
 
 An optional multi-head self-attention block (4 heads, $d_{model} = 64$) can be placed after the conv blocks. \textbf{Result: Attention consistently hurts performance} and is treated only as a negative control. Hypothesis: the 8-point PCHIP sequence is too short for attention to add value; dilation already provides sufficient receptive field.
 
