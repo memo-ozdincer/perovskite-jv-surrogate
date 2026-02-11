@@ -59,6 +59,7 @@ PREPROCESS_DIR="$WORK_DIR/preprocessed"
 OUTPUT_BASE="$WORK_DIR/outputs/atcn_experiments_$(date +%Y%m%d)"
 ATCN_DATA_DIR="$OUTPUT_BASE/atcn_processed"
 LOGS_DIR="$WORK_DIR/logs"
+SCALAR_DIR="${SCALAR_DIR:-$WORK_DIR/scalars_external}"
 
 # Raw data files (100k + 300k)
 PARAMS_PRIMARY="$WORK_DIR/LHS_parameters_m.txt"
@@ -76,6 +77,12 @@ SEEDS=(42 123 456)
 # Training configuration
 MAX_EPOCHS=100
 BATCH_SIZE=128
+USE_PHYSICS_FEATURE_SELECTION=true
+PHYSICS_MAX_FEATURES=5
+PHYSICS_SELECTION_FLAG=""
+if [ "$USE_PHYSICS_FEATURE_SELECTION" = true ]; then
+    PHYSICS_SELECTION_FLAG="--physics-feature-selection --physics-max-features $PHYSICS_MAX_FEATURES"
+fi
 
 # ============================================================================
 # SETUP
@@ -135,12 +142,6 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
         --min-vmpp $MIN_VMPP \
         --suffix "_clean"
 
-    echo "Generating scalar txt files (100k)..."
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" \
-        --tag 100k --suffix "_clean"
-
     # --- 300k dataset ---
     echo "Processing extra dataset (300k)..."
     python scripts/preprocess_data.py \
@@ -150,12 +151,6 @@ if [ "$SKIP_PREPROCESSING" = false ]; then
         --min-ff $MIN_FF \
         --min-vmpp $MIN_VMPP \
         --suffix "_clean"
-
-    echo "Generating scalar txt files (300k)..."
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" \
-        --tag 300k --suffix "_clean"
 
     STEP_END=$(date +%s)
     echo "Preprocessing time: $((STEP_END - STEP_START))s" >> $TIMING_LOG
@@ -168,11 +163,11 @@ IV_CLEAN="$PREPROCESS_DIR/IV_m_clean.txt"
 PARAMS_EXTRA_CLEAN="$PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
 IV_EXTRA_CLEAN="$PREPROCESS_DIR/IV_m_300k_clean.txt"
 
-# Scalar txt files (true scalars from preprocessing)
-VOC_100K="$PREPROCESS_DIR/voc_clean_100k.txt"
-VMPP_100K="$PREPROCESS_DIR/vmpp_clean_100k.txt"
-VOC_300K="$PREPROCESS_DIR/voc_clean_300k.txt"
-VMPP_300K="$PREPROCESS_DIR/vmpp_clean_300k.txt"
+# Scalar txt files (externally predicted, e.g. MATLAB Stage-1 model)
+VOC_100K="$SCALAR_DIR/voc_clean_100k.txt"
+VMPP_100K="$SCALAR_DIR/vmpp_clean_100k.txt"
+VOC_300K="$SCALAR_DIR/voc_clean_300k.txt"
+VMPP_300K="$SCALAR_DIR/vmpp_clean_300k.txt"
 
 # Verify input files exist
 echo ""
@@ -225,9 +220,9 @@ for EXP_ID in "TCN-DilatedConv-NoAttn" "Conv-NoAttn" "Pointwise-NoAttn"; do
         echo "  Flags:  ${EXP_FLAGS[$EXP_ID]}"
 
         if [ "$DRY_RUN" = true ]; then
-            echo "[DRY RUN] python train_attention_tcn.py ... ${EXP_FLAGS[$EXP_ID]} --seed $SEED"
+                echo "[DRY RUN] python train_dilated_conv.py ... ${EXP_FLAGS[$EXP_ID]} --seed $SEED"
         else
-            python train_attention_tcn.py \
+            python train_dilated_conv.py \
                 --params "$PARAMS_CLEAN" \
                 --iv "$IV_CLEAN" \
                 --params-extra "$PARAMS_EXTRA_CLEAN" \
@@ -241,6 +236,7 @@ for EXP_ID in "TCN-DilatedConv-NoAttn" "Conv-NoAttn" "Pointwise-NoAttn"; do
                 --max-epochs $MAX_EPOCHS \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
+                $PHYSICS_SELECTION_FLAG \
                 ${EXP_FLAGS[$EXP_ID]} \
                 2>&1 | tee "$EXP_OUT/train.log"
 

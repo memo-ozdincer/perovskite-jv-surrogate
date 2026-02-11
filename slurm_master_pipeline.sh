@@ -66,6 +66,7 @@ OUTPUT_BASE="$WORK_DIR/outputs/icml_experiments_$(date +%Y%m%d)"
 FIGURES_DIR="$OUTPUT_BASE/figures"
 RESULTS_DIR="$OUTPUT_BASE/results"
 LOGS_DIR="$WORK_DIR/logs"
+SCALAR_DIR="${SCALAR_DIR:-$WORK_DIR/scalars_external}"
 
 # Data files
 PARAMS_PRIMARY="$WORK_DIR/LHS_parameters_m.txt"
@@ -148,18 +149,6 @@ if [ "$FIGURES_ONLY" = false ] && [ "$SKIP_PREPROCESSING" = false ]; then
         --min-vmpp $MIN_VMPP \
         --suffix "_clean"
 
-    # Generate scalar files
-    echo "Generating scalar files..."
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" \
-        --tag 100k --suffix "_clean"
-
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" \
-        --tag 300k --suffix "_clean"
-
     STEP_END=$(date +%s)
     echo "Preprocessing time: $((STEP_END - STEP_START))s" >> $TIMING_LOG
     echo "Preprocessing complete: $(date)"
@@ -174,10 +163,10 @@ IV_EXTRA_CLEAN="$PREPROCESS_DIR/IV_m_300k_clean.txt"
 # Anchor files
 ANCHORS="$PREPROCESS_DIR/anchors_clean_100k.txt"
 ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean_300k.txt"
-VOC="$PREPROCESS_DIR/voc_clean_100k.txt"
-VOC_EXTRA="$PREPROCESS_DIR/voc_clean_300k.txt"
-VMPP="$PREPROCESS_DIR/vmpp_clean_100k.txt"
-VMPP_EXTRA="$PREPROCESS_DIR/vmpp_clean_300k.txt"
+VOC="$SCALAR_DIR/voc_clean_100k.txt"
+VOC_EXTRA="$SCALAR_DIR/voc_clean_300k.txt"
+VMPP="$SCALAR_DIR/vmpp_clean_100k.txt"
+VMPP_EXTRA="$SCALAR_DIR/vmpp_clean_300k.txt"
 
 # ============================================================================
 # STEP 2: TIER 0 EXPERIMENTS (Main Ablations)

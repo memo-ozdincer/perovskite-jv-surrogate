@@ -176,6 +176,12 @@ def build_config(args: argparse.Namespace) -> dict:
                 **dataloader_cfg,
             },
             "use_physics_features": args.use_physics_features,
+            "physics_feature_selection": {
+                "enabled": bool(args.physics_feature_selection),
+                "weak_threshold": float(args.physics_weak_threshold),
+                "corr_threshold": float(args.physics_corr_threshold),
+                "max_features": args.physics_max_features,
+            },
             "curvature_weighting": {
                 "alpha": 4.0,
                 "power": 1.5,
@@ -262,6 +268,118 @@ def compute_curvature_weights(
     max_kappa = np.max(kappa, axis=1, keepdims=True)
     max_kappa[max_kappa < 1e-9] = 1.0
     return (1.0 + alpha * np.power(kappa / max_kappa, power)).astype(np.float32)
+
+
+def _compute_curve_targets_for_feature_selection(
+    i_slices: np.ndarray, v_slices: np.ndarray
+) -> np.ndarray:
+    """
+    Build scalar targets from 8-point curves for train-only feature filtering.
+    Columns: Jsc, Voc, Vmpp, Jmpp, FF.
+    """
+    jsc = i_slices[:, 0].astype(np.float32, copy=False)
+    power = v_slices * i_slices
+    mpp_idx = np.argmax(power, axis=1)
+    vmpp = v_slices[np.arange(len(v_slices)), mpp_idx].astype(np.float32, copy=False)
+    jmpp = i_slices[np.arange(len(i_slices)), mpp_idx].astype(np.float32, copy=False)
+
+    voc = np.full(len(i_slices), v_slices[:, -1], dtype=np.float32)
+    for i in range(len(i_slices)):
+        y = i_slices[i]
+        x = v_slices[i]
+        crossing = np.where((y[:-1] > 0) & (y[1:] <= 0))[0]
+        if len(crossing) > 0:
+            j = crossing[0]
+            y0, y1 = float(y[j]), float(y[j + 1])
+            x0, x1 = float(x[j]), float(x[j + 1])
+            dy = y1 - y0
+            if abs(dy) < 1e-12:
+                voc[i] = x1
+            else:
+                voc[i] = np.float32(x0 - y0 * (x1 - x0) / dy)
+        else:
+            voc[i] = np.float32(x[-1])
+
+    ff = power[np.arange(len(power)), mpp_idx] / np.maximum(voc * jsc, 1e-12)
+    ff = np.clip(ff, 0.0, 1.0).astype(np.float32, copy=False)
+    return np.column_stack([jsc, voc, vmpp, jmpp, ff]).astype(np.float32)
+
+
+def _max_abs_target_corr(features: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    """Per-feature max absolute Pearson correlation across targets."""
+    out = np.zeros(features.shape[1], dtype=np.float32)
+    for i in range(features.shape[1]):
+        fx = features[:, i]
+        if np.std(fx) < 1e-12:
+            continue
+        best = 0.0
+        for j in range(targets.shape[1]):
+            ty = targets[:, j]
+            if np.std(ty) < 1e-12:
+                continue
+            r = np.corrcoef(fx, ty)[0, 1]
+            if np.isnan(r):
+                r = 0.0
+            best = max(best, abs(float(r)))
+        out[i] = np.float32(best)
+    return out
+
+
+def _select_physics_features(
+    physics_train: np.ndarray,
+    target_train: np.ndarray,
+    feature_names: list[str],
+    corr_threshold: float = 0.85,
+    weak_threshold: float = 0.30,
+    max_features: int | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Train-only filter:
+      1) Drop multicollinear features using pairwise |r| > corr_threshold
+      2) Keep features with max |corr(target)| >= weak_threshold
+      3) Optional cap to top-k by target correlation
+    """
+    n_feat = physics_train.shape[1]
+    if n_feat == 0:
+        return np.array([], dtype=int), []
+
+    # --- Step 1: multicollinearity ---
+    std = physics_train.std(axis=0)
+    std[std < 1e-10] = 1.0
+    z = (physics_train - physics_train.mean(axis=0)) / std
+    corr = np.corrcoef(z.T)
+    corr = np.nan_to_num(corr, nan=0.0)
+    target_corr = _max_abs_target_corr(physics_train, target_train)
+
+    keep = np.ones(n_feat, dtype=bool)
+    for i in range(n_feat):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n_feat):
+            if not keep[j]:
+                continue
+            if abs(corr[i, j]) > corr_threshold:
+                if target_corr[i] >= target_corr[j]:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break
+
+    # --- Step 2: relevance ---
+    cand_idx = np.where(keep)[0]
+    if len(cand_idx) == 0:
+        return np.array([], dtype=int), []
+    strong = cand_idx[target_corr[cand_idx] >= weak_threshold]
+    selected = strong if len(strong) > 0 else cand_idx
+
+    # --- Step 3: optional top-k cap ---
+    if max_features is not None and max_features > 0 and len(selected) > max_features:
+        order = np.argsort(target_corr[selected])[::-1]
+        selected = selected[order[:max_features]]
+
+    selected = np.array(sorted(selected.tolist()), dtype=int)
+    names = [feature_names[i] for i in selected]
+    return selected, names
 
 
 def get_param_transformer(colnames: list[str]) -> ColumnTransformer:
@@ -791,14 +909,29 @@ class IVDataModule(pl.LightningDataModule):
             i_slices_scaled, **cfg["dataset"]["curvature_weighting"]
         )
 
-        # ── Fit parameter transformer ──
+        # ── Train / val / test split ──
+        all_idx = np.arange(len(valid_indices))
+        train_val_idx, test_idx = train_test_split(
+            all_idx, test_size=0.2, random_state=cfg["train"]["seed"]
+        )
+        train_idx, val_idx = train_test_split(
+            train_val_idx, test_size=0.15, random_state=cfg["train"]["seed"]
+        )
+        split_labels = np.array([""] * len(all_idx), dtype=object)
+        split_labels[train_idx] = "train"
+        split_labels[val_idx] = "val"
+        split_labels[test_idx] = "test"
+        train_mask = split_labels == "train"
+
+        # ── Fit parameter transformer (train split only) ──
         params_df_valid = params_df.iloc[valid_indices].reset_index(drop=True)
+        params_df_train = params_df_valid.iloc[train_idx].reset_index(drop=True)
         param_transformer = get_param_transformer(COLNAMES)
-        param_transformer.fit(params_df_valid)
+        param_transformer.fit(params_df_train)
         joblib.dump(param_transformer, paths["param_transformer"])
         param_dim = param_transformer.transform(params_df_valid).shape[1]
 
-        # ── Load scalar features exclusively from txt files ──
+        # ── Load scalar features exclusively from external txt files ──
         scalar_files = paths.get("scalar_files", [])
         scalar_files_extra = paths.get("scalar_files_extra", [])
         scalar_names: list[str] = []
@@ -828,10 +961,11 @@ class IVDataModule(pl.LightningDataModule):
         if scalar_dim > 0:
             scalar_data = np.column_stack(scalar_columns).astype(np.float32)
             scalar_df = pd.DataFrame(scalar_data, columns=scalar_names)
+            scalar_df_train = scalar_df.iloc[train_idx].reset_index(drop=True)
             scalar_transformer = Pipeline([
                 ("scaler", MinMaxScaler(feature_range=(-1, 1)))
             ])
-            scalar_transformer.fit(scalar_df)
+            scalar_transformer.fit(scalar_df_train)
             joblib.dump(scalar_transformer, paths["scalar_transformer"])
             log.info(f"Scalar features from txt: {scalar_names}")
         else:
@@ -840,23 +974,58 @@ class IVDataModule(pl.LightningDataModule):
 
         # ── Compute physics features from raw params (if enabled) ──
         physics_feature_names: list[str] = []
+        physics_selected_indices = np.array([], dtype=np.int64)
         if cfg["dataset"].get("use_physics_features", False):
             from features import compute_all_physics_features, get_feature_names
+
             log.info("Computing physics features from raw parameters...")
             raw_params_tensor = torch.from_numpy(
                 params_df_valid.values.astype(np.float32)
             )
             with torch.no_grad():
                 physics_features = compute_all_physics_features(raw_params_tensor)
-            physics_data = physics_features.numpy().astype(np.float32)
-            physics_feature_names = get_feature_names()
+            physics_all = physics_features.numpy().astype(np.float32)
+            all_feature_names = get_feature_names()
+
+            sel_cfg = cfg["dataset"].get("physics_feature_selection", {})
+            if sel_cfg.get("enabled", False):
+                target_all = _compute_curve_targets_for_feature_selection(i_slices, v_slices)
+                selected_idx, selected_names = _select_physics_features(
+                    physics_train=physics_all[train_mask],
+                    target_train=target_all[train_mask],
+                    feature_names=all_feature_names,
+                    corr_threshold=float(sel_cfg.get("corr_threshold", 0.85)),
+                    weak_threshold=float(sel_cfg.get("weak_threshold", 0.30)),
+                    max_features=sel_cfg.get("max_features"),
+                )
+                if len(selected_idx) == 0:
+                    log.warning(
+                        "Physics feature selection produced 0 features; falling back to all."
+                    )
+                    selected_idx = np.arange(physics_all.shape[1], dtype=int)
+                    selected_names = all_feature_names
+                physics_selected_indices = selected_idx.astype(np.int64)
+                physics_feature_names = selected_names
+                physics_data = physics_all[:, physics_selected_indices]
+                log.info(
+                    "Physics feature selection enabled: "
+                    f"{physics_all.shape[1]} -> {len(physics_feature_names)} features"
+                )
+            else:
+                physics_data = physics_all
+                physics_feature_names = all_feature_names
+                physics_selected_indices = np.arange(len(physics_feature_names), dtype=np.int64)
+
             physics_df = pd.DataFrame(physics_data, columns=physics_feature_names)
+            physics_df_train = physics_df.iloc[train_idx].reset_index(drop=True)
             physics_transformer = Pipeline([
                 ("scaler", MinMaxScaler(feature_range=(-1, 1)))
             ])
-            physics_transformer.fit(physics_df)
+            physics_transformer.fit(physics_df_train)
             joblib.dump(physics_transformer, paths["physics_transformer"])
-            log.info(f"Physics features: {len(physics_feature_names)} features computed and scaled")
+            log.info(
+                f"Physics features: {len(physics_feature_names)} features computed and scaled"
+            )
         else:
             physics_data = np.empty((len(valid_indices), 0), dtype=np.float32)
 
@@ -866,19 +1035,6 @@ class IVDataModule(pl.LightningDataModule):
             f"Total input dimension: {param_dim + scalar_dim + physics_dim} "
             f"({param_dim} device params + {scalar_dim} scalars + {physics_dim} physics)"
         )
-
-        # ── Train / val / test split ──
-        all_idx = np.arange(len(valid_indices))
-        train_val_idx, test_idx = train_test_split(
-            all_idx, test_size=0.2, random_state=cfg["train"]["seed"]
-        )
-        train_idx, val_idx = train_test_split(
-            train_val_idx, test_size=0.15, random_state=cfg["train"]["seed"]
-        )
-        split_labels = np.array([""] * len(all_idx), dtype=object)
-        split_labels[train_idx] = "train"
-        split_labels[val_idx] = "val"
-        split_labels[test_idx] = "test"
 
         np.savez(
             paths["preprocessed_npz"],
@@ -893,6 +1049,7 @@ class IVDataModule(pl.LightningDataModule):
             scalar_data=scalar_data,
             physics_feature_names=np.array(physics_feature_names),
             physics_data=physics_data,
+            physics_selected_indices=physics_selected_indices,
         )
         log.info(f"Saved preprocessed data to {paths['preprocessed_npz']}")
 
@@ -1484,7 +1641,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ── Experiment ──
-    p.add_argument("--run-name", default="TACN-full", help="Experiment run name")
+    p.add_argument("--run-name", default="DilatedConv-full", help="Experiment run name")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     p.add_argument(
         "--enable-example-plots", action="store_true",
@@ -1517,6 +1674,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--use-physics-features", action="store_true", default=False,
         help="Compute and use 71 physics-derived features from raw parameters",
+    )
+    p.add_argument(
+        "--physics-feature-selection", action="store_true", default=False,
+        help="Enable train-only physics feature filtering (multicollinearity + relevance)",
+    )
+    p.add_argument(
+        "--physics-weak-threshold", type=float, default=0.30,
+        help="Minimum max |corr| with curve-derived targets to keep a physics feature",
+    )
+    p.add_argument(
+        "--physics-corr-threshold", type=float, default=0.85,
+        help="Pairwise |corr| threshold for multicollinearity pruning",
+    )
+    p.add_argument(
+        "--physics-max-features", type=int, default=None,
+        help="Optional cap on number of selected physics features",
     )
     p.add_argument(
         "--jacobian-weight", type=float, default=0.0,

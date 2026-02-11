@@ -67,6 +67,7 @@ ATCN_DATA_DIR="$OUTPUT_BASE/data_cache"
 RESULTS_DIR="$OUTPUT_BASE/results"
 FIGURES_DIR="$OUTPUT_BASE/figures"
 LOGS_DIR="$WORK_DIR/logs"
+SCALAR_DIR="${SCALAR_DIR:-$WORK_DIR/scalars_external}"
 
 # Raw data
 PARAMS_PRIMARY="$WORK_DIR/LHS_parameters_m.txt"
@@ -84,6 +85,12 @@ MIN_VMPP=0.00
 # Training
 MAX_EPOCHS=100
 BATCH_SIZE=128
+USE_PHYSICS_FEATURE_SELECTION=true
+PHYSICS_MAX_FEATURES=5
+PHYSICS_SELECTION_FLAG=""
+if [ "$USE_PHYSICS_FEATURE_SELECTION" = true ]; then
+    PHYSICS_SELECTION_FLAG="--physics-feature-selection --physics-max-features $PHYSICS_MAX_FEATURES"
+fi
 
 # ── Environment setup ────────────────────────────────────────────────────────
 cd $WORK_DIR
@@ -129,19 +136,11 @@ if [ "$FIGURES_ONLY" = false ] && [ "$SKIP_PREPROCESSING" = false ]; then
         --output-dir "$PREPROCESS_DIR" \
         --min-ff $MIN_FF --min-vmpp $MIN_VMPP --suffix "_clean"
 
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" --tag 100k --suffix "_clean"
-
     # 300k
     python scripts/preprocess_data.py \
         --params "$PARAMS_EXTRA" --iv "$IV_EXTRA" \
         --output-dir "$PREPROCESS_DIR" \
         --min-ff $MIN_FF --min-vmpp $MIN_VMPP --suffix "_clean"
-
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" --tag 300k --suffix "_clean"
 
     STEP_END=$(date +%s)
     echo "Preprocessing: $((STEP_END - STEP_START))s" >> $TIMING_LOG
@@ -153,11 +152,11 @@ IV_CLEAN="$PREPROCESS_DIR/IV_m_clean.txt"
 PARAMS_EXTRA_CLEAN="$PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
 IV_EXTRA_CLEAN="$PREPROCESS_DIR/IV_m_300k_clean.txt"
 
-# Scalar txt files (true scalars — swap for predicted later)
-VOC_100K="$PREPROCESS_DIR/voc_clean_100k.txt"
-VMPP_100K="$PREPROCESS_DIR/vmpp_clean_100k.txt"
-VOC_300K="$PREPROCESS_DIR/voc_clean_300k.txt"
-VMPP_300K="$PREPROCESS_DIR/vmpp_clean_300k.txt"
+# Scalar txt files (externally predicted, e.g. MATLAB Stage-1 model)
+VOC_100K="$SCALAR_DIR/voc_clean_100k.txt"
+VMPP_100K="$SCALAR_DIR/vmpp_clean_100k.txt"
+VOC_300K="$SCALAR_DIR/voc_clean_300k.txt"
+VMPP_300K="$SCALAR_DIR/vmpp_clean_300k.txt"
 
 # Verify files exist
 echo ""
@@ -195,7 +194,7 @@ run_tcn() {
         return
     fi
 
-    python train_attention_tcn.py \
+    python train_dilated_conv.py \
         --params "$PARAMS_CLEAN" \
         --iv "$IV_CLEAN" \
         --params-extra "$PARAMS_EXTRA_CLEAN" \
@@ -209,6 +208,7 @@ run_tcn() {
         --max-epochs $MAX_EPOCHS \
         --batch-size $BATCH_SIZE \
         --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
+        $PHYSICS_SELECTION_FLAG \
         $FLAGS \
         2>&1 | tee "$EXP_OUT/train.log"
 
@@ -276,7 +276,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
         mkdir -p "$EXP_OUT" "$EXP_DATA"
 
         if [ "$DRY_RUN" = false ]; then
-            python train_attention_tcn.py \
+            python train_dilated_conv.py \
                 --params "$PARAMS_CLEAN" \
                 --iv "$IV_CLEAN" \
                 --params-extra "$PARAMS_EXTRA_CLEAN" \
@@ -288,6 +288,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
                 --max-epochs $MAX_EPOCHS \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
+                $PHYSICS_SELECTION_FLAG \
                 --architecture conv --no-attention --use-dilated \
                 2>&1 | tee "$EXP_OUT/train.log"
             cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
@@ -306,7 +307,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
         mkdir -p "$EXP_OUT" "$EXP_DATA"
 
         if [ "$DRY_RUN" = false ]; then
-            python train_attention_tcn.py \
+            python train_dilated_conv.py \
                 --params "$PARAMS_CLEAN" \
                 --iv "$IV_CLEAN" \
                 --scalar-files "$VOC_100K" "$VMPP_100K" \
@@ -317,6 +318,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
                 --max-epochs $MAX_EPOCHS \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
+                $PHYSICS_SELECTION_FLAG \
                 --architecture conv --no-attention --use-dilated \
                 2>&1 | tee "$EXP_OUT/train.log"
             cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
@@ -335,7 +337,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
         mkdir -p "$EXP_OUT" "$EXP_DATA"
 
         if [ "$DRY_RUN" = false ]; then
-            python train_attention_tcn.py \
+            python train_dilated_conv.py \
                 --params "$PARAMS_CLEAN" \
                 --iv "$IV_CLEAN" \
                 --params-extra "$PARAMS_EXTRA_CLEAN" \
@@ -349,6 +351,7 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER1_ONLY" = false ]; then
                 --max-epochs 200 \
                 --batch-size $BATCH_SIZE \
                 --num-workers $((SLURM_CPUS_PER_TASK / 2)) \
+                $PHYSICS_SELECTION_FLAG \
                 --architecture conv --no-attention --use-dilated \
                 2>&1 | tee "$EXP_OUT/train.log"
             cp -f "$EXP_OUT/$RUN_NAME/test_stats.json" \
@@ -400,13 +403,13 @@ if [ "$FIGURES_ONLY" = false ] && [ "$TIER0_ONLY" = false ]; then
 fi
 
 # ============================================================================
-# STEP 4: PHYSICS ANALYSIS
+# STEP 4: AGGREGATE ANALYSIS
 # ============================================================================
 
 if [ "$FIGURES_ONLY" = false ]; then
     echo ""
     echo "=============================================="
-    echo "STEP 4: Physics Analysis"
+    echo "STEP 4: Aggregate Analysis"
     echo "=============================================="
     STEP_START=$(date +%s)
 
@@ -415,7 +418,7 @@ if [ "$FIGURES_ONLY" = false ]; then
     mkdir -p "$ANALYSIS_DIR"
 
     if [ -d "$MAIN_MODEL" ] && [ "$DRY_RUN" = false ]; then
-        python tcn_analysis.py \
+        python dilated_analysis.py \
             --results-dir "$OUTPUT_BASE" \
             --output-dir "$ANALYSIS_DIR" \
             --main-model-dir "$MAIN_MODEL" \
@@ -436,7 +439,7 @@ echo "STEP 5: Collecting Results"
 echo "=============================================="
 
 if [ "$DRY_RUN" = false ]; then
-    python tcn_collect_results.py \
+    python dilated_collect_results.py \
         --results-dir "$RESULTS_DIR" \
         --output-base "$OUTPUT_BASE" \
         2>&1 || true
@@ -454,7 +457,7 @@ echo "=============================================="
 if [ "$DRY_RUN" = false ]; then
     RESULTS_CSV="$OUTPUT_BASE/all_results.csv"
     if [ -f "$RESULTS_CSV" ]; then
-        python tcn_generate_figures.py \
+        python dilated_generate_figures.py \
             --results "$RESULTS_CSV" \
             --output "$FIGURES_DIR" \
             --analysis-dir "$OUTPUT_BASE/analysis" \

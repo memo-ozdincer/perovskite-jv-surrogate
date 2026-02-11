@@ -34,6 +34,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 # Working directory
 WORK_DIR="/scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors"
+SCALAR_DIR="${SCALAR_DIR:-$WORK_DIR/scalars_external}"
 cd $WORK_DIR
 
 mkdir -p /scratch/memoozd/ts-tools-scratch/dbe/logs
@@ -75,19 +76,6 @@ python scripts/preprocess_data.py \
     --min-vmpp 0.30 \
     --suffix "_clean"
 
-# Generate scalar TXT files (Voc/Vmpp) from cleaned IV curves
-python scripts/generate_scalar_txt.py \
-    --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
-    --output-dir "$PREPROCESS_DIR" \
-    --tag 100k \
-    --suffix "_clean"
-
-python scripts/generate_scalar_txt.py \
-    --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
-    --output-dir "$PREPROCESS_DIR" \
-    --tag 300k \
-    --suffix "_clean"
-
 echo ""
 echo "Preprocessing complete. Using cleaned datasets for training."
 echo ""
@@ -101,10 +89,10 @@ RESULTS_DIR="$WORK_DIR/results"
 # Anchor files (from preprocessing)
 ANCHORS_PRIMARY="$PREPROCESS_DIR/anchors_clean_100k.txt"
 ANCHORS_EXTRA="$PREPROCESS_DIR/anchors_clean_300k.txt"
-VOC_PRIMARY="$PREPROCESS_DIR/voc_clean_100k.txt"
-VOC_EXTRA="$PREPROCESS_DIR/voc_clean_300k.txt"
-VMPP_PRIMARY="$PREPROCESS_DIR/vmpp_clean_100k.txt"
-VMPP_EXTRA="$PREPROCESS_DIR/vmpp_clean_300k.txt"
+VOC_PRIMARY="$SCALAR_DIR/voc_clean_100k.txt"
+VOC_EXTRA="$SCALAR_DIR/voc_clean_300k.txt"
+VMPP_PRIMARY="$SCALAR_DIR/vmpp_clean_100k.txt"
+VMPP_EXTRA="$SCALAR_DIR/vmpp_clean_300k.txt"
 
 CTRL_POINTS=8
 

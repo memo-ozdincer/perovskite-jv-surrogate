@@ -57,6 +57,7 @@ ATCN_DATA_DIR="$OUTPUT_BASE/data_cache"
 RESULTS_DIR="$OUTPUT_BASE/results"
 DIAGNOSTICS_DIR="$OUTPUT_BASE/diagnostics"
 LOGS_DIR="$WORK_DIR/logs"
+SCALAR_DIR="${SCALAR_DIR:-$WORK_DIR/scalars_external}"
 
 # Raw data
 PARAMS_PRIMARY="$WORK_DIR/LHS_parameters_m.txt"
@@ -72,6 +73,8 @@ BATCH_SIZE=128
 
 # Physics features & Jacobian regularization
 USE_PHYSICS_FEATURES=true
+USE_PHYSICS_FEATURE_SELECTION=true
+PHYSICS_MAX_FEATURES=5
 JACOBIAN_WEIGHT=0.0
 
 # ── Environment setup ────────────────────────────────────────────────────────
@@ -116,18 +119,10 @@ if [ "$FIGURES_ONLY" = false ] && [ "$SKIP_PREPROCESSING" = false ]; then
         --output-dir "$PREPROCESS_DIR" \
         --min-ff $MIN_FF --min-vmpp $MIN_VMPP --suffix "_clean"
 
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" --tag 100k --suffix "_clean"
-
     python scripts/preprocess_data.py \
         --params "$PARAMS_EXTRA" --iv "$IV_EXTRA" \
         --output-dir "$PREPROCESS_DIR" \
         --min-ff $MIN_FF --min-vmpp $MIN_VMPP --suffix "_clean"
-
-    python scripts/generate_scalar_txt.py \
-        --iv "$PREPROCESS_DIR/IV_m_300k_clean.txt" \
-        --output-dir "$PREPROCESS_DIR" --tag 300k --suffix "_clean"
 
     STEP_END=$(date +%s)
     echo "Preprocessing: $((STEP_END - STEP_START))s" >> $TIMING_LOG
@@ -138,10 +133,10 @@ PARAMS_CLEAN="$PREPROCESS_DIR/LHS_parameters_m_clean.txt"
 IV_CLEAN="$PREPROCESS_DIR/IV_m_clean.txt"
 PARAMS_EXTRA_CLEAN="$PREPROCESS_DIR/LHS_parameters_m_300k_clean.txt"
 IV_EXTRA_CLEAN="$PREPROCESS_DIR/IV_m_300k_clean.txt"
-VOC_100K="$PREPROCESS_DIR/voc_clean_100k.txt"
-VMPP_100K="$PREPROCESS_DIR/vmpp_clean_100k.txt"
-VOC_300K="$PREPROCESS_DIR/voc_clean_300k.txt"
-VMPP_300K="$PREPROCESS_DIR/vmpp_clean_300k.txt"
+VOC_100K="$SCALAR_DIR/voc_clean_100k.txt"
+VMPP_100K="$SCALAR_DIR/vmpp_clean_100k.txt"
+VOC_300K="$SCALAR_DIR/voc_clean_300k.txt"
+VMPP_300K="$SCALAR_DIR/vmpp_clean_300k.txt"
 
 # Verify files
 echo ""
@@ -178,10 +173,10 @@ if [ "$FIGURES_ONLY" = false ]; then
     mkdir -p "$EXP_OUT" "$EXP_DATA"
 
     if [ "$DRY_RUN" = true ]; then
-        echo "  [DRY RUN] train_attention_tcn.py --architecture conv --no-attention --use-dilated"
+        echo "  [DRY RUN] train_dilated_conv.py --architecture conv --no-attention --use-dilated"
         echo "            physics_features=$USE_PHYSICS_FEATURES  jacobian_weight=$JACOBIAN_WEIGHT"
     else
-        python train_attention_tcn.py \
+        python train_dilated_conv.py \
             --params "$PARAMS_CLEAN" \
             --iv "$IV_CLEAN" \
             --params-extra "$PARAMS_EXTRA_CLEAN" \
@@ -198,6 +193,7 @@ if [ "$FIGURES_ONLY" = false ]; then
             --enable-example-plots \
             --architecture conv --no-attention --use-dilated \
             ${USE_PHYSICS_FEATURES:+--use-physics-features} \
+            ${USE_PHYSICS_FEATURE_SELECTION:+--physics-feature-selection --physics-max-features $PHYSICS_MAX_FEATURES} \
             --jacobian-weight $JACOBIAN_WEIGHT \
             --force-preprocess \
             2>&1 | tee "$EXP_OUT/train.log"
