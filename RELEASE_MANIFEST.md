@@ -10,6 +10,8 @@ This manifest defines the publish-facing structure for the dilated-convolution S
 
 ## New publish-facing entrypoints
 
+- `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_training.sh`
+- `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_inference.sh`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/slurm_dilated_conv_master_pipeline.sh`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/slurm_dilated_conv_single.sh`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/train_dilated_conv.py`
@@ -25,6 +27,8 @@ Compatibility files are intentionally kept and not moved/deleted.
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/config.py`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/data.py`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/features.py`
+- `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_training.sh`
+- `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_inference.sh`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/train_attention_tcn.py`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/train_dilated_conv.py`
 - `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/inference_tcn_dilated.py`
@@ -64,6 +68,8 @@ Current master/single pipelines pass `--physics-feature-selection`.
 
 Use this in README:
 
+- `Paper training`: `run_paper_training.sh`
+- `Paper inference`: `run_paper_inference.sh`
 - `Quickstart (single run)`: `slurm_dilated_conv_single.sh`
 - `Full ablation pipeline`: `slurm_dilated_conv_master_pipeline.sh`
 - `Trainer`: `train_dilated_conv.py`

@@ -9,6 +9,8 @@ This release is centered on the **bidirectional dilated convolution** model (no 
 
 ## Repository Entry Points
 
+- Paper training entrypoint: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_training.sh`
+- Paper inference entrypoint: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_inference.sh`
 - Single-run pipeline: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/slurm_dilated_conv_single.sh`
 - Full ablation pipeline: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/slurm_dilated_conv_master_pipeline.sh`
 - Trainer CLI: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/train_dilated_conv.py`
@@ -42,15 +44,15 @@ Important: this repo does **not** compute publishing scalars from true IV curves
 ### 3) Train Stage-2 model
 
 ```bash
-python3 train_dilated_conv.py \
+bash run_paper_training.sh \
   --params /abs/path/LHS_parameters_m_clean.txt \
   --iv /abs/path/IV_m_clean.txt \
+  --voc /abs/path/voc_clean_100k.txt \
+  --vmpp /abs/path/vmpp_clean_100k.txt \
   --params-extra /abs/path/LHS_parameters_m_300k_clean.txt \
   --iv-extra /abs/path/IV_m_300k_clean.txt \
-  --scalar-files /abs/path/voc_clean_100k.txt /abs/path/vmpp_clean_100k.txt \
-  --scalar-files-extra /abs/path/voc_clean_300k.txt /abs/path/vmpp_clean_300k.txt \
-  --architecture conv --no-attention --use-dilated \
-  --use-physics-features --physics-feature-selection \
+  --voc-extra /abs/path/voc_clean_300k.txt \
+  --vmpp-extra /abs/path/vmpp_clean_300k.txt \
   --output-dir /abs/path/out \
   --data-dir /abs/path/cache
 ```
@@ -58,7 +60,7 @@ python3 train_dilated_conv.py \
 ### 4) Run inference
 
 ```bash
-python3 inference_tcn_dilated.py \
+bash run_paper_inference.sh \
   --params /abs/path/params.csv \
   --voc /abs/path/voc.txt \
   --vmpp /abs/path/vmpp.txt \
