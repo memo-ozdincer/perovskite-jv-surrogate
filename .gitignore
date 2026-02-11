@@ -1,23 +1,12 @@
-# Large experiment outputs / artifacts
-NEWRESULTS/
+# Outputs and artifacts
+outputs/
 results/
-analysisresults/
 diagnostics/
-newfigs/
-figures/
-data/
 
 # Local caches and compiled files
 __pycache__/
 *.pyc
 .DS_Store
-
-# Raw/processed large numeric dumps
-IV_m*.txt
-LHS_parameters_m*.txt
-*anchors*_*.txt
-*voc*_*.txt
-*vmpp*_*.txt
 
 # Model and training artifacts
 *.ckpt
@@ -27,10 +16,12 @@ LHS_parameters_m*.txt
 *.mmap
 *.npz
 *.npy
-*.csv
 *.log
 
 # TensorBoard / runtime folders
 tb_logs/
 lightning_logs/
-outputs/
+
+# IDE
+.vscode/
+.idea/

@@ -1,16 +1,11 @@
-# Core dependencies
 numpy>=1.24.0
 pandas>=2.0.0
 torch>=2.1.0
-lightgbm>=4.0.0
-
-# HPO
-optuna>=3.4.0
-
-# Utilities
+pytorch-lightning>=2.1.0
+scipy>=1.11.0
 scikit-learn>=1.3.0
 joblib>=1.3.0
-
-# Note: For GPU support with LightGBM, install with:
-# pip install lightgbm --config-settings=cmake.define.USE_GPU=ON
-# Or use conda: conda install -c conda-forge lightgbm-gpu
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+Pillow>=10.0.0

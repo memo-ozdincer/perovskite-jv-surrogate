@@ -2,7 +2,6 @@
 """
 Prepare scalar TXT files (Voc, Vmpp) from externally predicted sources.
 
-This script does NOT compute scalars from true IV curves.
 It only reformats externally predicted scalar files into the naming
 convention expected by the Stage-2 curve model pipeline.
 """

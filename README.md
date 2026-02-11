@@ -1,89 +1,153 @@
-# PINN-Coupled-PDE-Solver (ICML Release)
+# Physics-Informed Convolutional Surrogates for Coupled Drift-Diffusion Equations
 
-Physics-constrained Stage-2 surrogate for perovskite J-V curve reconstruction.
+Reconstructing full J-V curves of perovskite solar cells from 31 coupled drift-diffusion parameters.
 
-This release is centered on the **bidirectional dilated convolution** model (no attention), with a modular two-stage setup:
+**Paper:** *Physics-Informed Convolutional Surrogates for Coupled Drift-Diffusion Equations: Reconstructing Full J-V Curves of Perovskite Solar Cells* (Ozdincer, 2026)
 
-- Stage-1: external scalar predictor (MATLAB) provides `Voc`, `Vmpp`
-- Stage-2: this repo reconstructs 8-point curves (and optional 45-point PCHIP curves)
+**Pre-trained models:** [huggingface.co/memo-ozdincer/perovskite-jv-surrogate](https://huggingface.co/memo-ozdincer/perovskite-jv-surrogate)
 
-## Repository Entry Points
+**Dataset (~150k devices):** [huggingface.co/datasets/memo-ozdincer/perovskite-jv-comsol-150k](https://huggingface.co/datasets/memo-ozdincer/perovskite-jv-comsol-150k)
 
-- Paper training entrypoint: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_training.sh`
-- Paper inference entrypoint: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/run_paper_inference.sh`
-- Single-run pipeline: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/slurm_dilated_conv_single.sh`
-- Full ablation pipeline: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/slurm_dilated_conv_master_pipeline.sh`
-- Trainer CLI: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/train_dilated_conv.py`
-- Inference CLI (31 params + `Voc`/`Vmpp`): `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/inference_tcn_dilated.py`
-- Preprocessing: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/scripts/preprocess_data.py`
-- External scalar packaging: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/scripts/generate_scalar_txt.py`
-- Result aggregation: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/dilated_collect_results.py`
-- Figure/table generation: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/dilated_generate_figures.py`
-- Aggregate analysis: `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/dilated_analysis.py`
+## Key Results
 
-## Quickstart
+| Metric | Mean | Median |
+|---|---|---|
+| R² (per-curve, ΔV-weighted) | 0.9858 ± 0.0009 | **0.9975 ± 0.0004** |
+| MAE (A/m²) | 4.75 ± 0.26 | 2.96 ± 0.34 |
+| \|V_oc error\| (V) | 0.0056 ± 0.0058 | **0.00039 ± 0.00016** |
 
-### 1) Install dependencies
+- Median V_oc error of 0.39 mV is an order of magnitude below experimental measurement uncertainty
+- \>10⁴× speedup over COMSOL FEM (10⁶-device screening in <1 hour on a single GPU)
+- Training completes in ~10 min on a single NVIDIA L40S GPU
+
+## Method Overview
+
+A two-stage surrogate pipeline:
+
+1. **Stage 1** (external, Zhao et al.): Three-layer ANNs predict scalar metrics (V_oc, V_mpp) from 31 raw COMSOL parameters
+2. **Stage 2** (this repository): A physics-constrained dilated convolutional network reconstructs 8-point J-V curves from the 31 parameters + Stage-1 scalars + 5 physics-derived features
+
+### Architecture
+
+```
+31 params + 2 scalars + 5 physics features
+    → ParamMLP (3-layer, 256→128→128)
+    → Broadcast + Gaussian RBF voltage encoding (8 positions × 256 channels)
+    → 3× Dilated 1D Conv blocks (bidirectional, kernel=5, dilation up to 2)
+    → Pointwise linear → 8-point normalized J-V curve
+    → PCHIP interpolation → 45-point full curve
+```
+
+### Physics-Constrained Loss
+
+```
+L = 0.98·L_MSE + 0.005·L_monotonicity + 0.005·L_convexity + 0.01·L_curvature + λ·L_jacobian
+```
+
+### Physics Feature Engineering
+
+71 analytically derived drift-diffusion features are distilled to 5 based on independent physical mechanisms:
+
+1. **J_max^log** — Beer-Lambert photocurrent ceiling (generation)
+2. **E_g** — Perovskite band gap (energetics)
+3. **E_g^offset** — Band gap vs built-in potential mismatch (field alignment)
+4. **χ_P^e** — Perovskite electron affinity (interface band alignment)
+5. **V_oc^loss** — Composite recombination metric (recombination losses)
+
+## Repository Structure
+
+```
+├── src/                        # Core Python modules
+│   ├── train.py                # Main training script (PyTorch Lightning)
+│   ├── inference.py            # Inference CLI
+│   ├── config.py               # 31-parameter definitions, voltage grid, constants
+│   ├── features.py             # 71 physics-derived feature computation
+│   ├── data.py                 # Dataset loaders and transforms
+│   ├── preprocessing.py        # Parameter scaling pipeline (log1p → Robust → MinMax)
+│   ├── metrics_curve.py        # ΔV-weighted evaluation metrics
+│   ├── physics_analysis.py     # Jacobian sensitivity analysis
+│   ├── logging_utils.py        # Training logging utilities
+│   └── plotting_utils.py       # Visualization utilities
+├── scripts/                    # Shell entry points
+│   ├── run_paper_training.sh   # Training entrypoint with paper defaults
+│   ├── run_paper_inference.sh  # Inference entrypoint
+│   └── generate_scalar_txt.py  # Utility to package scalar predictions
+├── paper/                      # LaTeX source
+│   └── icml_paper.tex
+├── NEWRESULTS/                 # Pre-trained model and data (HuggingFace)
+├── requirements.txt
+└── README.md
+```
+
+## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-pip install pytorch-lightning scipy seaborn pillow tqdm
 ```
 
-### 2) Prepare inputs
+Requires Python 3.10+ and a CUDA-capable GPU for training (CPU inference is supported).
 
-- Parameters: 31-column file (`.csv` or `.txt`)
-- External scalar files from Stage-1 (MATLAB):
-  - `voc_clean_100k.txt`, `vmpp_clean_100k.txt`
-  - `voc_clean_300k.txt`, `vmpp_clean_300k.txt`
+## Data
 
-Important: this repo does **not** compute publishing scalars from true IV curves.
+The model expects:
+- **31-parameter file**: Tab/comma-separated, one row per device, 31 COMSOL drift-diffusion parameters (see `src/config.py` for column names)
+- **I-V curve file**: Tab/comma-separated, one row per device, 45 current-density values on the non-uniform voltage grid
+- **Scalar files**: One-column text files for V_oc and V_mpp (from Stage-1 predictions or COMSOL ground truth)
 
-### 3) Train Stage-2 model
+The 31 parameters span >20 orders of magnitude and cover: layer thicknesses, carrier mobilities, density of states, band edges, work functions, permittivities, generation rate, recombination coefficients, SRH lifetimes, and surface recombination velocities.
+
+## Training
 
 ```bash
-bash run_paper_training.sh \
-  --params /abs/path/LHS_parameters_m_clean.txt \
-  --iv /abs/path/IV_m_clean.txt \
-  --voc /abs/path/voc_clean_100k.txt \
-  --vmpp /abs/path/vmpp_clean_100k.txt \
-  --params-extra /abs/path/LHS_parameters_m_300k_clean.txt \
-  --iv-extra /abs/path/IV_m_300k_clean.txt \
-  --voc-extra /abs/path/voc_clean_300k.txt \
-  --vmpp-extra /abs/path/vmpp_clean_300k.txt \
-  --output-dir /abs/path/out \
-  --data-dir /abs/path/cache
+bash scripts/run_paper_training.sh \
+    --params /path/to/LHS_parameters.txt \
+    --iv /path/to/IV_curves.txt \
+    --voc /path/to/voc_predictions.txt \
+    --vmpp /path/to/vmpp_predictions.txt \
+    --output-dir ./outputs/paper_train \
+    --batch-size 512 \
+    --seed 42
 ```
 
-### 4) Run inference
+Key training flags:
+- `--batch-size 512`: Paper default (largest single-factor improvement)
+- `--no-physics-features`: Ablation without physics feature engineering
+- `--physics-max-features N`: Number of selected physics features (default: 5)
+- `--force-preprocess`: Regenerate cached preprocessing artifacts
+
+Outputs: model checkpoint (`best-model.ckpt`), preprocessing transformers (`cnn_*.joblib`), and diagnostic plots.
+
+## Inference
 
 ```bash
-bash run_paper_inference.sh \
-  --params /abs/path/params.csv \
-  --voc /abs/path/voc.txt \
-  --vmpp /abs/path/vmpp.txt \
-  --checkpoint /abs/path/best-model.ckpt \
-  --cache-dir /abs/path/cache \
-  --output-dir /abs/path/inference_out
+bash scripts/run_paper_inference.sh \
+    --params /path/to/params.txt \
+    --voc /path/to/voc.txt \
+    --vmpp /path/to/vmpp.txt \
+    --checkpoint /path/to/best-model.ckpt \
+    --cache-dir /path/to/training_cache \
+    --output-dir ./outputs/inference
 ```
 
-## Feature Selection
+Outputs:
+- `predictions_8pt_normalized.csv` — 8-point J_sc-normalized curve predictions
+- `predictions_45pt_normalized.csv` — PCHIP-interpolated 45-point curves
+- `predictions_*_absolute.csv` — Absolute current (requires `--jsc` flag)
 
-The trainer supports train-only physics feature filtering:
+## Citation
 
-- `--physics-feature-selection`
-- `--physics-weak-threshold` (default `0.30`)
-- `--physics-corr-threshold` (default `0.85`)
-- `--physics-max-features` (optional)
+```bibtex
+@article{ozdincer2026physics,
+  title={Physics-Informed Convolutional Surrogates for Coupled Drift-Diffusion Equations: Reconstructing Full {J-V} Curves of Perovskite Solar Cells},
+  author={Ozdincer, Mehmet},
+  year={2026}
+}
+```
 
-If exact `m=5` is required, use `--physics-max-features 5`.
+## Acknowledgments
 
-## Publishing Layout
+Stage-1 scalar predictors are from Zhao et al. (2025), "Accelerating device characterization in perovskite solar cells via neural network approach," *Applied Energy*, 392:125922.
 
-See `/Users/memoozdincer/Desktop/NUS2026/PINN-Coupled-PDE-Solver/RELEASE_MANIFEST.md` for:
+## License
 
-- GitHub keep list
-- Hugging Face dataset/model split
-- release notes and compatibility aliases
+See [LICENSE](LICENSE) for details.

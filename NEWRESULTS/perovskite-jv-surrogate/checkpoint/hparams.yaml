@@ -1,0 +1,78 @@
+_output_dir: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/T0-10-BS512/seed_42
+dataset:
+  curvature_weighting:
+    alpha: 4.0
+    power: 1.5
+  dataloader:
+    batch_size: 512
+    num_workers: 12
+    persistent_workers: true
+    pin_memory: true
+    prefetch_factor: 4
+  paths:
+    i_fine_memmap: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42/atcn_i_fine_curves.mmap
+    iv_raw_txt: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/IV_m_clean.txt
+    iv_raw_txt_extra: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/IV_m_300k_clean.txt
+    output_dir: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42
+    param_transformer: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42/atcn_param_transformer.joblib
+    params_csv: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/LHS_parameters_m_clean.txt
+    params_csv_extra: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/LHS_parameters_m_300k_clean.txt
+    physics_transformer: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42/atcn_physics_transformer.joblib
+    preprocessed_npz: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42/atcn_preprocessed.npz
+    scalar_files:
+    - /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/voc_clean_100k.txt
+    - /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/vmpp_clean_100k.txt
+    scalar_files_extra:
+    - /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/voc_clean_300k.txt
+    - /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/preprocessed/vmpp_clean_300k.txt
+    scalar_transformer: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42/atcn_scalar_transformer.joblib
+    v_fine_memmap: /scratch/memoozd/ts-tools-scratch/dbe/scalar_predictors/outputs/tcn_icml_20260207/data_cache/T0-10-BS512_seed42/atcn_v_fine_curves.mmap
+  pchip:
+    n_fine: 2000
+    n_post_mpp: 4
+    n_pre_mpp: 3
+    seq_len: 8
+    v_max: 1.4
+  use_physics_features: false
+model:
+  architecture: conv
+  dense_units:
+  - 256
+  - 128
+  - 128
+  dropout: 0.03631232181608377
+  embedding_type: gaussian
+  filters:
+  - 128
+  - 64
+  gaussian_bands: 18
+  gaussian_sigma: 0.07749512610240868
+  heads: 4
+  kernel: 5
+  loss_weights:
+    convex: 0.005
+    excess_threshold: 0.8
+    excurv: 0.01
+    jacobian: 0.0
+    mono: 0.005
+    mse: 0.98
+  param_dim: 33
+  use_attention: false
+  use_dilated_conv: true
+optimizer:
+  final_lr_ratio: 0.00666
+  lr: 0.005545402750717978
+  warmup_epochs: 7
+  weight_decay: 5.403751961152276e-05
+train:
+  enable_example_plots: false
+  run_name: T0-10-BS512_seed42
+  seed: 42
+trainer:
+  accelerator: auto
+  benchmark: true
+  devices: auto
+  gradient_clip_val: 1.0
+  log_every_n_steps: 25
+  max_epochs: 100
+  precision: bf16-mixed
