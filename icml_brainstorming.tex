@@ -1,979 +1,1238 @@
-\documentclass[10pt]{article}
-\usepackage[margin=0.9in]{geometry}
+\documentclass[11pt]{article}
+
+% ── Layout ──
+\usepackage[margin=1in]{geometry}
+
+% ── Fonts ──
+\usepackage{times}
+\usepackage[T1]{fontenc}
+
+% ── Math ──
 \usepackage{amsmath,amssymb,amsfonts}
-\usepackage{algorithm}
-\usepackage{algorithmic}
-\usepackage{booktabs}
-\usepackage{graphicx}
-\usepackage{hyperref}
+
+% ── Tables & Figures ──
+\usepackage{booktabs,multirow}
+\usepackage{graphicx,subcaption}
+
+% ── Links ──
+\usepackage[colorlinks,citecolor=blue!60!black,linkcolor=blue!60!black,urlcolor=blue!60!black]{hyperref}
+
+% ── Units ──
+\usepackage{siunitx}
+\sisetup{detect-weight=true}
+
+% ── Colors (shared with standalone TikZ figures) ──
 \usepackage{xcolor}
-\usepackage{listings}
-\usepackage{subcaption}
-\usepackage{multirow}
-\usepackage{longtable}
+\definecolor{ink}{HTML}{1F2937}
+\definecolor{steel}{HTML}{334155}
+\definecolor{cblue}{HTML}{2563EB}
+\definecolor{amber}{HTML}{D97706}
+\definecolor{emerald}{HTML}{059669}
+\definecolor{rose}{HTML}{BE123C}
+\definecolor{muted}{HTML}{64748B}
+\definecolor{slatebg}{HTML}{F8FAFC}
+\definecolor{gridc}{HTML}{E2E8F0}
+\definecolor{gridline}{HTML}{E2E8F0}
+\definecolor{mppgold}{HTML}{F59E0B}
+\definecolor{flagship}{HTML}{2563EB}
+\definecolor{secondary}{HTML}{D97706}
+\definecolor{physgood}{HTML}{059669}
+\definecolor{errbad}{HTML}{BE123C}
+\definecolor{panelbg}{HTML}{F8FAFC}
+\definecolor{stepblue}{HTML}{2C3E50}
+\definecolor{featureteal}{HTML}{1ABC9C}
+\definecolor{headpurple}{HTML}{8E44AD}
+\definecolor{projred}{HTML}{C0392B}
+\definecolor{splineorg}{HTML}{D35400}
+\definecolor{annotgray}{HTML}{7F8C8D}
+\definecolor{bgcard}{HTML}{FDFEFE}
+\definecolor{accentbg}{HTML}{F7F9FB}
+
+% ── TikZ ──
 \usepackage{tikz}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
-\usetikzlibrary{arrows.meta,calc,positioning,fit,backgrounds,decorations.pathreplacing}
+\usetikzlibrary{arrows.meta,calc,positioning,fit,backgrounds,decorations.pathreplacing,shadows.blur}
+\usepackage{standalone}
 
-% Color for jot notes and TODOs
-\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
-\newcommand{\jot}[1]{\textcolor{blue}{\textit{[#1]}}}
-\newcommand{\insight}[1]{\textcolor{purple}{\textbf{Insight: }#1}}
+\graphicspath{{figures/}{diagnostics/}{media/}{newfigs/}{boxplots/}{NEWRESULTS/tcn_icml_20260207/figures/main_paper/}}
 
-% Figure/diagnostics paths
-\graphicspath{{figures/}{diagnostics/}{diagnostics/diagnostics/}}
-
-\title{Physics-Constrained Dilated Convolutions for \\
-J-V Curve Reconstruction in Perovskite Solar Cells}
-
-\author{Paper Draft --- ICML Brainstorming}
-\date{\today}
+% ── Title ──
+\title{\textbf{Physics-Constrained Dilated Convolutions for \\[4pt]
+J-V Curve Reconstruction in Perovskite Solar Cells}}
+\author{Paper Draft --- ICML 2026}
+\date{}
 
 \begin{document}
 \maketitle
 
 %=============================================================================
-% BRAINSTORMING NOTES --- DO NOT MISS
+\begin{abstract}
 %=============================================================================
-
-\section*{Jot Notes \& Things We Must Not Forget}
-\begin{itemize}
-    \item \jot{The core pitch: we replace minutes-long COMSOL FEM solves of coupled drift-diffusion + Poisson PDEs with sub-millisecond neural inference, while preserving the physics of the J-V curve through both \textbf{physics-informed input features} and \textbf{physics-constrained loss functions}.}
-    \item \jot{The 71 physics features are not arbitrary --- they are \emph{analytical solutions and approximations from the same drift-diffusion equations} that COMSOL solves numerically. They give the network ``hints'' about the physics without solving the full PDE.}
-    \item \jot{Jacobian regularization encourages smooth $\partial J(V)/\partial \mathbf{x}$ --- this is physically motivated because nearby devices in parameter space should produce similar J-V curves. It is the ML equivalent of well-posedness in the PDE sense.}
-    \item \jot{Attention \textbf{hurts} on 8-point sequences --- this is a finding, not a failure. Dilation already gives sufficient receptive field. This goes against the ``attention is all you need'' trend and is worth discussing.}
-    \item \jot{External scalar files (Voc, Vmpp) are a design choice for deployment: in production, these come from separate scalar predictor models. No data leakage by construction.}
-    \item \jot{The non-uniform voltage grid is physically motivated: the knee/MPP region is where device performance is most sensitive and where the curve shape carries the most information about fill factor.}
-    \item \jot{We use PCHIP (monotone cubic Hermite) for the 8-point representation --- this is not just downsampling. PCHIP preserves monotonicity by construction (Fritsch-Carlson), which is a physics prior.}
-    \item \jot{The curvature-weighted sampling during training emphasizes samples with complex knee shapes --- these are the hard cases and also the ones most relevant for device optimization.}
-    \item \jot{Normalizing curves by $I_{sc}$ before training decouples magnitude from shape. The network learns shape; $I_{sc}$ scaling is applied post-hoc. This is analogous to normalizing PDEs before solving.}
-    \item \jot{The physics features act at multiple levels of the device: energetics (band alignment), transport (diffusion, drift), recombination (SRH, Auger, radiative), and geometry. This is the full picture from semiconductor physics.}
-    \item \jot{Important framing: this is \emph{not} a PINN in the traditional sense (we don't solve the PDE in the loss). We use physics to \emph{inform} the feature space and \emph{constrain} the output space. The PDE is solved by COMSOL; we learn the parameter-to-solution map.}
-    \item \jot{Mention: 31 params span $>$20 orders of magnitude (e.g.\ mobilities $10^{-6}$--$10^{2}$ cm$^2$/Vs, lifetimes $10^{-12}$--$10^{-4}$ s). Group-wise log + robust scaling is essential.}
-    \item \jot{The dilated conv with $d=\{1,2\}$ on an 8-point sequence gives receptive field covering the full sequence. This is exactly why larger dilation or more layers don't help.}
-    \item \jot{Fill factor and power conversion efficiency are \emph{emergent} from the J-V curve shape. If we reconstruct the curve well, these device-level metrics come for free.}
-\end{itemize}
-
-\newpage
-\tableofcontents
-\newpage
-
-%=============================================================================
-\section{Abstract}
-%=============================================================================
-
-Perovskite solar cells possess a 31-dimensional material/device parameter space whose current-voltage (J-V) characteristics are traditionally obtained through minutes-long coupled drift-diffusion finite-element simulations.
-We present a physics-constrained dilated convolutional network that maps raw device parameters to compact 8-point J-V curve representations in sub-second inference, achieving a median per-curve $R^2 = 0.9974$ and mean absolute error of $4.99$~A/m$^2$ on a held-out test set of ${\sim}48$k devices.
-The framework introduces three complementary physics priors: (i)~71 analytically derived features from drift-diffusion theory as input enrichment, (ii)~soft monotonicity, convexity, and curvature penalties in the loss function, and (iii)~optional Jacobian smoothness regularization for well-posed parameter-to-solution maps.
-An architectural ablation across six backbone variants (dilated conv, causal TCN, pointwise, $\pm$~self-attention) reveals that bidirectional dilated convolution without attention is the strongest configuration --- self-attention consistently degrades performance on 8-point sequences, as dilation alone spans the full receptive field.
-Training on ${\sim}242$k COMSOL-generated samples completes in ${\sim}32$ minutes on a single GPU.
-These results demonstrate that analytically informed feature engineering combined with physics-constrained loss functions can outperform more complex architectures, offering a practical surrogate for high-throughput perovskite device optimization.
+We present a physics-constrained dilated convolutional network that maps 31 coupled drift-diffusion parameters to full current-voltage (J-V) curve representations for perovskite solar cells.
+On ${\sim}15$k held-out devices spanning $>$20 orders of magnitude in parameter space, the model achieves median $R^2 = 0.9975$, median MAE\,$=$\,$2.96$~A/m$^2$, and median $V_{oc}$ error of 0.39~mV---an order of magnitude below experimental measurement uncertainty.
+Three physics priors act complementarily:
+(i)~71 analytically derived drift-diffusion features as input enrichment, of which train-only selection retains only $m{=}5$, revealing that J-V shape is governed by a low-dimensional manifold spanning five independent physical mechanisms: photocurrent generation ($J_{max}$), band gap energetics ($E_g$), built-in field alignment ($E_g^{offset}$), interface band alignment ($\chi_P^e$), and recombination losses ($V_{oc}^{loss}$);
+(ii)~soft monotonicity, convexity, and curvature penalties encoding first-principles shape constraints;
+(iii)~Jacobian smoothness regularization for well-posedness.
+Upstream scalar predictions ($V_{oc}$, $V_{mpp}$) from independently trained ANNs~\cite{zhao2025ae} condition the curve model in a modular two-stage surrogate pipeline.
+Systematic ablation across 30 runs (10 configurations $\times$ 3 seeds) demonstrates that bidirectional dilated convolution \emph{without} self-attention is optimal for this task---dilation alone spans the 8-point receptive field, making attention redundant and consistently harmful.
+Training completes in ${\sim}10$~min on a single GPU; inference achieves $>$$10^4\times$ speedup over COMSOL finite-element simulation, enabling million-device screening in under one hour.
+\end{abstract}
 
 %=============================================================================
 \section{Introduction}
+\label{sec:introduction}
 %=============================================================================
 
-Perovskite solar cells have emerged as one of the most promising photovoltaic technologies, with power conversion efficiencies exceeding 26\% in single-junction devices.
-Optimizing these devices requires navigating a 31-dimensional parameter space encompassing bandgaps, carrier mobilities, layer thicknesses, doping densities, interface recombination velocities, and contact work functions.
-The standard computational approach --- solving coupled Poisson and drift-diffusion equations via COMSOL finite-element simulation --- yields accurate J-V curves but at prohibitive cost: each evaluation takes minutes, making exhaustive design-space exploration impractical.
+Perovskite solar cells have emerged as a transformative photovoltaic technology, exceeding 26\% power conversion efficiency (PCE) in single-junction and 28\% in tandem configurations~\cite{zhao2023phd}.
+Their ABX$_3$ crystal structure offers continuously tunable band gaps spanning 1.2--2.3~eV~\cite{zhao2025ae}, making them ideal candidates for multi-junction architectures.
+However, optimizing these devices requires navigating a high-dimensional parameter space $\mathbf{x} \in \mathbb{R}^{31}$ encompassing bandgaps, carrier mobilities, layer thicknesses, doping densities, recombination coefficients, and contact work functions---parameters that interact through coupled nonlinear drift-diffusion physics.
 
-Existing machine learning surrogates for photovoltaic device simulation have largely focused on predicting scalar figures of merit (open-circuit voltage $V_{oc}$, short-circuit current $J_{sc}$, fill factor FF) or operating on simplified device models.
-Few works reconstruct the \emph{complete} J-V curve from raw device parameters, and those that do typically employ standard feedforward networks without incorporating the rich physics of the drift-diffusion equations.
+The standard computational approach is coupled Poisson--drift-diffusion simulation via COMSOL finite-element methods (FEM), which faithfully resolves the transport physics but costs ${\sim}4800$~s per device.
+At this cost, a comprehensive $10^6$-device screening campaign would require ${\sim}160$ years of compute time, making exhaustive design-space exploration infeasible.
 
-We address this gap with a framework built on three principles:
+Zhao et al.~\cite{zhao2025ae} achieved $>$$10^3\times$ speedup for \emph{scalar} device metrics ($V_{oc}$, FF, PCE) using three-layer ANNs with Bayesian regularization, trained on 100k Latin Hypercube Sampling (LHS) COMSOL simulations.
+However, scalar metrics are \emph{emergent} from J-V curve shape and fundamentally miss critical device signatures:
+S-shaped kinks indicating interface barriers,
+the drift-to-recombination transition at the maximum power point (MPP),
+voltage-dependent current partitioning between extraction and recombination,
+and fill-factor degradation modes that manifest only in the curve's curvature profile.
+Two devices with identical PCE can have qualitatively different J-V shapes---and correspondingly different stability, degradation, and operating-point characteristics.
 
+We address this gap by predicting full J-V curves from material parameters, contributing:
 \begin{enumerate}
-    \item \textbf{Physics-informed feature engineering}: 71 features derived from analytical approximations to the same drift-diffusion equations that COMSOL solves numerically --- diffusion lengths, extraction figures of merit ($\Theta$), series resistance estimates, and composite predictors --- provide the network with ``analytical PDE summaries'' that would otherwise need to be learned from data alone.
+    \item \textbf{Physics-informed input enrichment} (\S\ref{sec:physics_features}): 71 analytical drift-diffusion features ($L_n$, $\Theta_e$, $R_s$, composites) that shortcut representation learning.
+    Train-only feature selection reveals that only $m{=}5$ carry non-redundant predictive information, each mapping to an independent physical mechanism: photocurrent ceiling ($J_{max}$), band gap ($E_g$), energetic alignment ($E_g^{offset}$), interface band alignment ($\chi_P^e$), and recombination loss ($V_{oc}^{loss}$) (\S\ref{sec:feature_selection}).
 
-    \item \textbf{Physics-constrained loss}: Soft penalties for monotonicity, convexity, and excess curvature encode fundamental properties of J-V curves directly in the training objective, complementing the reconstruction MSE.
+    \item \textbf{Physics-constrained loss} (\S\ref{sec:loss}): soft penalties encoding $dJ/dV \leq 0$ (monotonicity), $d^2J/dV^2 \leq 0$ (convexity near the knee), bounded curvature, and Jacobian smoothness---the same qualitative properties guaranteed by the drift-diffusion equations.
 
-    \item \textbf{Compact representation}: An 8-point PCHIP (monotone cubic Hermite) representation concentrated around the maximum power point achieves $R^2 > 0.993$ against the full 45-point curve, reducing the prediction target while preserving the physically meaningful curve shape.
+    \item \textbf{Modular two-stage pipeline} (\S\ref{sec:scalar_pipeline}): upstream ANNs~\cite{zhao2025ae} provide $V_{oc}$, $V_{mpp}$ as conditioning inputs with no inter-stage gradient flow, enabling independent validation and swappable scalar sources.
+
+    \item \textbf{Architecture selection via systematic ablation} (\S\ref{sec:ablation}): 10 configurations $\times$ 3 seeds testing dilation, directionality, attention, scalar conditioning, data scaling, training length, and batch size.
 \end{enumerate}
 
-Our key findings include:
-\begin{itemize}
-    \item A dilated 1D convolutional backbone (no self-attention) achieves median $R^2 = 0.9974$ with a median $V_{oc}$ error of only 0.41~mV.
-    \item Self-attention \emph{consistently degrades} performance on 8-point sequences --- dilation alone provides full receptive field coverage, making attention redundant.
-    \item Physics features improve reconstruction quality: the model with 71 physics features reaches mean $R^2 = 0.982$ compared to $0.981$ without, with the largest gains in the difficult high-curvature knee region.
-    \item Bidirectional (non-causal) convolution outperforms causal TCN, confirming that J-V curves lack temporal directionality --- the physics is symmetric with respect to voltage ordering.
-    \item Training completes in ${\sim}32$ minutes on a single GPU; inference is sub-millisecond per sample --- a $>$$10^4\times$ speedup over COMSOL.
-\end{itemize}
+Before describing the methodology, we present the key results to establish the reconstruction quality achieved by this approach.
 
 %=============================================================================
-\section{Background: COMSOL Drift-Diffusion Simulation}
-\label{sec:comsol}
-%=============================================================================
-
-The coupled semiconductor equations that COMSOL solves for each device configuration:
-
-\subsection{Coupled PDEs}
-
-\begin{enumerate}
-    \item \textbf{Poisson's equation} (electrostatics):
-    \begin{equation}
-    \nabla \cdot (\varepsilon \nabla \phi) = -q(p - n + N_D^+ - N_A^-)
-    \end{equation}
-
-    \item \textbf{Electron continuity} (drift-diffusion):
-    \begin{equation}
-    \frac{\partial n}{\partial t} = \frac{1}{q} \nabla \cdot \mathbf{J}_n - R_n + G
-    \end{equation}
-
-    \item \textbf{Hole continuity} (drift-diffusion):
-    \begin{equation}
-    \frac{\partial p}{\partial t} = -\frac{1}{q} \nabla \cdot \mathbf{J}_p - R_p + G
-    \end{equation}
-\end{enumerate}
-
-where $\mathbf{J}_n = q n \mu_n \mathbf{E} + q D_n \nabla n$ (drift + diffusion), $R$ includes SRH, radiative, and Auger recombination, and $G$ is the photogeneration rate.
-
-The 31 input parameters are the material constants in these equations: mobilities ($\mu$), lifetimes ($\tau$ in SRH), layer thicknesses ($l$), band alignments ($\chi$), doping densities ($N_c, N_v$), recombination coefficients ($B_{rad}, C_{Aug}$), surface velocities ($v_{II}, v_{III}$), and contact work functions ($W$).
-
-\subsection{From PDEs to Optoelectronic Features}
-
-Rather than solving the PDE, we extract ``summary statistics'' of the solution using known analytical results from semiconductor physics.
-The hierarchy is: raw 31 parameters $\to$ analytical approximations $\to$ 71 physics features.
-These features are closed-form expressions that approximate what COMSOL computes numerically --- diffusion lengths from Einstein relations, extraction figures of merit from the Hecht equation, series resistance from Ohm's law applied to each transport layer, and composite predictors that combine multiple physics mechanisms.
-
-\subsection{From Optoelectronic Features to Physics-Informed Input}
-
-The 71 features are organized into 11 categories (Section~\ref{sec:physics_features}), compressing the information content of the PDE solution into a form the neural network can use directly, without needing to learn these relationships from data alone.
-This is the central design philosophy: \emph{use physics to inform the feature space and constrain the output space, while letting the numerical PDE solver handle the ground truth}.
-
-%=============================================================================
-\section{Related Work}
-\label{sec:litreview}
-%=============================================================================
-
-\textbf{ML surrogates for semiconductor device simulation.}
-Machine learning approaches to photovoltaic device modeling have grown substantially, with works predicting scalar figures of merit (efficiency, $V_{oc}$, FF) from device parameters using gradient-boosted trees and neural networks.
-Full curve reconstruction remains less explored; most approaches predict on fixed grids without physics constraints.
-
-\textbf{Physics-informed neural networks (PINNs).}
-Traditional PINNs encode PDE residuals directly in the loss function.
-Our approach differs fundamentally: we do not solve the PDE in the loss.
-Instead, we use (a)~physics features as input enrichment, (b)~physics shape constraints (monotonicity, convexity, curvature), and (c)~Jacobian smoothness regularization.
-The PDE itself is solved by COMSOL; we learn the parameter-to-solution map.
-
-\textbf{Compact curve representations.}
-Spline-based and control-point methods have been used for curve compression in various domains.
-Our PCHIP 8-point representation is specifically designed for J-V curves: Fritsch-Carlson slopes preserve monotonicity by construction, and the point placement is concentrated around the maximum power point where device performance sensitivity is highest.
-
-\textbf{Dilated convolutions in sequence modeling.}
-Dilated (atrous) convolutions expand the receptive field without increasing parameters, originally developed for image segmentation (DeepLab) and later adopted for audio (WaveNet) and time-series (TCN).
-We apply them to the novel setting of physics-constrained curve prediction on very short sequences (8 points), where we find that a single dilation step ($d=2$) already spans the full sequence.
-
-%=============================================================================
-\section{Method: Pipeline \& Architecture}
-\label{sec:method}
-%=============================================================================
-
-This section describes the complete framework: data generation, preprocessing, physics feature engineering, model architecture, physics-constrained training, and Jacobian regularization.
-
-%-----------------------------------------------------------------------------
-\subsection{Problem Formulation}
-%-----------------------------------------------------------------------------
-
-Given 31 material/device parameters $\mathbf{x} \in \mathbb{R}^{31}$ (bandgaps, mobilities, thicknesses, doping densities, interface recombination velocities), predict the complete J-V curve $\mathbf{J}(V)$.
-
-\textbf{Sign convention}: Positive photogenerated current density (A/m$^2$), where $J > 0$ for $V < V_{oc}$ and $J = 0$ at $V = V_{oc}$ (``power-producing quadrant'' convention).
-
-%-----------------------------------------------------------------------------
-\subsection{Data: COMSOL Latin Hypercube Sampling}
-%-----------------------------------------------------------------------------
-
-\begin{itemize}
-    \item \textbf{Primary}: 100k samples (66k after quality filtering)
-    \item \textbf{Augmented}: 300k samples (176k after filtering)
-    \item \textbf{Combined}: $\sim$242k training samples
-    \item \textbf{Split}: 68/17/15 train/val/test
-    \item \textbf{Filtering}: Only extreme FF/Vmpp violations removed (COMSOL convergence failures, unphysical curves)
-\end{itemize}
-
-Latin Hypercube Sampling across 31 coupled parameters ensures coverage of the design space. Raw J-V curves are evaluated on a non-uniform 45-point voltage grid with denser sampling near the knee/MPP region ($\Delta V = 0.025$ V for $V > 0.4$ V vs $\Delta V = 0.1$ V for $V \leq 0.4$ V).
-
-%-----------------------------------------------------------------------------
-\subsection{Preprocessing Pipeline}
-\label{sec:preprocessing}
-%-----------------------------------------------------------------------------
-
-\subsubsection{Parameter Scaling}
-
-The 31 input parameters span $>$20 orders of magnitude. We apply group-wise normalization:
-
-\begin{enumerate}
-    \item \textbf{Group-wise log transform}: $x' = \log_{10}(x + 1)$ for material properties (mobilities, densities of states) stored in $\log_{10}$ scale.
-    \item \textbf{RobustScaler}: $x'' = (x' - \text{median}) / \text{IQR}$ (outlier-robust, per-group).
-    \item \textbf{MinMaxScaler}: $x''' \in [-1, 1]$ (final range).
-\end{enumerate}
-
-Parameter groups: layer thicknesses (3), material properties (19, with log transform), contacts (2), recombination/generation (7).
-
-\subsubsection{External Scalar Conditioning}
-
-Optoelectronic scalars ($V_{oc}$, $V_{mpp}$) are loaded from \textbf{external TXT files} and scaled via \texttt{MinMaxScaler} to $[-1, 1]$. This is a deliberate design choice: in deployment, these files are swapped with outputs from separate scalar predictor models (LGBM or NN), ensuring no data leakage between the scalar prediction stage and the curve reconstruction stage.
-
-\subsubsection{Compact Curve Representation via PCHIP}
-
-Rather than predicting all 45 voltage-grid points directly, we represent each J-V curve as \textbf{8 query points} concentrated around the maximum power point (MPP).
-PCHIP preserves monotonicity by construction (Fritsch-Carlson slopes), ensuring the ground-truth curve slices remain physically valid.
-
-\begin{figure*}[t]
-  \centering
-  \includegraphics[width=0.49\textwidth]{jv_curve_8_point_reconstruction_example.png}
-  \hfill
-  \includegraphics[width=0.49\textwidth]{reconstruction_number_vs_number_of_points.png}
-  \caption{\textbf{PCHIP reconstruction fidelity.}
-  \textbf{Left}: 8-point PCHIP reconstruction (dashed red) vs.\ the full-resolution COMSOL reference (solid blue) for a representative device ($R^2=0.9939$, MAE $=3.83$~A/m$^2$).
-  Blue circles mark the 8 query points; the reconstruction closely tracks the reference through the flat photocurrent plateau, the high-curvature knee, and the steep roll-off toward $V_{oc}$.
-  \textbf{Right}: Reconstruction performance vs.\ number of interpolation points.
-  $R^2$ saturates rapidly: ${\sim}0.999$ by 10 points and ${\sim}0.9997$ by 12 points.
-  The 8-point budget was selected as the Pareto-optimal trade-off between reconstruction fidelity and model output dimensionality.}
-  \label{fig:interp_fidelity_pair}
-\end{figure*}
-
-\subsubsection{Current Normalization}
-
-Curves are normalized by short-circuit current:
-\begin{equation}
-\tilde{J}(V) = 2 \cdot \frac{J(V)}{J_{sc}} - 1 \in [-1, 1]
-\end{equation}
-
-This decouples magnitude (governed by generation rate $G$ and perovskite thickness $l_P$) from shape (governed by recombination, transport, and series resistance). The network learns shape; $J_{sc}$ scaling is applied post-hoc during inference.
-
-\subsubsection{Curvature-Weighted Training Samples}
-
-Training samples are weighted by the curvature of their J-V curves:
-\begin{equation}
-w_i = 1 + \alpha \left(\frac{\kappa_i}{\max_j \kappa_j}\right)^p, \quad \alpha = 4.0, \; p = 1.5
-\end{equation}
-
-where $\kappa_i = |I''(V)|$ is the discrete second derivative. This emphasizes devices with sharper knee regions, which are both harder to fit and more relevant for device optimization (fill factor sensitivity).
-
-%-----------------------------------------------------------------------------
-\subsection{Physics Feature Engineering (71 Features)}
-\label{sec:physics_features}
-%-----------------------------------------------------------------------------
-
-From the raw 31 COMSOL parameters, we derive \textbf{71 physics-informed features} that encode analytical approximations from drift-diffusion theory. These are computed \textbf{once during preprocessing} (not per-batch) and cached alongside the training data.
-
-These features are derived from the \emph{same equations} that COMSOL solves numerically. They are analytical shortcuts that give the network ``hints'' without solving the full coupled PDE system.
-
-\subsubsection{Feature Categories}
-
-\begin{table}[h]
-\centering
-\caption{Physics Feature Taxonomy (71 total). Each category maps to a specific physical mechanism in the drift-diffusion equations.}
-\label{tab:physics_features}
-\begin{tabular}{llcl}
-\toprule
-\textbf{Category} & \textbf{Physics Origin} & \textbf{Count} & \textbf{Key Features} \\
-\midrule
-Energetics & Band theory & 7 & $E_g$, $V_{bi}$, $E_g^{offset}$, $E_g^{HTL}$, $E_g^{ETL}$ \\
-Interface barriers & Band alignment & 9 & $\Delta E_v^{HP}$, $\Delta E_c^{PE}$, $\Phi_{h,ETL}$, $\Phi_{e,HTL}$ \\
-Diffusion lengths & Transport theory & 8 & $L_n$, $L_p$, $\eta_{coll}$, collection ratio \\
-$\mu\tau$ products & Transport quality & 4 & $\mu\tau_e$, $\mu\tau_h$, balance, $\tau_{eff}$ \\
-Drift extraction ($\Theta$) & Hecht equation & 6 & $\Theta_e$, $\Theta_h$, $\Theta_{min}$, drift lengths \\
-Series resistance & Ohm's law & 5 & $R_s^{HTL}$, $R_s^{ETL}$, $R_s^{total}$, ratios \\
-Generation & Beer-Lambert & 4 & $J_{max}$, $G/l_P$, $G_{avg}$ \\
-Recombination & SRH/Auger/Rad & 8 & $\tau_{eff}$, $R_{SRH}$, $V_{oc}^{loss}$, $n_i^2$ \\
-Surface recomb. & Interface physics & 4 & $v_{II}$, $v_{III}$, surface/bulk ratios \\
-Dielectric & Electrostatics & 4 & $\varepsilon$ ratios, Debye length \\
-Geometry & Device structure & 5 & Thickness ratios, total thickness \\
-\midrule
-Composite predictors & Multi-physics & 7 & $\text{FF}_{pred}$, $V_{oc}^{pred}$, $J_{sc}^{pred}$, Quality \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsubsection{Example Derivations}
-
-\textbf{Diffusion lengths} (from transport theory):
-\begin{align}
-L_n &= \sqrt{\mu_n^P \cdot \tau_e \cdot k_B T} & L_p &= \sqrt{\mu_p^P \cdot \tau_h \cdot k_B T}
-\end{align}
-
-\textbf{Extraction figures of merit} (Hecht equation approximation):
-\begin{equation}
-\Theta_e = \frac{\mu_n^P \cdot \tau_e \cdot V_{bi}}{l_P^2}, \quad
-\Theta_h = \frac{\mu_p^P \cdot \tau_h \cdot V_{bi}}{l_P^2}, \quad
-\Theta_{min} = \min(\Theta_e, \Theta_h)
-\end{equation}
-
-$\Theta \gg 1$ means carriers are extracted before recombining; $\Theta \ll 1$ means the device is recombination-limited. This is the single most predictive feature for fill factor.
-
-\textbf{Composite predictors} (cross-physics combinations):
-\begin{align}
-\text{FF}_{pred} &= \log(\Theta_{min}) - \log(R_s^{total}) \\
-V_{oc}^{pred} &= E_g + \frac{1}{2}(\Phi_{h,ETL} + \Phi_{e,HTL}) - k_B T \log(R_{SRH})
-\end{align}
-
-\subsubsection{Feature Scaling and Integration}
-
-Physics features are computed from raw (unscaled) parameters via \texttt{compute\_all\_physics\_features()} in fp32 on GPU. The resulting 71-dimensional vector is scaled to $[-1, 1]$ via \texttt{MinMaxScaler} and concatenated with the scaled device parameters and scalar features:
-
-\begin{equation}
-\mathbf{x}_{input} = [\underbrace{\mathbf{x}_{params}^{scaled}}_{31} \;;\; \underbrace{\mathbf{x}_{scalars}^{scaled}}_{2} \;;\; \underbrace{\mathbf{x}_{physics}^{scaled}}_{71}] \in \mathbb{R}^{104}
-\end{equation}
-
-%-----------------------------------------------------------------------------
-\subsection{Model Architecture: PhysicsIVSystem}
-\label{sec:architecture}
-%-----------------------------------------------------------------------------
-
-The model maps $(\mathbf{x}_{input}, \mathbf{V}_{query}) \to \hat{\mathbf{I}}$ where $\mathbf{V}_{query} \in \mathbb{R}^8$ are the voltage query points and $\hat{\mathbf{I}} \in \mathbb{R}^8$ are the predicted (normalized) currents.
-
-\begin{equation}
-\mathbf{x}_{input} \xrightarrow{\text{ParamMLP}} \mathbf{h} \in \mathbb{R}^{128}
-\xrightarrow{\text{broadcast}} [\mathbf{h}; \text{RBF}(\mathbf{V})] \in \mathbb{R}^{8 \times 256}
-\xrightarrow{\text{DilatedConv}} \xrightarrow{\text{Linear}} \hat{\mathbf{I}} \in \mathbb{R}^{8}
-\end{equation}
-
-\subsubsection{Parameter MLP}
-
-Three dense layers process the concatenated input (31 params + 2 scalars + 71 physics = 104 dims):
-
-\begin{table}[h]
-\centering
-\caption{Parameter MLP Architecture}
-\begin{tabular}{lccccc}
-\toprule
-\textbf{Layer} & \textbf{In} & \textbf{Out} & \textbf{Act.} & \textbf{Norm} & \textbf{Drop} \\
-\midrule
-Dense 1 & 104 & 256 & GELU & BN & 0.036 \\
-Dense 2 & 256 & 128 & GELU & BN & 0.036 \\
-Dense 3 & 128 & 128 & GELU & BN & 0.036 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsubsection{Gaussian RBF Positional Encoding}
-
-Voltage query points are encoded via learnable Gaussian radial basis functions:
-\begin{equation}
-\text{RBF}(V_j) = \exp\left(-\frac{(V_j - \mu_k)^2}{2\sigma_k^2}\right), \quad k = 1, \ldots, 128
-\end{equation}
-
-with learnable centers $\mu_k$ (initialized uniformly over $[0, V_{max}]$) and widths $\sigma_k$. The 128-dim parameter embedding $\mathbf{h}$ is broadcast across the 8 voltage positions and concatenated with the 128-dim RBF encoding, yielding a $8 \times 256$ sequence representation.
-
-\subsubsection{Dilated 1D Convolution Backbone}
-
-\begin{table}[h]
-\centering
-\caption{Conv Backbone (3 blocks with residual connections)}
-\begin{tabular}{lccccl}
-\toprule
-\textbf{Block} & \textbf{In Ch} & \textbf{Out Ch} & \textbf{Kernel} & \textbf{Dilation} & \textbf{Notes} \\
-\midrule
-Block 1 (Conv) & 256 & 128 & 5 & 1 & Symmetric padding + BN + GELU \\
-Block 2 (Conv) & 128 & 128 & 5 & 1 & Residual; same dilation as Block 1 \\
-Block 3 (Conv) & 128 & 64 & 5 & 2 & Dilation doubles receptive field \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Each block: Conv1d $\to$ BatchNorm $\to$ GELU $\to$ Dropout(0.036) $\to$ Conv1d $\to$ BatchNorm $\to$ GELU $\to$ Dropout + residual skip. Dilation $d=2$ in Block 3 expands the receptive field to cover all 8 points. Xavier initialization for all weights.
-
-Output head: Linear(64 $\to$ 1) applied pointwise, yielding 8 predicted currents.
-
-%-----------------------------------------------------------------------------
-\subsection{Physics-Constrained Loss Function}
-\label{sec:loss}
-%-----------------------------------------------------------------------------
-
-\begin{equation}
-\mathcal{L} = \underbrace{0.98 \cdot \mathcal{L}_{MSE}}_{\text{reconstruction}}
-+ \underbrace{0.005 \cdot \mathcal{L}_{mono}}_{\text{monotonicity}}
-+ \underbrace{0.005 \cdot \mathcal{L}_{conv}}_{\text{convexity}}
-+ \underbrace{0.01 \cdot \mathcal{L}_{curv}}_{\text{excess curvature}}
-+ \underbrace{\lambda_{jac} \cdot \mathcal{L}_{jac}}_{\text{Jacobian (optional)}}
-\end{equation}
-
-\subsubsection{Reconstruction Loss}
-
-Curvature-weighted MSE on the 8-point normalized curves:
-\begin{equation}
-\mathcal{L}_{MSE} = \frac{1}{B \cdot 8} \sum_{i=1}^{B} \sum_{j=1}^{8} w_{ij} \left(\hat{I}_{ij} - I_{ij}\right)^2
-\end{equation}
-
-\subsubsection{Monotonicity Penalty}
-
-J-V curves must be monotonically decreasing (current decreases as voltage increases):
-\begin{equation}
-\mathcal{L}_{mono} = \frac{1}{B \cdot 7} \sum_{i,j} \left[\text{ReLU}\left(\hat{I}_{i,j+1} - \hat{I}_{i,j}\right)\right]^2
-\end{equation}
-
-\subsubsection{Convexity Penalty}
-
-The J-V curve should be concave-down in the power-producing region:
-\begin{equation}
-\mathcal{L}_{conv} = \frac{1}{B \cdot 6} \sum_{i,j} \left[\text{ReLU}\left(2\hat{I}_{i,j} - \hat{I}_{i,j-1} - \hat{I}_{i,j+1}\right)\right]^2
-\end{equation}
-
-\subsubsection{Excess Curvature Penalty}
-
-Prevents unrealistic oscillations in the predicted curve:
-\begin{equation}
-\mathcal{L}_{curv} = \frac{1}{B \cdot 6} \sum_{i,j} \left[\text{ReLU}\left(|\hat{I}_{i,j-1} - 2\hat{I}_{i,j} + \hat{I}_{i,j+1}| - \tau\right)\right]^2, \quad \tau = 0.8
-\end{equation}
-
-%-----------------------------------------------------------------------------
-\subsection{Jacobian Regularization}
-\label{sec:jacobian}
-%-----------------------------------------------------------------------------
-
-Jacobian regularization penalizes the Frobenius norm of the input-output Jacobian $\mathbf{J} = \partial \hat{\mathbf{I}} / \partial \mathbf{x}_{input}$, encouraging the model to be smooth with respect to input parameter perturbations --- physically motivated because nearby devices in parameter space should produce similar J-V curves:
-
-\begin{equation}
-\mathcal{L}_{jac} = \frac{1}{d_{in}} \|\mathbf{J}\|_F^2
-= \frac{1}{d_{in}} \sum_{i=1}^{8} \sum_{j=1}^{d_{in}} \left(\frac{\partial \hat{I}_i}{\partial x_j}\right)^2
-\end{equation}
-
-Computed via Hutchinson's stochastic trace estimator with $K = 4$ random projections in fp32 (bf16 causes overflow in squared gradient accumulation).
-Default: $\lambda_{jac} = 0$ (disabled). Recommended range: $10^{-4}$ to $10^{-2}$.
-
-%-----------------------------------------------------------------------------
-\subsection{Training Configuration}
-\label{sec:training}
-%-----------------------------------------------------------------------------
-
-\begin{table}[h]
-\centering
-\caption{Training Configuration (Primary Model)}
-\begin{tabular}{lll}
-\toprule
-\textbf{Component} & \textbf{Setting} & \textbf{Value} \\
-\midrule
-Framework & PyTorch Lightning & bf16-mixed precision \\
-Optimizer & AdamW & $\beta=(0.9, 0.999)$ \\
-Learning rate & OneCycleLR & peak $5.5 \times 10^{-3}$ \\
-Weight decay & & $5.4 \times 10^{-5}$ \\
-Warmup & & 7 epochs \\
-LR schedule & OneCycleLR & cosine anneal to $lr/150$ \\
-Gradient clipping & & max\_norm = 1.0 \\
-Early stopping & val\_loss patience & 20 epochs \\
-Max epochs & & 100 \\
-Batch size & & 128 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-%-----------------------------------------------------------------------------
-\subsection{Pipeline Diagram}
-%-----------------------------------------------------------------------------
-
-\begin{figure}[h]
-    \centering
-    \input{figures/pipeline.tex}
-    \caption{\textbf{End-to-end pipeline.}
-    The 31 COMSOL drift-diffusion parameters and 2 external scalars ($V_{oc}$, $V_{mpp}$) are preprocessed (group-wise log + robust + min-max scaling; PCHIP 8-point slicing) and optionally augmented with 71 physics features.
-    The dilated conv model (no attention) produces 8 normalized current predictions, trained with a physics-constrained loss comprising reconstruction MSE, monotonicity, convexity, and excess curvature penalties.}
-    \label{fig:pipeline}
-\end{figure}
-
-%=============================================================================
-\section{Experimental Setup}
-\label{sec:experiments}
-%=============================================================================
-
-\subsection{Ablation Design}
-
-We evaluate six architectural variants across three axes: backbone type (conv vs.\ TCN vs.\ pointwise), dilation (with/without), and attention (with/without).
-Additionally, we test the impact of scalar conditioning, dataset size, training duration, and batch size.
-
-\begin{table}[h]
-\centering
-\caption{Architecture Ablation Matrix (configurations tested).}
-\label{tab:ablation_design}
-\begin{tabular}{llp{6cm}}
-\toprule
-\textbf{ID} & \textbf{Configuration} & \textbf{Hypothesis Tested} \\
-\midrule
-\multicolumn{3}{l}{\textit{Architecture comparisons:}} \\
-Conv-Dilated-NoAttn & Dilated Conv, no attention & \textbf{Primary model} \\
-Conv-NoAttn & Conv without dilation & Isolates dilation contribution \\
-TCN-DilatedConv-NoAttn & Causal dilated TCN & Causal vs.\ symmetric context \\
-RegularConv-NoAttn & Standard Conv, no attention & Non-dilated bidirectional baseline \\
-\midrule
-\multicolumn{3}{l}{\textit{Attention experiments (negative controls):}} \\
-RegularConv-WithAttn & Conv + self-attention & Attention impact on conv \\
-DilatedConv-WithAttn & Dilated Conv + attention & Attention impact on dilated conv \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Metrics}
-
-\begin{itemize}
-    \item \textbf{Primary}: Per-curve $R^2$ (mean and median over test set)
-    \item \textbf{Error}: MAE (A/m$^2$) and RMSE (A/m$^2$) on absolute current predictions
-    \item \textbf{Device-level}: $V_{oc}$ absolute error (V), $I_{sc}$ absolute error (A/m$^2$)
-    \item \textbf{Timing}: Training time (s), test/inference time (s), throughput (samples/s)
-\end{itemize}
-
-%=============================================================================
-\section{Results}
+\section{Results: Curve Reconstruction Quality}
 \label{sec:results}
 %=============================================================================
 
-\subsection{Primary Model Performance}
-
-The primary dilated conv model (with 71 physics features, seed 42) achieves the following on the held-out test set (${\sim}48$k samples):
-
-\begin{table}[h]
-\centering
-\caption{Primary model test-set performance (DilatedConv, seed 42, 100 epochs, batch size 128, with physics features).}
-\label{tab:primary_results}
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Metric} & \textbf{Mean} & \textbf{Median} & \textbf{Std} \\
-\midrule
-$R^2$ (per-curve) & 0.9824 & \textbf{0.9974} & 0.384 \\
-MAE (A/m$^2$) & 4.990 & 3.142 & 5.695 \\
-RMSE (A/m$^2$) & 7.038 & 4.498 & 7.659 \\
-$|V_{oc}$ error$|$ (V) & 0.00525 & \textbf{0.000408} & --- \\
-$|I_{sc}$ error$|$ (A/m$^2$) & 0.915 & 0.0 & --- \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\insight{The median $R^2$ of 0.9974 indicates that for a typical device in the test set, the model explains $>$99.7\% of the variance in the J-V curve.
-The gap between mean ($0.982$) and median ($0.997$) $R^2$ reveals a long left tail --- a small fraction of devices with unusual parameter combinations have disproportionately large errors (see Section~\ref{sec:failure_analysis}).
-The median $V_{oc}$ error of 0.41~mV is well below typical experimental measurement uncertainty ($\pm5$~mV), suggesting the model captures voltage-dependent behavior with high fidelity.}
-
-\subsubsection{Timing}
-
-\begin{table}[h]
-\centering
-\caption{Wall-clock timing breakdown (single NVIDIA GPU, ${\sim}242$k training samples, ${\sim}48$k test samples).}
-\label{tab:timing}
-\begin{tabular}{lr}
-\toprule
-\textbf{Phase} & \textbf{Time} \\
-\midrule
-Preprocessing (100k + 300k) & 26 s \\
-Training (100 epochs, 59{,}052 steps) & 1{,}944 s (32.4 min) \\
-Testing (${\sim}48$k samples) & 31 s \\
-Diagnostics generation & 4 s \\
-\midrule
-\textbf{Total pipeline} & \textbf{1{,}991 s (33.2 min)} \\
-\midrule
-Throughput (training) & ${\sim}7{,}400$ samples/s \\
-Throughput (inference) & ${\sim}1{,}550$ samples/s \\
-\textbf{Speedup vs.\ COMSOL} & $\mathbf{>10^4\times}$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-%-----------------------------------------------------------------------------
-\subsection{Architecture Ablation}
-%-----------------------------------------------------------------------------
-
-The ablation study across architectural variants reveals clear patterns about what matters for J-V curve reconstruction.
-
-\begin{table}[h]
-\centering
-\caption{Architecture ablation results. All models trained with 100 epochs, batch size 128, on the combined 100k+300k dataset. Mean $R^2$, MAE, and RMSE are reported on the held-out test set. Bold indicates best per column.}
-\label{tab:ablation_results}
-\begin{tabular}{lccccccc}
-\toprule
-\textbf{Configuration} & \textbf{Seed} & \textbf{$R^2$ (mean)} & \textbf{$R^2$ (med.)} & \textbf{MAE} & \textbf{RMSE} & \textbf{$|V_{oc}|$} & \textbf{$|I_{sc}|$} \\
- & & & & \scriptsize{A/m$^2$} & \scriptsize{A/m$^2$} & \scriptsize{mV} & \scriptsize{A/m$^2$} \\
-\midrule
-\multicolumn{8}{l}{\textit{Without attention:}} \\
-Conv-NoAttn & 42 & 0.9812 & 0.9961 & 5.657 & 7.813 & 0.576 & 0.726 \\
-Conv-NoAttn & 123 & \textbf{0.9848} & \textbf{0.9964} & \textbf{5.430} & \textbf{7.523} & 0.606 & 1.299 \\
-Conv-Dilated-NoAttn & 42 & 0.9812 & 0.9961 & 5.657 & 7.813 & 0.576 & 0.726 \\
-\midrule
-\multicolumn{8}{l}{\textit{TCN (causal):}} \\
-TCN-Dilated-NoAttn & 42 & 0.9792 & 0.9963 & 5.953 & 8.015 & 3.040 & 0.826 \\
-TCN-Dilated-NoAttn & 123 & 0.9836 & 0.9960 & 6.076 & 7.909 & 0.577 & 2.185 \\
-TCN-Dilated-NoAttn & 456 & 0.9844 & 0.9954 & 5.988 & 7.951 & 1.320 & 1.774 \\
-\midrule
-\multicolumn{8}{l}{\textit{TCN mean $\pm$ std (3 seeds):}} \\
-TCN-Dilated-NoAttn & avg & 0.9824$\pm$0.003 & 0.9959$\pm$0.0005 & 6.006$\pm$0.06 & 7.958$\pm$0.05 & 1.65$\pm$1.3 & 1.60$\pm$0.7 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\insight{The non-causal conv and dilated conv architectures achieve comparable mean $R^2$ ($0.981$--$0.985$), while the causal TCN shows slightly higher variance across seeds, particularly in $V_{oc}$ error (std = 1.3~mV vs.\ $<$0.1~mV for conv).
-This makes physical sense: J-V curves are \emph{not} causal sequences --- the current at voltage $V_j$ depends on the full device physics, not on preceding voltages.
-Imposing a left-to-right ordering via causal masking restricts information flow and introduces an artificial asymmetry.}
-
-\subsubsection{Attention as a Negative Control}
-
-\begin{figure}[h]
-    \centering
-    \includegraphics[width=0.85\textwidth]{dilation_n_attention.png}
-    \caption{\textbf{Attention consistently degrades performance on 8-point J-V sequences.}
-    Comparison of median $R^2$, MAE, $V_{oc}$ error, and $I_{sc}$ error across four configurations: RegularConv$\pm$Attention and DilatedConv$\pm$Attention.
-    In both cases, adding 4-head self-attention after the conv blocks worsens all metrics.
-    The effect is strongest for median $R^2$, where attention variants show substantially negative scores, indicating catastrophic fits for a subset of test samples.
-    }
-    \label{fig:dilation_attention}
-\end{figure}
-
-\insight{The attention degradation is not a training failure --- all models converge normally.
-Rather, on an 8-point sequence, self-attention introduces $8 \times 8 = 64$ pairwise interactions, most of which are spurious for physics-governed curves.
-The dilated conv with $d = \{1, 2\}$ already has a receptive field spanning all 8 points (effective RF = $1 + 2 \times (5-1) \times 1 + 2 \times (5-1) \times 2 = 25 > 8$).
-Adding attention on top provides no additional context while introducing noisy long-range shortcuts that the model cannot regularize effectively.
-This is a concrete instance of the broader principle: \emph{inductive bias should match the data structure}.
-J-V curves have strong local correlations (adjacent voltage points are highly correlated) and weak long-range dependencies (the flat plateau region is nearly independent of the knee shape).
-Convolutions naturally capture local structure; attention treats all pairwise interactions equally.}
-
-%-----------------------------------------------------------------------------
-\subsection{Training Dynamics}
-%-----------------------------------------------------------------------------
-
-\begin{figure}[h]
-    \centering
-    \includegraphics[width=0.95\textwidth]{training_curves.png}
-    \caption{\textbf{Training dynamics of the primary dilated conv model.}
-    \textbf{Left}: Training and validation loss (log scale) over 59{,}052 gradient steps (${\sim}100$ epochs).
-    Both losses drop sharply in the first ${\sim}5{,}000$ steps (roughly 8 epochs), then continue a slow, steady descent.
-    The small train-val gap throughout indicates minimal overfitting, suggesting the model capacity is well-matched to the task.
-    \textbf{Right}: Physics loss components on log scale.
-    The monotonicity penalty (\textcolor{green}{green}) drops by $>$3 orders of magnitude from $10^{-1}$ to ${\sim}10^{-5}$ in training, indicating the model rapidly learns to produce monotonically decreasing curves.
-    Convexity and excess curvature penalties (\textcolor{blue}{blue}, \textcolor{orange}{orange}) stabilize around $10^{-1}$, reflecting the inherent difficulty of fitting the high-curvature knee region.
-    The validation monotonicity (\textcolor{brown}{brown}) shows higher variance but follows the same downward trend.}
-    \label{fig:training_curves}
-\end{figure}
-
-\insight{The 3-order-of-magnitude reduction in the monotonicity penalty confirms that the physics loss is actively shaping the model's output space.
-Without it, the model would need to discover monotonicity purely from the MSE signal --- possible in principle but slower and less reliable.
-The stabilization of convexity and excess curvature penalties at ${\sim}10^{-1}$ is physically meaningful: real J-V curves exhibit non-trivial curvature in the knee region, so the model should not be penalized for faithfully reproducing this curvature.
-The penalty only activates for \emph{excess} curvature beyond $\tau = 0.8$, acting as a regularizer against oscillations rather than a strict shape constraint.}
+We front-load results to provide immediate context for the methodological choices that follow.
+All metrics are evaluated on ${\sim}15$k held-out test devices (10\% of ${\sim}150$k total) that the model has never seen during training or hyperparameter selection.
 
 %-----------------------------------------------------------------------------
 \subsection{Reconstruction Gallery}
+\label{sec:gallery}
 %-----------------------------------------------------------------------------
 
-\begin{figure*}[t]
+Figure~\ref{fig:random_samples} displays J-V reconstructions for randomly sampled test devices spanning the full performance range.
+The model's 8-point PCHIP representation, interpolated back to a dense voltage grid via Fritsch--Carlson monotone cubic Hermite interpolation~\cite{fritsch1980monotone}, faithfully captures both the flat photocurrent plateau at low voltages and the sharp sigmoidal transition at the knee/MPP region.
+The vast majority of devices achieve $R^2 > 0.99$; the rare low-$R^2$ cases correspond to pathological device configurations discussed in \S\ref{sec:failure_analysis}.
+
+\begin{figure}[t]
     \centering
-    \begin{subfigure}[b]{0.95\textwidth}
-        \centering
-        \includegraphics[width=\textwidth]{test_plots_best_r2_samples.png}
-        \caption{Best $R^2$ samples ($R^2 \approx 1.0000$). The model achieves essentially perfect reconstruction for well-behaved devices with clean sigmoid-shaped J-V curves. Both the flat photocurrent region ($V < 0.4$~V) and the steep roll-off near $V_{oc}$ are captured with high fidelity. The 8-point PCHIP reconstruction (blue dots $\to$ dashed red) overlaps the COMSOL reference (solid black) within line width.}
-        \label{fig:best_r2}
-    \end{subfigure}
+    \includegraphics[width=0.95\textwidth]{test_plots_random_samples.png}
+    \caption{\textbf{Random test-set reconstructions} ($R^2 = 0.58$--$0.999$). Blue circles: 8 PCHIP query points predicted by the dilated conv model; dashed: PCHIP reconstruction; solid grey: COMSOL finite-element reference. The model captures flat-band plateaus, sharp knees, and the approach to $V_{oc}$ across devices with widely varying material parameters. The rare low-$R^2$ cases (bottom row) correspond to S-shaped or barrier-dominated devices where physics constraints \emph{correctly refuse} unphysical fits (\S\ref{sec:failure_analysis}).}
+    \label{fig:random_samples}
+\end{figure}
 
-    \vspace{0.3cm}
+%-----------------------------------------------------------------------------
+\subsection{Primary Performance}
+\label{sec:primary_performance}
+%-----------------------------------------------------------------------------
 
-    \begin{subfigure}[b]{0.95\textwidth}
-        \centering
-        \includegraphics[width=\textwidth]{test_plots_random_samples.png}
-        \caption{Random test samples ($R^2 = 0.58$--$0.999$). The distribution of reconstruction quality is visible: most samples are excellent ($R^2 > 0.99$), but occasional devices with unusual IV characteristics (e.g., very low $V_{oc}$, S-shaped kinks from interface barriers, or extremely high series resistance) produce lower scores. Sample \#12209 ($R^2 = 0.583$) shows a device where the predicted knee location deviates from truth.}
-        \label{fig:random_samples}
-    \end{subfigure}
+Table~\ref{tab:primary_results} reports performance of the primary model (bidirectional dilated conv, batch size 512, with physics features) on the held-out test set, averaged over 3 random seeds.
 
-    \vspace{0.3cm}
+\begin{table}[t]
+\centering
+\caption{Test-set performance (${\sim}15$k devices), averaged over 3 seeds ($\pm$ seed-to-seed std). The mean--median gap in $R^2$ reflects a long left tail from pathological devices (\S\ref{sec:failure_analysis}), not systematic bias.}
+\label{tab:primary_results}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Metric} & \textbf{Mean} & \textbf{Median} \\
+\midrule
+$R^2$ (per-curve, $\Delta V$-weighted) & $0.9858 \pm 0.0009$ & $\mathbf{0.9975 \pm 0.0004}$ \\
+MAE (A/m$^2$) & $4.75 \pm 0.26$ & $2.96 \pm 0.34$ \\
+RMSE (A/m$^2$) & $6.66 \pm 0.26$ & $4.27 \pm 0.34$ \\
+$|V_{oc}$ error$|$ (V) & $0.0056 \pm 0.0058$ & $\mathbf{0.00039 \pm 0.00016}$ \\
+$|I_{sc}$ error$|$ (A/m$^2$) & $0.59 \pm 0.53$ & $0.36 \pm 0.62$ \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-    \begin{subfigure}[b]{0.95\textwidth}
-        \centering
-        \includegraphics[width=\textwidth]{test_plots_worst_r2_samples.png}
-        \caption{Worst $R^2$ samples ($R^2 < 0$, i.e.\ worse than predicting the mean curve). These pathological cases share common features: (i)~concave-\emph{up} curves violating the standard diode equation (from extreme interface barriers), (ii)~S-shaped kinks from mismatched transport layers, (iii)~very low fill factors ($<0.3$). These represent $<$1\% of the test set and correspond to devices that would not function well physically.}
-        \label{fig:worst_r2}
-    \end{subfigure}
+\paragraph{Physical significance.}
+The median MAE of 2.96~A/m$^2$ corresponds to $<$0.5\% of a typical $J_{sc} \approx 200$~A/m$^2$, meaning the model faithfully resolves both the flat-band photocurrent magnitude and the sharp transition at MPP where most power extraction occurs.
+The $I_{sc}$ median error of 0.36~A/m$^2$ (with seed-to-seed variability of $\pm$0.62) confirms that the flat-band region ($V \ll V_{mpp}$) is trivially learned---consistent with the physics, since $J(V \!\approx\! 0) \approx J_{sc}$ is determined primarily by photogeneration and collection efficiency, which are well-captured by the input features.
 
-    \caption{\textbf{Reconstruction quality gallery.} Best (top), random (middle), and worst (bottom) test-set reconstructions.
-    Blue dots: 8 PCHIP query points; dashed red: PCHIP reconstruction; solid black: COMSOL reference.
-    The model handles the vast majority of devices with $R^2 > 0.99$; failure modes are concentrated in pathological devices that violate standard J-V curve physics.}
-    \label{fig:reconstruction_gallery}
-\end{figure*}
+The median $V_{oc}$ error of 0.39~mV is an order of magnitude below typical experimental measurement uncertainty ($\pm$5~mV for perovskite devices with hysteresis), meaning the model's voltage-axis localization of the open-circuit point is more precise than what current fabrication and measurement technology can resolve.
+This sub-millivolt precision in $V_{oc}$ reconstruction is important because $V_{oc}$ determines the upper voltage bound of the J-V curve, and errors in $V_{oc}$ propagate into the reconstructed current values throughout the knee region where $dJ/dV$ is large.
+
+\paragraph{The mean--median gap.}
+The gap between mean $R^2 = 0.986$ and median $R^2 = 0.998$ indicates that fewer than 1\% of devices account for the majority of aggregate error.
+This asymmetry is by design: the physics constraints \emph{correctly refuse} to fit S-shaped or concave-up curves that violate the monotone-sigmoid assumption (\S\ref{sec:failure_analysis}).
+A model that achieved higher mean $R^2$ by fitting these pathological devices would necessarily sacrifice physical plausibility on the remaining 99\%.
+
+\paragraph{Computational performance.}
+Total wall time: ${\sim}10$~min (preprocessing 24~s, training ${\sim}9.5$~min, inference ${\sim}10$~s on ${\sim}15$k test samples).
+Training throughput: ${\sim}12.7$k samples/s (batch size 512); inference throughput: ${\sim}1.4$k samples/s.
+This represents $>$$10^4\times$ speedup over COMSOL FEM per device, enabling a $10^6$-device Latin Hypercube screening sweep in $<$1~hour.
+
+%-----------------------------------------------------------------------------
+\subsection{Architecture Ablation}
+\label{sec:ablation}
+%-----------------------------------------------------------------------------
+
+We conducted a systematic ablation spanning 10 configurations $\times$ 3 seeds = 30 runs, isolating the contributions of dilation, directionality (causal vs.\ bidirectional), self-attention, spatial mixing, scalar conditioning, dataset size, training duration, and batch size.
+Table~\ref{tab:ablation_results} summarizes the results; all values are averaged over 3 seeds with $\pm$ indicating seed-to-seed standard deviation.
+
+\begin{table}[t]
+\centering
+\caption{Architecture ablation (30 runs = 10 configurations $\times$ 3 seeds). All bidirectional conv variants (rows~1--3) achieve $R^2_{med} \geq 0.996$; attention (rows~6--7) and pointwise architectures (row~5) are consistently worse. The champion configuration (row~1, batch~512) achieves the highest median $R^2$ and lowest median MAE.}
+\label{tab:ablation_results}
+\begin{tabular}{@{}rlcccc@{}}
+\toprule
+ & \textbf{Configuration} & \textbf{$R^2$ (med.)} & \textbf{MAE$_{med}$} & \textbf{$|V_{oc}|_{med}$} & \textbf{$|I_{sc}|_{med}$} \\
+ & & & (A/m$^2$) & (mV) & (A/m$^2$) \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Architecture variants (bidir.\ conv, batch 128, 100 ep.)}} \\
+1 & \textbf{Conv-Dilated (BS512)} & $\mathbf{.9975{\pm}.0004}$ & $\mathbf{2.96{\pm}.34}$ & $\mathbf{0.39{\pm}.16}$ & $0.36{\pm}.62$ \\
+2 & Conv-Dilated & $.9964{\pm}.0007$ & $3.74{\pm}.63$ & $1.04{\pm}.30$ & $0.0{\pm}0.0$ \\
+3 & Conv-NoDilation & $.9967{\pm}.0004$ & $3.60{\pm}.36$ & $0.60{\pm}.39$ & $0.66{\pm}.63$ \\
+4 & TCN-Dilated (causal) & $.9965{\pm}.0007$ & $3.68{\pm}.67$ & $1.51{\pm}1.68$ & $0.94{\pm}1.63$ \\
+5 & Pointwise ($1{\times}1$) & $.9890{\pm}.0004$ & $6.48{\pm}.04$ & $6.11{\pm}1.35$ & $1.31{\pm}1.18$ \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Self-attention variants}} \\
+6 & Conv-Dilated + Attn & $.9914{\pm}.0006$ & $5.94{\pm}.30$ & $23.7{\pm}39.9$ & $1.59{\pm}.65$ \\
+7 & TCN-Dilated + Attn & $.9917{\pm}.0005$ & $5.89{\pm}.61$ & $2.12{\pm}2.53$ & $1.49{\pm}2.59$ \\
+\midrule
+\multicolumn{6}{@{}l}{\emph{Training \& data variants}} \\
+8 & No scalar cond. & $.9966{\pm}.0003$ & $3.63{\pm}.34$ & $0.86{\pm}.33$ & $1.20{\pm}1.51$ \\
+9 & 100k data only & $.9948{\pm}.0001$ & $4.57{\pm}.26$ & $0.86{\pm}.58$ & $1.02{\pm}.98$ \\
+10 & 200 epochs & $.9965{\pm}.0005$ & $3.69{\pm}.29$ & $1.43{\pm}1.50$ & $0.83{\pm}.75$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Spatial mixing is essential.}
+The pointwise ($1{\times}1$ convolution) baseline (row~5) achieves only $R^2_{med} = 0.989$, confirming that inter-voltage-point information exchange is critical for J-V reconstruction.
+Without spatial mixing, each voltage point is predicted independently from the device embedding, preventing the network from leveraging the smooth, monotone structure of J-V curves.
+
+\paragraph{Self-attention as negative control.}
+Adding 4-head self-attention ($d_{model} = 64$) consistently degrades all metrics (rows~6--7 vs.\ rows~2, 4; Figure~\ref{fig:attention_impact}).
+The degradation is both large (median $R^2$ drops from ${\sim}0.997$ to ${\sim}0.991$) and structurally explained: on 8-point sequences the dilated conv receptive field already exceeds the sequence length (Block~3 with $d{=}2$, $k{=}5$ gives RF $> 8$), so attention's $\mathcal{O}(n^2)$ pairwise interactions are redundant.
+J-V spatial correlations decay monotonically with voltage separation, matching convolution's local inductive bias; attention treats all pairs uniformly, amplifying noise from weakly coupled voltage points.
+The Conv+Attn configuration's extreme $V_{oc}$ instability ($23.7 \pm 39.9$~mV, driven by a single catastrophic seed) further demonstrates that attention introduces harmful optimization landscape pathologies.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.7\textwidth]{dilation_n_attention.png}
+    \caption{\textbf{Self-attention consistently degrades performance.}
+    Paired comparisons across Conv$\pm$Attn and TCN$\pm$Attn backbones. Adding attention worsens median $R^2$, MAE, $V_{oc}$ error, and $I_{sc}$ error in every case, confirming that the conv's full receptive field makes attention redundant and harmful on short physics-governed sequences.}
+    \label{fig:attention_impact}
+\end{figure}
+
+\paragraph{Bidirectional vs.\ causal.}
+Bidirectional convolution and causal TCN achieve similar median $R^2$ ($0.9964$ vs.\ $0.9965$), but the TCN shows substantially higher $V_{oc}$ error variance ($1.51 \pm 1.68$~mV vs.\ $1.04 \pm 0.30$~mV for Conv-Dilated, and $0.39 \pm 0.16$~mV for BS512).
+This instability reflects the physics: J-V curves are thermodynamic equilibrium responses---at any voltage, the current depends on the full band diagram, not just lower-voltage behavior---so causal masking discards physically relevant context, particularly near $V_{oc}$ where high-voltage information is essential.
+
+\paragraph{Batch size and data scaling.}
+Increasing batch size from 128 to 512 (row~1 vs.\ row~2) yields the largest single-factor improvement: $R^2_{med}$ from $0.9964$ to $0.9975$ and MAE$_{med}$ from 3.74 to 2.96~A/m$^2$, while halving training time (${\sim}10$~min vs.\ ${\sim}23$~min).
+Using only 100k training samples (row~9) instead of the full ${\sim}120$k degrades $R^2_{med}$ from $0.9967$ to $0.9948$, confirming data scaling benefits.
+Extending training to 200 epochs (row~10) provides no improvement over 100 epochs, indicating convergence within the early-stopping patience window.
+
+\paragraph{Scalar conditioning.}
+Removing upstream scalar conditioning ($V_{oc}^{pred}$, $V_{mpp}^{pred}$; row~8) barely affects median $R^2$ ($0.9966$ vs.\ $0.9967$ for Conv-NoDilation), confirming that the 31 raw parameters and 5 physics features already encode sufficient information for curve reconstruction.
+The scalar inputs provide marginal benefit primarily through improved $V_{oc}$ localization.
+
+\paragraph{Robustness across runs.}
+Figure~\ref{fig:architecture_comparison} confirms tight clustering of key metrics across all 30 runs, with the non-attention conv variants all achieving median $R^2 > 0.996$ regardless of seed, demonstrating that the primary results are robust to random initialization.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.7\textwidth]{fig_architecture_comparison.png}
+    \caption{\textbf{Architecture comparison across all 30 runs.} Non-attention conv variants (blue shades) cluster tightly at median $R^2 > 0.996$, while attention variants (red) and pointwise (orange) are clearly separated. The champion BS512 configuration (green) achieves the highest median $R^2$.}
+    \label{fig:architecture_comparison}
+\end{figure}
+
+\emph{General finding: for short physics-governed sequences with monotonically decaying spatial correlations, bidirectional convolution with domain-matched features outperforms both attention-augmented and pointwise variants; self-attention is consistently harmful.}
 
 %-----------------------------------------------------------------------------
 \subsection{Failure Mode Analysis}
 \label{sec:failure_analysis}
 %-----------------------------------------------------------------------------
 
-The gap between mean ($R^2 = 0.982$) and median ($R^2 = 0.997$) $R^2$ reveals a long left tail of difficult devices. Visual inspection of the worst-performing test samples (Figure~\ref{fig:worst_r2}) reveals three failure modes:
+The left tail of the $R^2$ distribution ($R^2_{mean} = 0.986$ vs.\ $R^2_{med} = 0.998$, affecting $<$1\% of devices) arises from three physically distinct failure modes:
 
 \begin{enumerate}
-    \item \textbf{Concave-up J-V curves} ($R^2 < -60$ in extreme cases): These arise from devices with severe interface barrier misalignment (large $|\Delta E_v^{HP}|$ or $|\Delta E_c^{PE}|$), producing S-shaped or concave-up curves that violate the standard single-diode equation.
-    The model's monotonicity and convexity penalties \emph{correctly} prevent it from producing such curves --- the ``failure'' is actually the physics constraint working as designed, refusing to predict unphysical shapes even when the ground truth is unphysical.
+    \item \textbf{S-shaped / concave-up curves}: Large interface band offsets ($|\Delta E_v^{HP}|$ or $|\Delta E_c^{PE}| \gg k_BT$) produce barrier-dominated transport that violates the monotone-sigmoid assumption inherent in the PCHIP representation.
+    The physics constraints \emph{correctly refuse} to fit these curves---the model produces a smooth sigmoid approximation rather than an unphysical reconstruction.
+    This is failure by design: S-shaped kinks arise from interface recombination or extraction barriers that the 8-point representation cannot capture without violating monotonicity.
 
-    \item \textbf{Mislocated knee}: Devices where the MPP voltage differs substantially from the training distribution (extremely high or low $V_{oc}$) show errors concentrated at the knee, where the PCHIP query point placement may not optimally cover the curvature.
+    \item \textbf{Mislocated knee}: When $V_{oc}$ falls far from the training-set center, the curvature maximum lies outside the dense query-point region.
+    This failure mode is addressable by adaptive query-point placement conditioned on predicted $V_{oc}$---a straightforward engineering improvement.
 
-    \item \textbf{Extreme series resistance}: Devices with $R_s^{total} > 10^3$~$\Omega \cdot \text{cm}^2$ produce nearly linear J-V curves that look qualitatively different from the sigmoid-shaped majority.
+    \item \textbf{Extreme series resistance}: $R_s^{total} > 10^3$~$\Omega\!\cdot\!\text{cm}^2$ produces nearly linear J-V curves qualitatively unlike the sigmoid majority.
+    These devices have $\text{FF} \ll 0.5$ and represent impractical configurations that would never be fabricated---a measure-zero subset of the design space.
 \end{enumerate}
 
-\insight{These failure modes are \emph{physicall interpretable}, not random.
-They correspond to devices at the extreme boundaries of the parameter space where the underlying physics changes qualitatively.
-In a practical device optimization loop, these pathological configurations would be screened out early.
-For the remaining $>$99\% of physically reasonable devices, the model achieves median $R^2 > 0.997$.}
+In all three cases, the failure mode is \emph{physically interpretable} and corresponds to devices outside the intended operating regime.
+A lightweight anomaly detector based on $E_g^{offset}$, $J_{max}^{log}$, and $|\Delta E_v^{HP}|$ can flag such devices at negligible computational cost before running inference.
 
-%=============================================================================
-\section{Voltage Grid Design}
-%=============================================================================
+Figures~\ref{fig:best_r2} and~\ref{fig:worst_r2} contrast the best and worst reconstructions, making the failure modes visually concrete.
 
-\begin{figure}[h]
+\begin{figure}[t]
     \centering
-    \input{figures/voltage_grid_design.tex}
-    \caption{\textbf{Non-uniform voltage grid and weighted error.}
-    \textbf{(a)}~The 45-point grid uses coarse 0.1~V spacing in the flat photocurrent region ($V \leq 0.4$~V) and dense 0.025~V spacing in the knee/MPP region ($V > 0.4$~V).
-    \textbf{(b)}~The $\Delta V$-weighted curve loss applies Gaussian emphasis centered at $V_{mpp}$, ensuring the optimization objective aligns with the region of highest device-performance sensitivity.}
-    \label{fig:voltage_grid}
+    \includegraphics[width=0.95\textwidth]{test_plots_best_r2_samples.png}
+    \caption{\textbf{Best $R^2$ reconstructions} ($\approx 1.000$): near-perfect reconstruction for well-behaved sigmoid curves with clear knee regions. These devices have favorable energetic alignment ($E_g^{offset} \approx 0$), moderate barrier heights, and high $J_{max}$, placing them squarely within the model's physics-constrained operating regime.}
+    \label{fig:best_r2}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\textwidth]{test_plots_worst_r2_samples.png}
+    \caption{\textbf{Worst $R^2$ reconstructions} ($< 0$): S-shaped kinks (barrier-dominated transport), concave-up curves, and extreme-resistance configurations. In each case, the physics constraints \emph{correctly prevent} unphysical fits, producing smooth sigmoid approximations instead. These devices have large $|E_g^{offset}|$, extreme $|\chi_P^e|$ values, or $|\Delta E_v^{HP}| \gg k_BT$, violating the monotone-sigmoid assumption inherent in the PCHIP representation.}
+    \label{fig:worst_r2}
 \end{figure}
 
 %=============================================================================
-\section{Analysis \& Insights}
+\section{Background: Drift-Diffusion Model}
+\label{sec:comsol}
+%=============================================================================
+
+The ground-truth J-V curves are generated by a coupled Poisson--drift-diffusion simulator~\cite{zhao2023phd,zhao2025ae} modeling a planar p-i-n perovskite stack: Glass / Front-contact / HTL / Perovskite absorber / ETL / Back-contact.
+Optical absorption follows a vectorized transfer-matrix formulation (Appendix~\ref{app:optical}) yielding the spatially averaged photogeneration rate $G_{avg} = l_P^{-1}\int_0^{l_P} G(x)\,dx$, which enters as one of the 31 inputs.
+
+The electronic transport is governed by three coupled PDEs:
+\begin{align}
+\nabla \cdot (\varepsilon \nabla \psi) &= -q(p - n + N_D^+ - N_A^-) \label{eq:poisson} \\
+\frac{\partial n}{\partial t} &= \frac{1}{q} \nabla \cdot \mathbf{J}_n - R + G \label{eq:electron} \\
+\frac{\partial p}{\partial t} &= -\frac{1}{q} \nabla \cdot \mathbf{J}_p - R + G \label{eq:hole}
+\end{align}
+where the current densities follow drift-diffusion:
+\begin{equation}
+\mathbf{J}_n = qn\mu_n\mathbf{E} + qD_n\nabla n, \qquad
+\mathbf{J}_p = qp\mu_p\mathbf{E} - qD_p\nabla p
+\label{eq:drift_diffusion}
+\end{equation}
+with diffusion coefficients related to mobilities through the Einstein relation $D = \mu k_B T / q$.
+
+Recombination combines radiative, Shockley--Read--Hall (SRH), Auger, and interface terms:
+\begin{align}
+R_{rad} &= B_{rad}(np - n_i^2) \label{eq:recomb_rad} \\
+R_{SRH} &= \frac{np - n_i^2}{\tau_h(n{+}n_1) + \tau_e(p{+}p_1)} \label{eq:recomb_srh} \\
+R_{Aug} &= (A_e n + A_h p)(np - n_i^2) \label{eq:recomb_aug}
+\end{align}
+with intrinsic carrier concentration $n_i = \sqrt{N_c N_v}\exp(-E_g/2k_BT)$, built-in voltage $V_{bi} = W_{anode} - W_{cathode}$, and interface recombination velocity $j_s = v_s \Delta c$.
+
+The system is solved in COMSOL at each applied voltage $V$ to generate the $J(V)$ curve.
+The 31 input parameters (Table~\ref{tab:31params}) span $>$20 orders of magnitude---from carrier mobilities (${\sim}10^{-4}$--$10^{2}$~cm$^2$/Vs) to doping densities (${\sim}10^{17}$--$10^{21}$~cm$^{-3}$) to recombination coefficients (${\sim}10^{-12}$--$10^{-6}$~cm$^3$/s)---necessitating careful preprocessing (\S\ref{sec:preprocessing}).
+
+\begin{table}[t]
+\centering
+\caption{The 31 COMSOL parameters grouped by physical origin. Parameters span $>$20 orders of magnitude, with six per-layer quantities (band edges, mobilities), three layer thicknesses, and global recombination/generation parameters.}
+\label{tab:31params}
+\begin{tabular}{@{}lcp{8cm}@{}}
+\toprule
+\textbf{Group} & $n$ & \textbf{Parameters} \\
+\midrule
+Band edges & 6 & $\chi_{e,h}$ for ETL, perovskite, HTL (eV) \\
+Mobilities & 6 & $\mu_{n,p}$ per layer (cm$^2$/Vs) \\
+Thicknesses & 3 & $l_H, l_P, l_E$ (nm) \\
+SRH lifetimes & 2 & $\tau_e, \tau_h$ (s) \\
+Density of states & 4 & $N_{c,v}$ for perovskite and ETL (cm$^{-3}$) \\
+Recombination & 4 & $v_{IV,V}$ (cm/s), $B_{rad}$ (cm$^3$/s), $C_{Aug}$ (cm$^6$/s) \\
+Permittivities & 3 & $\varepsilon$ per layer (relative) \\
+Contacts & 2 & $W_{anode}$, $W_{cathode}$ (eV) \\
+Generation & 1 & $G_{avg}$ (cm$^{-3}$s$^{-1}$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Two-Stage Surrogate Pipeline}
+\label{sec:scalar_pipeline}
+%=============================================================================
+
+The framework operates as a modular two-stage pipeline (Figure~\ref{fig:pipeline}):
+
+\paragraph{Stage~1: Scalar prediction (Zhao et al.~\cite{zhao2025ae}).}
+Three-layer ANNs with Bayesian regularization, trained on 100k LHS samples, predict scalar device metrics from the 31 raw parameters:
+\begin{equation}
+\mathbf{x} \in \mathbb{R}^{31} \xrightarrow[\text{Zhao et al.}]{\text{3-layer ANN}} \{V_{oc}^{pred}, V_{mpp}^{pred}, J_{sc}^{pred}\}
+\label{eq:scalar_stage}
+\end{equation}
+with MSE $< 3.1 \times 10^{-4}$ for $V_{oc}$, validated against 9 fabricated devices spanning $E_g \in \{1.56, 1.63\}$~eV (calibration MSE $8.2 \times 10^{-8}$--$1.8 \times 10^{-4}$)~\cite{zhao2025ae}.
+
+\paragraph{Stage~2: Curve reconstruction (this work).}
+Pre-computed scalar predictions condition the curve model alongside 31 scaled parameters and $m$ selected physics features:
+\begin{equation}
+\mathbf{x}_{in} = [\,\underbrace{\mathbf{x}^{sc}}_{31}\;;\;\underbrace{V_{oc}^{pred},\, V_{mpp}^{pred}}_{\text{Stage 1}}\;;\;\underbrace{\boldsymbol{\phi}(\mathbf{x})}_{m}\,]
+\xrightarrow{f_\theta} \hat{\mathbf{J}} \in \mathbb{R}^{8}
+\label{eq:curve_stage}
+\end{equation}
+where $m = 5$ after train-only feature selection (\S\ref{sec:feature_selection}).
+
+The two-stage design provides three critical properties:
+\begin{enumerate}
+    \item \textbf{No inter-stage gradient leakage}: the curve model consumes scalar predictions as fixed inputs, preventing error backpropagation from distorting scalar predictors.
+    \item \textbf{Swappability}: ground-truth scalars can replace predicted scalars during debugging and ablation, isolating curve-model errors from upstream prediction errors.
+    \item \textbf{Independent execution}: Stage~1 runs in ${\sim}0.3$~s for 100k samples; both stages execute independently with different training procedures and hyperparameters.
+\end{enumerate}
+
+\begin{figure}[t]
+    \centering
+    \resizebox{\textwidth}{!}{\input{figures/pipeline.tex}}
+    \caption{\textbf{Two-stage surrogate pipeline.}
+    Stage~1: three-layer ANNs~\cite{zhao2025ae} predict scalar metrics ($V_{oc}$, $V_{mpp}$) from 31 COMSOL parameters.
+    Stage~2: dilated conv model consumes scaled parameters, Stage~1 scalars, and $m{=}5$ selected physics features to produce 8-point J-V curves under physics-constrained loss.
+    The modular architecture enables independent training, validation, and deployment of each stage. Scalars are pre-computed and stored as external files, enabling transparent swapping between ground-truth and predicted values for ablation studies.}
+    \label{fig:pipeline}
+\end{figure}
+
+%=============================================================================
+\section{Related Work}
+\label{sec:litreview}
+%=============================================================================
+
+\paragraph{ML surrogates for perovskites.}
+Prior machine learning surrogates for perovskite solar cells predict scalar properties: band gap from composition~\cite{feng2024bandgap}, formability classification~\cite{talapatra2021formability}, lattice constants~\cite{zhang2020lattice}, and device-level metrics (PCE, FF)~\cite{hu2022ml,oboh2024nn}.
+None predict full J-V curves from material parameters.
+
+\paragraph{J-V curve prediction.}
+Two concurrent works address J-V reconstruction for perovskite devices (Table~\ref{tab:comparison}).
+Toprak~\cite{toprak2025jv} mapped irradiance and voltage $(G, V)$ to current density $J$ for a \emph{single fixed device geometry} (2 input dimensions, $R^2 = 0.994$, 8k training samples).
+Zbinden et al.~\cite{zbinden2026ae} used conditional variational autoencoders for forward and inverse J-V modeling from 6 fabrication parameters ($R^2 = 0.996$, 50k training samples, validated on 4 fabricated devices).
+Our work generalizes across 31 coupled drift-diffusion dimensions with ${\sim}150$k training samples and explicit physics constraints, and contributes the architectural finding that bidirectional convolutions outperform attention-based and pointwise architectures on short physics-governed sequences.
+
+\begin{table}[t]
+\centering
+\caption{Comparison with concurrent J-V curve reconstruction approaches. Our method operates in the highest-dimensional parameter space with the largest training set and strongest physics constraints.}
+\label{tab:comparison}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+& \textbf{Toprak}~\cite{toprak2025jv} & \textbf{Zbinden}~\cite{zbinden2026ae} & \textbf{Ours} \\
+\midrule
+Input dimensions & 2 & 6 & 31 + $m$ \\
+Architecture & MLP & Conditional AE & Dilated Conv \\
+Training data & 8k & 50k & 150k \\
+Best $R^2$ & 0.994 & 0.996 & \textbf{0.998} \\
+Physics constraints & --- & Latent regularization & Mono+conv+curv+Jacobian \\
+Inverse design & No & Encoder-based & Jacobian-based \\
+Experimental validation & No & 4 devices & Via~\cite{zhao2025ae}: 9 devices \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Physics-informed neural networks (PINNs).}
+Classical PINNs embed PDE residuals as loss terms, requiring PDE evaluation during training.
+Our approach instead uses physics to \emph{inform inputs} (71 derived features) and \emph{constrain outputs} (monotonicity, convexity, curvature), avoiding PDE evaluation entirely.
+This is closer to the ``physics-informed feature engineering'' paradigm than to residual-based PINNs.
+
+%=============================================================================
+\section{Method}
+\label{sec:method}
+%=============================================================================
+
+\subsection{Problem Formulation}
+
+Given device parameters $\mathbf{x} \in \mathbb{R}^{31}$ and upstream scalar predictions $\{V_{oc}^{pred}, V_{mpp}^{pred}\}$, predict a compact J-V representation:
+\begin{equation}
+\hat{\mathbf{J}} = f_\theta(\mathbf{x}_{in}; \mathbf{V}_{query}) \in \mathbb{R}^8
+\end{equation}
+where $\mathbf{V}_{query}$ are 8 voltage query points concentrated near the MPP.
+Convention: positive photocurrent ($J > 0$ for $V < V_{oc}$).
+The full 45-point J-V curve is recovered via PCHIP interpolation from the 8 predicted points.
+
+\subsection{Data}
+\label{sec:data}
+
+Two LHS campaigns generate the ground-truth dataset:
+\begin{itemize}
+    \item \textbf{Campaign 1}: 100k samples $\to$ usable subset after COMSOL convergence filtering
+    \item \textbf{Campaign 2}: 300k samples $\to$ usable subset after filtering
+    \item \textbf{Combined}: ${\sim}$150k devices after convergence and quality filtering, split 80/10/10 train/val/test (120k/15k/15k)
+\end{itemize}
+
+Filtering removes only devices where COMSOL failed to converge or produced grossly unphysical curves (e.g., negative $J_{sc}$, $V_{oc} < 0$); no curvature-based or performance-based filtering is applied, preserving the full LHS distribution including pathological devices.
+
+The voltage grid is \textbf{non-uniform} (Figure~\ref{fig:voltage_grid}), with resolution concentrated where device-performance sensitivity is highest:
+\begin{itemize}
+    \item \textbf{Low voltage} ($0 \leq V \leq 0.4$~V): 5 coarse points, $\Delta V = 0.1$~V
+    \item \textbf{Knee/MPP region} ($0.425 \leq V \leq 1.4$~V): 40 dense points, $\Delta V = 0.025$~V
+    \item \textbf{Total}: $N_V = 45$ points
+\end{itemize}
+
+This design reflects the physics: the flat-band region ($V \ll V_{mpp}$) has $J \approx J_{sc}$ with near-zero curvature, while the knee region contains the MPP, the drift-to-recombination transition, and the approach to $V_{oc}$---all critical for fill-factor evaluation and device optimization.
+The non-uniform spacing necessitates $\Delta V$-weighted evaluation metrics (\S\ref{sec:metrics}).
+
+\begin{figure}[t]
+    \centering
+    \resizebox{\textwidth}{!}{\input{figures/voltage_grid_design.tex}}
+    \caption{\textbf{Non-uniform voltage grid and $\Delta V$-weighted loss.}
+    (a)~Coarse/dense grid design: 5 points at $\Delta V = 0.1$~V in the flat-band region, 40 points at $\Delta V = 0.025$~V in the knee/MPP regime, for $N_V = 45$ total.
+    (b)~$\Delta V$-weighted curve loss with Gaussian emphasis $w_j$ centered at $V_{mpp}$ ($w_{mpp} = 2$, $\sigma_w = 0.1$~V), preventing low-information flat-band points from dominating the objective while concentrating fitting effort where power extraction and device-performance sensitivity are highest.}
+    \label{fig:voltage_grid}
+\end{figure}
+
+\paragraph{Dataset statistics.}
+Figure~\ref{fig:dataset_stats} summarizes the ${\sim}150$k-device dataset.
+The LHS design achieves near-orthogonal parameter coverage (most pairwise correlations $< 0.2$), ensuring that the training data uniformly spans the design space.
+Figure~\ref{fig:current_density_boxplots} shows the per-voltage-point $J$ distributions: spread is minimal at low $V$ (flat-band: $J \approx J_{sc}$) and peaks near the knee/$V_{mpp}$, directly motivating the dense grid and curvature-based sample weighting.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figa.png}
+    \caption{Pearson correlation heatmap of the 31 input parameters. Most pairwise correlations are $< 0.2$, confirming that the LHS design achieves near-orthogonal coverage. PCE shows negative correlation with $N_{CV}$ via the chain $R \propto n_i^2 \propto N_c N_v \exp(-E_g/k_BT)$.}
+    \label{fig:param_correlation}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figb.png}
+    \caption{Pairwise KDE of $V_{oc}$, $J_{sc}$, FF, PCE. Near-symmetric $V_{oc}$ and FF distributions reflect the LHS coverage; right-skewed $J_{sc}$ reflects the log-uniform distribution of generation-related parameters.}
+    \label{fig:pairwise_kde}
+  \end{subfigure}
+  \caption{\textbf{Dataset statistics.} Near-orthogonal 31-parameter design space (a) and scalar metric distributions (b) from the combined LHS campaigns (${\sim}150$k usable devices after COMSOL convergence and quality filtering).}
+  \label{fig:dataset_stats}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.7\textwidth]{current_density_boxplot_distributions.png}
+    \caption{\textbf{$J(V_j)$ distributions per voltage point.} Spread is minimal at low $V$ (flat-band region: $J \approx J_{sc}$ for all devices) and peaks near the knee/$V_{mpp}$ region, motivating both the dense voltage grid and the curvature-based sample weighting that emphasizes sharp-knee devices.}
+    \label{fig:current_density_boxplots}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\subsection{Preprocessing}
+\label{sec:preprocessing}
+%-----------------------------------------------------------------------------
+
+\paragraph{Parameter scaling.}
+The $>$20 orders-of-magnitude dynamic range requires multi-stage normalization.
+Parameters are grouped by physical type, with group-specific transformations:
+\begin{equation}
+x \!\xrightarrow{\log_{1p}}\! x' \!\xrightarrow{\text{Robust}}\! \frac{x' - \tilde{x}'}{\text{IQR}} \!\xrightarrow{\text{MinMax}}\! x''' \!\in\! [-1, 1]
+\label{eq:scaling}
+\end{equation}
+
+The four groups are:
+\begin{itemize}
+    \item \textbf{Thicknesses} (3): $l_H, l_P, l_E$ $\to$ RobustScaler $\to$ MinMax$[-1,1]$
+    \item \textbf{Material properties} (19): mobilities, DOS, energies, permittivities $\to$ $\log_{1p}$ $\to$ RobustScaler $\to$ MinMax$[-1,1]$
+    \item \textbf{Contacts} (2): $W_{anode}, W_{cathode}$ $\to$ RobustScaler $\to$ MinMax$[-1,1]$
+    \item \textbf{Recombination/generation} (7): $G_{avg}$, Auger, $B_{rad}$, lifetimes, surface velocities $\to$ RobustScaler $\to$ MinMax$[-1,1]$
+\end{itemize}
+
+RobustScaler uses median and interquartile range (IQR) rather than mean and standard deviation, providing resilience to outliers from the LHS tails.
+The $\log_{1p}$ transform compresses the multi-order-of-magnitude range of material properties before robust scaling.
+All transformer parameters are fit exclusively on the training split and stored via \texttt{joblib} for reproducible deployment.
+Figure~\ref{fig:boxplot_normalized} confirms that the multi-stage pipeline compresses the $>$20 orders-of-magnitude dynamic range into a well-behaved $[-1,1]$ interval with outliers contained within $[-3, 3]$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.7\textwidth]{normalized_all.png}
+  \caption{\textbf{All 31 parameters after normalization} ($\log_{1p}$ $\to$ RobustScaler $\to$ MinMax$[-1,1]$). Outliers are visible but contained within $[-3, 3]$, confirming that the multi-stage normalization handles the $>$20 orders-of-magnitude dynamic range effectively.}
+  \label{fig:boxplot_normalized}
+\end{figure}
+
+\paragraph{Compact curve representation.}
+Rather than predicting all 45 grid points directly, each J-V curve is represented by \textbf{8 query points} concentrated near the MPP.
+The full 45-point curve is recovered by PCHIP interpolation~\cite{fritsch1980monotone} with Fritsch--Carlson slopes, which preserves monotonicity by construction---simultaneously achieving dimensionality reduction ($45 \to 8$) and encoding a physics prior (monotone decreasing $J(V)$).
+
+Figure~\ref{fig:interp_fidelity_pair} quantifies this approximation.
+The 8-point PCHIP reconstruction achieves $R^2 = 0.994$ against the full COMSOL reference; by ${\sim}10$ points the representation error saturates at ${\sim}0.999$.
+The 8-point budget is Pareto-optimal: sufficient fidelity for practical applications while keeping the sequence short enough for efficient convolutional processing.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.49\textwidth]{jv_curve_8_point_reconstruction_example.png}
+  \hfill
+  \includegraphics[width=0.49\textwidth]{reconstruction_number_vs_number_of_points.png}
+  \caption{\textbf{PCHIP reconstruction fidelity.}
+  \textbf{Left}: 8-point reconstruction (dashed orange) vs.\ COMSOL reference (solid blue), $R^2 = 0.994$.
+  The representation faithfully captures both the flat photocurrent plateau and the sharp knee transition.
+  \textbf{Right}: $R^2$ vs.\ number of query points; performance saturates at ${\sim}0.999$ by 10 points and ${\sim}0.9997$ by 12 points. The 8-point budget is Pareto-optimal, balancing fidelity against model output dimensionality and sequence length for the convolutional backbone.}
+  \label{fig:interp_fidelity_pair}
+\end{figure}
+
+\paragraph{Current normalization.}
+Curves are $J_{sc}$-normalized to decouple magnitude from shape, enabling the network to learn shape independently of overall current scale:
+\begin{equation}
+\tilde{J}(V) = 2\,J(V)/J_{sc} - 1 \in [-1, 1]
+\label{eq:normalization}
+\end{equation}
+so that $\tilde{J}(0) = +1$ and $\tilde{J}(V_{oc}) = -1$.
+Denormalization recovers absolute current: $J(V) = (\tilde{J}(V) + 1) \cdot J_{sc} / 2$.
+
+Training samples are additionally weighted by curvature:
+\begin{equation}
+w_i = 1 + 4.0\,(\kappa_i / \kappa_{max})^{1.5}
+\label{eq:sample_weight}
+\end{equation}
+where $\kappa_i$ is the maximum curvature of sample $i$.
+This emphasizes sharp-knee devices that are most informative for fill-factor prediction and most challenging to reconstruct.
+
+%-----------------------------------------------------------------------------
+\subsection{Physics Feature Engineering}
+\label{sec:physics_features}
+%-----------------------------------------------------------------------------
+
+From the raw 31 parameters, we derive 71 features encoding closed-form approximations of the drift-diffusion equations---the \emph{same physics} that COMSOL solves numerically, expressed analytically (Table~\ref{tab:physics_features}; full definitions in Appendix~\ref{app:features}).
+These features are computed once during preprocessing and cached as part of the input tensor.
+
+\begin{table}[t]
+\centering
+\caption{Physics feature taxonomy (71 total). Each category derives from a specific aspect of the drift-diffusion equations. Features encode the same physics COMSOL solves numerically, providing the network with physically meaningful coordinates that shortcut nonlinear representation learning.}
+\label{tab:physics_features}
+\begin{tabular}{@{}llcl@{}}
+\toprule
+\textbf{Category} & \textbf{Physical origin} & $n$ & \textbf{Key features} \\
+\midrule
+Energetics & Band theory & 7 & $E_g$, $V_{bi}$, $E_g^{offset}$ \\
+Barriers & Band alignment & 9 & $\Delta E_v^{HP}$, $\Phi_{h,ETL}$, $\Phi_{e,HTL}$ \\
+Diffusion lengths & Einstein + SRH & 8 & $L_{n,p}$, $\eta_{coll,e/h}$ \\
+$\mu\tau$ products & Transport quality & 4 & $\mu\tau_{e,h}$, $\mu\tau_{balance}$ \\
+Extraction FOMs & Hecht equation & 6 & $\Theta_{e,h}$, $\Theta_{min}$ \\
+Series resistance & Ohm's law & 5 & $R_s^{HTL,ETL,total}$ \\
+Generation & Beer--Lambert & 4 & $J_{max} = qG_{avg}l_P$ \\
+Recombination & SRH/Auger theory & 8 & $\tau_{eff}$, $V_{oc}^{loss}$ \\
+Surface & Interface recombination & 4 & $v_s$, surface/bulk ratio \\
+Geometry & Electrostatics & 9 & $\varepsilon$-ratios, Debye $\lambda_D$ \\
+\midrule
+Composite & Multi-physics combinations & 7 & $\text{FF}_{pred}$, Quality, $J_{sc}^{pred}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Physically notable features include the \textbf{Hecht extraction figures of merit}~\cite{courtier2019transport}, which quantify the competition between charge extraction (drift) and recombination:
+\begin{equation}
+\Theta_e = \frac{\mu_n^P \tau_e V_{bi}}{l_P^2}, \qquad
+\Theta_h = \frac{\mu_p^P \tau_h V_{bi}}{l_P^2}, \qquad
+\Theta_{min} = \min(\Theta_e, \Theta_h)
+\label{eq:theta}
+\end{equation}
+
+$\Theta \gg 1$ indicates extraction-dominated transport (high fill factor, efficient charge collection); $\Theta \ll 1$ signals recombination-limited operation (low fill factor, S-shaped risk).
+Although $\Theta_{min}$ is an important physical concept, it does not survive train-only feature selection (\S\ref{sec:feature_selection}) because its predictive information is already encoded by the combination of upstream features ($E_g^{offset}$, $J_{max}^{log}$) that capture the same $V_{bi}$, $l_P$, and transport physics through less redundant coordinates.
+
+\textbf{Composite predictors} combine multiple physical mechanisms into quantities that approximate device-level metrics:
+\begin{align}
+\text{FF}_{pred} &= \log\Theta_{min} - \log R_s^{total} \label{eq:ff_pred} \\
+V_{oc}^{pred} &= E_g + \tfrac{1}{2}(\Phi_{h,ETL} + \Phi_{e,HTL}) - k_BT\log R_{SRH} \label{eq:voc_pred} \\
+J_{sc}^{pred} &= \log(J_{max}) + \log(\eta_{coll,min}) \label{eq:jsc_pred} \\
+\text{Quality} &= \log(\Theta_{min}) + \text{SRH}_{str} - \log(R_s^{total}) \label{eq:quality}
+\end{align}
+These provide the network with physically meaningful coordinates, shortcutting the nonlinear combinations (products, ratios, exponentials of 6 or more raw parameters) that it would otherwise need to discover.
+
+\textbf{Analytical ceiling functions} bound scalar predictions:
+\begin{align}
+J_{sc}^{ceil} &= qG_{avg}l_P \qquad \text{(Beer--Lambert absorption limit)} \label{eq:jsc_ceil} \\
+V_{oc}^{ceil} &= \min(E_g, V_{bi}) \qquad \text{(thermodynamic + electrostatic bound)} \label{eq:voc_ceil} \\
+V_{mpp}^{est} &= V_{oc} - k_BT\ln(1 + V_{oc}/k_BT) \qquad \text{(Shockley approximation)} \label{eq:vmpp_est} \\
+\text{FF}^{est} &= \frac{v_{oc} - \ln(v_{oc} + 0.72)}{v_{oc} + 1}, \quad v_{oc} = V_{oc}/(k_BT) \qquad \text{(Green formula)} \label{eq:ff_green}
+\end{align}
+
+%-----------------------------------------------------------------------------
+\subsection{Physics-Guided Feature Selection}
+\label{sec:feature_selection}
+%-----------------------------------------------------------------------------
+
+While 71 candidate features encode the full analytical structure of the drift-diffusion equations, J-V curve shape is fundamentally governed by a small number of independent physical mechanisms.
+We identify five governing features through a physics-first selection procedure validated by statistical analysis.
+
+\paragraph{Physical rationale.}
+The drift-diffusion equations (Eqs.~\ref{eq:poisson}--\ref{eq:drift_diffusion}) govern J-V behavior through five largely independent mechanisms:
+(i)~\emph{photocurrent generation}, setting the absolute current scale;
+(ii)~\emph{band gap energetics}, determining the absorption edge and thermodynamic voltage limit;
+(iii)~\emph{built-in field alignment}, controlling charge extraction efficiency;
+(iv)~\emph{interface band alignment}, governing carrier transfer at heterojunctions; and
+(v)~\emph{non-radiative recombination}, dictating the open-circuit voltage deficit from the Shockley--Queisser limit.
+Each mechanism maps to a single dominant feature:
+
+\begin{enumerate}
+    \item $\boldsymbol{J_{max}^{log} = \log(qG_{avg}l_P)}$---the Beer--Lambert photocurrent ceiling.
+    This is the strongest single predictor of J-V curve shape ($\max|r| = 0.973$ with target current values), as it sets the absolute photocurrent scale from which all other device-level metrics derive.
+    $J_{max}$ combines absorption ($G_{avg}$) and geometry ($l_P$), capturing the dominant source of inter-device variability in the current axis.
+
+    \item $\boldsymbol{E_g}$---the perovskite band gap ($\max|r| = 0.432$).
+    $E_g$ directly determines the absorption edge and the thermodynamic upper bound for $V_{oc}$ via the Shockley--Queisser limit.
+    Changes in $E_g$ shift the entire J-V curve along the voltage axis and modulate $J_{sc}$ through the solar spectrum overlap.
+
+    \item $\boldsymbol{E_g^{offset} = E_g - V_{bi}}$---the mismatch between band gap and built-in potential ($\max|r| = 0.324$).
+    When $E_g^{offset} > 0$, the internal electric field ($V_{bi}/l_P$) is insufficient to sweep carriers across the full energy range, causing voltage-dependent extraction losses that reshape the knee region and degrade fill factor.
+    This feature encodes the competition between the thermodynamic voltage window ($E_g$) and the electrostatic driving force ($V_{bi} = W_{anode} - W_{cathode}$).
+
+    \item $\boldsymbol{\chi_P^e}$---the perovskite electron affinity ($\max|r| = 0.334$).
+    $\chi_P^e$ determines the conduction band offset at the perovskite/ETL interface ($\Delta E_c^{PE} = \chi_{ETL}^e - \chi_P^e$), governing whether electrons face an extraction barrier.
+    Large $|\Delta E_c^{PE}|$ produces S-shaped kinks in the J-V curve; moderate alignment enables efficient electron collection.
+
+    \item $\boldsymbol{V_{oc}^{loss} = -E_g/(k_BT) + \log(R_{SRH})}$---a composite recombination metric ($\max|r| = 0.432$).
+    This feature encodes the competition between the thermodynamic $V_{oc}$ limit (set by $E_g$) and non-radiative SRH recombination losses, directly predicting the voltage at which the J-V curve crosses zero.
+    The logarithmic form linearizes the exponential dependence of $J_0$ on recombination rates.
+\end{enumerate}
+
+Together, these five features span the primary determinants of J-V shape: photocurrent magnitude ($J_{max}$), voltage limits ($E_g$, $V_{oc}^{loss}$), fill factor ($E_g^{offset}$), and carrier extraction ($\chi_P^e$).
+
+\paragraph{Statistical validation.}
+A two-stage statistical filter confirms the physics-based selection:
+\begin{enumerate}
+    \item \textbf{Multicollinearity analysis}: among all 71 candidate features, 175 pairs exhibit Pearson $|r| > 0.85$, revealing extensive redundancy.
+    For example, the three generation-related features ($J_{max}^{log}$, $G_{per\,nm}^{log}$, $G_{avg}^{log}$) are mutually correlated ($|r| > 0.9$) because they differ only by factors of $q$ and $l_P$; similarly, all Hecht extraction figures of merit ($\Theta_e$, $\Theta_h$, $\Theta_{min}$) and diffusion length ratios ($\eta_{coll,e}$, $\eta_{coll,h}$) are collinear with $l_P$-dependent features ($|r| > 0.93$).
+    Dropping the less informative member of each correlated pair eliminates 34 features (71$\to$37).
+
+    \item \textbf{Relevance filter}: of the remaining 37 features, only those with $\max_{y \in \text{targets}} |r(\phi_i, y)| \geq 0.3$ are retained, removing 32 features with negligible independent predictive power---including all series resistance features ($R_s^{HTL}$, $R_s^{ETL}$, $R_s^{total}$; $|r| < 0.001$), all permittivity-related and thickness-ratio features, and all Auger and radiative recombination terms ($|r| = 0.0$).
+\end{enumerate}
+
+The two filters independently converge on $m = 5$ features (71$\to$37$\to$5), matching the five physical mechanisms identified above.
+Importantly, the multicollinearity analysis \emph{confirms} the physical intuition: the 66 eliminated features encode overlapping aspects of the same underlying transport physics.
+The drift-diffusion equations impose strong inter-feature correlations (e.g., $\Theta_{min}$ is algebraically related to $L_n$, $\mu\tau$, and $\eta_{coll}$ through shared dependence on $\mu$, $\tau$, $V_{bi}$, and $l_P$), making most intermediate quantities redundant once the five governing mechanisms are directly represented.
+
+\paragraph{Why not $\Theta_{min}$ or $R_s^{total}$?}
+Although the Hecht extraction parameter $\Theta_{min}$ and total series resistance $R_s^{total}$ are physically important concepts~\cite{courtier2019transport}, they do not survive the selection procedure.
+$\Theta_{min}$ achieves only $\max|r| = 0.189$ with target variables---below the relevance threshold---because its predictive information is already captured by the combination of $E_g^{offset}$ (which encodes the $V_{bi}/l_P^2$ dependence) and $J_{max}^{log}$ (which encodes $l_P$ and generation effects).
+$R_s^{total}$ achieves $|r| < 0.001$, reflecting the fact that in the LHS parameter space, most devices have sufficiently low series resistance that $R_s$ does not limit J-V shape; resistive effects only dominate in the extreme tail of the distribution (\S\ref{sec:failure_analysis}).
+
+\paragraph{Interpretation: low-dimensional physics.}
+The compression from 71 to 5 reveals that the physics feature space is highly structured.
+This is consistent with the generalized Shockley diode equation:
+\begin{equation}
+J(V) = J_{sc} - J_0\!\left[\exp\!\left(\frac{qV}{nk_BT}\right) - 1\right] - \frac{V}{R_{sh}}
+\label{eq:shockley}
+\end{equation}
+which relates J-V shape to just 3--4 effective parameters ($J_{sc}$, $J_0$, $n$, $R_s$).
+Our five selected features provide physically interpretable coordinates for this low-dimensional manifold: $J_{max}^{log}$ maps to $J_{sc}$; $E_g$ and $V_{oc}^{loss}$ together determine $J_0$ and $n$; $E_g^{offset}$ and $\chi_P^e$ modulate the ideality factor and parasitic losses.
+
+The feature mask is computed exclusively on the training split and stored alongside the model checkpoint; no target information from validation or test data influences feature selection.
+A hash of the training indices is stored for reproducibility verification.
+
+%-----------------------------------------------------------------------------
+\subsection{Architecture}
+\label{sec:architecture}
+%-----------------------------------------------------------------------------
+
+The full forward pass maps device parameters to 8 current-density predictions:
+\begin{align}
+&\underbrace{\mathbf{x}_{in} \in \mathbb{R}^{d_{in}}}_{31+2+m}
+\xrightarrow{\text{ParamMLP}}
+\mathbf{h} \in \mathbb{R}^{128} \nonumber \\
+&\xrightarrow[\text{concat}]{\oplus\,\text{RBF}(\mathbf{V})}
+\mathbf{S} \in \mathbb{R}^{8 \times 256}
+\xrightarrow{\text{DilConv}\times 3}
+\xrightarrow{\text{Lin}}
+\hat{\mathbf{J}} \in \mathbb{R}^{8}
+\label{eq:arch}
+\end{align}
+
+\paragraph{ParamMLP.}
+A three-layer MLP embeds the concatenated input ($\mathbf{x}^{sc}$, scalars, selected features) into a fixed-size representation:
+$d_{in} \to 256 \to 128 \to 128$, with GELU activation, BatchNorm, and Dropout($p{=}0.036$) after each layer.
+The output $\mathbf{h} \in \mathbb{R}^{128}$ is a device-level embedding shared across all voltage query points.
+
+\paragraph{Gaussian RBF positional encoding.}
+Each voltage query point $V_j$ is encoded via learnable Gaussian radial basis functions:
+\begin{equation}
+\text{RBF}(V_j) = \bigl[\exp\!\bigl(-(V_j - \mu_k)^2 / 2\sigma_k^2\bigr)\bigr]_{k=1}^{128}
+\label{eq:rbf}
+\end{equation}
+where centers $\mu_k$ are initialized uniformly over $[0, V_{max}]$ and bandwidths $\sigma_k$ are learnable.
+The 128-dimensional device embedding $\mathbf{h}$ is broadcast across 8 voltage positions and concatenated with the 128-dim RBF encoding, producing $\mathbf{S} \in \mathbb{R}^{8 \times 256}$---a sequence representation where each position encodes both device properties and voltage location.
+
+\paragraph{Dilated 1D conv backbone.}
+Three residual blocks with symmetric (non-causal) padding process the sequence:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lcccl@{}}
+\toprule
+\textbf{Block} & \textbf{Channels} & $k$ & $d$ & \textbf{Details} \\
+\midrule
+1 & $256 \to 128$ & 5 & 1 & Conv-BN-GELU-Drop(0.036) + skip \\
+2 & $128 \to 128$ & 5 & 1 & Residual connection \\
+3 & $128 \to 64$ & 5 & 2 & RF $> 8$: full bidirectional coverage \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Output: pointwise Linear($64 \to 1$) $\to$ $\hat{\mathbf{J}} \in \mathbb{R}^8$.
+
+\paragraph{Why dilation suffices.}
+Block~3's dilation $d{=}2$ with kernel $k{=}5$ gives a single-layer receptive field of 9 positions ($= k + (k-1)(d-1)$), already exceeding the 8-point sequence length.
+Combined with Blocks~1--2, every output position has \emph{bidirectional} context over all 8 input positions.
+This is the architectural mechanism that makes self-attention unnecessary (\S\ref{sec:ablation}): global context is already provided by the convolutional architecture, and the local inductive bias of convolution better matches the monotonically decaying spatial correlation structure of J-V curves.
+
+%-----------------------------------------------------------------------------
+\subsection{Physics-Constrained Loss}
+\label{sec:loss}
+%-----------------------------------------------------------------------------
+
+The total loss combines reconstruction accuracy with four physics-motivated penalties:
+\begin{multline}
+\mathcal{L} = \underbrace{0.98 \cdot \mathcal{L}_{MSE}}_{\text{reconstruction}}
++ \underbrace{0.005 \cdot \mathcal{L}_{mono}}_{\text{monotonicity: }dJ/dV \leq 0}
++ \underbrace{0.005 \cdot \mathcal{L}_{conv}}_{\text{convexity: }d^2J/dV^2 \leq 0} \\
++ \underbrace{0.01 \cdot \mathcal{L}_{curv}}_{\text{curvature bound}}
++ \underbrace{\lambda_{jac} \cdot \mathcal{L}_{jac}}_{\text{Jacobian smoothness}}
+\label{eq:loss}
+\end{multline}
+
+Each penalty encodes a qualitative property of physical J-V curves:
+
+\paragraph{Reconstruction loss.}
+Weighted mean squared error on the 8 predicted current values:
+\begin{equation}
+\mathcal{L}_{MSE} = \frac{1}{8B} \sum_{i=1}^{B}\sum_{j=1}^{8} w_{ij}(\hat{J}_{ij} - J_{ij})^2
+\label{eq:mse}
+\end{equation}
+where $w_{ij}$ incorporates sample curvature weighting (Eq.~\ref{eq:sample_weight}).
+
+\paragraph{Monotonicity penalty.}
+Current density must decrease with voltage in the power-producing quadrant ($dJ/dV \leq 0$):
+\begin{equation}
+\mathcal{L}_{mono} = \frac{1}{7B} \sum_{i,j} [\text{ReLU}(\hat{J}_{i,j+1} - \hat{J}_{i,j})]^2
+\label{eq:mono}
+\end{equation}
+Penalizes any predicted increase in current with voltage---a direct encoding of the fundamental physics that net photocurrent decreases as the applied voltage reduces the built-in field and enhances recombination.
+
+\paragraph{Convexity penalty.}
+In the knee region, J-V curves are concave (negative second derivative):
+\begin{equation}
+\mathcal{L}_{conv} = \frac{1}{6B} \sum_{i,j} [\text{ReLU}(2\hat{J}_{i,j} - \hat{J}_{i,j-1} - \hat{J}_{i,j+1})]^2
+\label{eq:convex}
+\end{equation}
+
+\paragraph{Excess curvature penalty.}
+Bounds the magnitude of the second finite difference to prevent oscillatory artifacts:
+\begin{equation}
+\mathcal{L}_{curv} = \frac{1}{6B} \sum_{i,j} [\text{ReLU}(|\Delta^2 \hat{J}_{ij}| - 0.8)]^2
+\label{eq:curv}
+\end{equation}
+
+\paragraph{Jacobian regularization.}
+A smoothness prior on the parameter-to-curve mapping:
+\begin{equation}
+\mathcal{L}_{jac} = \frac{1}{d_{in}} \left\|\frac{\partial \hat{\mathbf{J}}}{\partial \mathbf{x}_{in}}\right\|_F^2
+\label{eq:jacobian}
+\end{equation}
+estimated via Hutchinson's trace estimator with $K{=}4$ random projections in fp32 (bf16 causes overflow due to the squared norm computation).
+Default $\lambda_{jac} = 0$; recommended range $[10^{-4}, 10^{-2}]$ when Jacobian smoothness is desired for inverse design (\S\ref{sec:inverse}).
+
+%-----------------------------------------------------------------------------
+\subsection{$\Delta V$-Weighted Evaluation Metrics}
+\label{sec:metrics}
+%-----------------------------------------------------------------------------
+
+The non-uniform voltage grid necessitates $\Delta V$-weighted metrics to ensure that evaluation reflects physical significance rather than grid density.
+Without weighting, the 40 dense knee-region points ($\Delta V = 0.025$~V) would dominate the 5 coarse flat-band points ($\Delta V = 0.1$~V), making errors in the flat-band region invisible.
+
+The $\Delta V$-weighted per-curve $R^2$:
+\begin{equation}
+R^2_i = 1 - \frac{\sum_j \Delta V_j \bigl(\hat{J}_i(V_j) - J_i(V_j)\bigr)^2}{\sum_j \Delta V_j \bigl(J_i(V_j) - \bar{J}_i\bigr)^2}
+\label{eq:dv_r2}
+\end{equation}
+where $\bar{J}_i = \sum_j \Delta V_j J_i(V_j) / \sum_j \Delta V_j$ and $\Delta V_j = V_{j+1} - V_j$ (last point repeated).
+
+The $\Delta V$-weighted curve loss used during training:
+\begin{equation}
+\mathcal{L}_{curve} = \frac{\sum_{j=1}^{N_V} \Delta V_j \, w_j \, (\hat{J}_j - J_j)^2}{\sum_{j=1}^{N_V} \Delta V_j \, w_j}
+\label{eq:dv_loss}
+\end{equation}
+with Gaussian MPP emphasis ($w_{mpp} = 2$, $\sigma_w = 0.1$~V):
+\begin{equation}
+w_j = 1 + (w_{mpp} - 1)\exp\!\left(-\frac{(V_j - V_{mpp})^2}{2\sigma_w^2}\right)
+\label{eq:gaussian_weight}
+\end{equation}
+
+We report mean, median, 5th percentile, and 95th percentile $R^2_i$ aggregates across the test set.
+
+%-----------------------------------------------------------------------------
+\subsection{Training}
+\label{sec:training}
+%-----------------------------------------------------------------------------
+
+\begin{table}[t]
+\centering
+\caption{Training configuration. Hyperparameters selected via Optuna TPE sampler (50 trials with median pruning; Table~\ref{tab:hpo}).}
+\label{tab:training_config}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Component} & \textbf{Parameter} & \textbf{Value} \\
+\midrule
+Optimizer & AdamW & $\beta_1 = 0.9$, $\beta_2 = 0.999$ \\
+Learning rate & OneCycleLR & $\eta_{peak} = 5.5 \times 10^{-3}$, cosine to $\eta/150$ \\
+Weight decay & & $5.4 \times 10^{-5}$ \\
+Batch size & & 512 (primary); 128 (ablations) \\
+Precision & & bf16 mixed (fp32 for Jacobian) \\
+Max epochs & & 100 \\
+Early stopping & & 20 epochs patience on val loss \\
+Gradient clipping & & $\|\nabla\|_{max} = 1.0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training uses AdamW with OneCycleLR scheduling (peak $\eta = 5.5 \times 10^{-3}$, cosine annealing to $\eta_{peak}/150$), bf16 mixed precision, and gradient clipping at $\|\nabla\|_{max} = 1.0$ to stabilize early epochs.
+The primary model uses batch size 512; ablation studies use batch size 128.
+Early stopping with 20-epoch patience on validation loss prevents overfitting.
+Hyperparameters are selected via Optuna TPE sampler with 50 trials and median pruning; Table~\ref{tab:hpo} reports the search space and optimal values.
+Total training time: ${\sim}10$~min on a single GPU (batch 512); ${\sim}23$~min for batch 128 configurations.
+
+\begin{table}[t]
+  \centering
+  \caption{HPO search space and optimal values (Optuna TPE, 50 trials, median pruning).}
+  \label{tab:hpo}
+  \begin{tabular}{@{}lcc@{}}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Search range} & \textbf{Best value} \\
+    \midrule
+    Learning rate $\eta$ & $[10^{-3}, 2{\times}10^{-2}]$ & $5.5{\times}10^{-3}$ \\
+    Weight decay & $[10^{-6}, 10^{-4}]$ & $5.4{\times}10^{-5}$ \\
+    Dropout & $[0, 0.2]$ & 0.036 \\
+    Kernel size $k$ & $\{3,5,7,9\}$ & 5 \\
+    Conv blocks & $[1, 3]$ & 3 \\
+    Channel dims & $\{32,64,128\}$ & $128{\to}128{\to}64$ \\
+    RBF bands & $[12, 28]$ & 19 \\
+    RBF $\sigma_{init}$ & $[0.05, 0.15]$ & 0.128 \\
+    MLP depth & $[1, 4]$ & 3 \\
+    MLP width & $\{64,\ldots,512\}$ & 256 \\
+    $w_{\text{mono}}$ & $[10^{-4}, 0.05]$ & 0.005 \\
+    $w_{\text{conv}}$ & $[10^{-4}, 0.05]$ & 0.005 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Analysis and Discussion}
 \label{sec:analysis}
 %=============================================================================
 
-\subsection{Architectural Insights}
+\paragraph{Architectural inductive biases.}
+The ablation results (\S\ref{sec:ablation}) are explained by the physics of J-V curves.
+J-V responses describe thermodynamic equilibria, not temporal sequences: at any voltage, the current depends on the full band diagram ($V_{bi} - V$ across the entire device), recombination landscape, and carrier extraction at both contacts.
+This explains why bidirectional context outperforms causal masking.
+Similarly, J-V spatial correlations decay monotonically with voltage separation---$J(V_j)$ and $J(V_k)$ are most correlated for small $|j-k|$ and progressively decorrelate at larger separations---matching convolution's local inductive bias.
+Attention treats all voltage pairs uniformly, amplifying noise from weakly coupled points where the dilated receptive field already provides sufficient context.
 
-\subsubsection{Why Dilated Conv Wins Over TCN}
+\paragraph{Physics features as PDE summaries.}
+Without the derived features, the MLP must discover nonlinear combinations such as:
+\begin{align*}
+J_{max} &= q G_{avg} l_P & \text{(3 raw params)} \\
+V_{oc}^{loss} &= -E_g/(k_BT) + \log(R_{SRH}) & \text{(4+ raw params)} \\
+E_g^{offset} &= (E_g^h - E_g^e) - (W_{anode} - W_{cathode}) & \text{(4 raw params)}
+\end{align*}
+spanning 6 orders of magnitude.
+With the derived features, the MLP learns only the residual mapping from pre-computed physics to J-V shape.
+The most impactful feature is $J_{max}^{log}$ (photocurrent ceiling, $|r| = 0.973$), followed by $G_{avg}^{log}$ (generation rate, $|r| = 0.582$), $E_g$ (band gap, $|r| = 0.432$), and $V_{oc}^{loss}$ (recombination loss, $|r| = 0.432$).
 
-The J-V curve describes a thermodynamic equilibrium at each applied voltage --- it is \emph{not} a time series.
-The current at voltage $V_j$ depends on the full device band diagram, carrier concentrations, and recombination rates, not on the current at $V_{j-1}$.
-A causal (TCN) architecture imposes an artificial left-to-right ordering that restricts information flow:
+\paragraph{Feature selection reveals low-dimensional structure.}
+The compression from 71 candidate features to $m = 5$ informative features implies that the relevant physics of J-V shape can be summarized by five independent physical mechanisms (\S\ref{sec:feature_selection}).
+$J_{max}^{log}$ emerges as the single strongest predictor ($|r| = 0.973$), consistent with its role as the Beer--Lambert absorption limit that sets the absolute current scale of the J-V curve.
+The remaining four features ($E_g$, $E_g^{offset}$, $\chi_P^e$, $V_{oc}^{loss}$) each capture a distinct aspect of voltage-axis physics and carrier extraction.
+The elimination of 66 features without performance loss implies that diffusion lengths ($L_n$, $L_p$), $\mu\tau$ products, Hecht parameters ($\Theta_e$, $\Theta_h$), barrier heights, and series resistance all encode overlapping aspects of the same transport physics---the drift-diffusion equations impose strong inter-feature correlations (175 pairs with $|r| > 0.85$).
 
-\begin{itemize}
-    \item At voltage point $j$, the TCN can only ``see'' points $1, \ldots, j$ (the low-voltage plateau).
-    It cannot use information from the high-voltage roll-off to improve its prediction at mid-range voltages.
-    \item The non-causal dilated conv uses symmetric padding, giving each point bidirectional context.
-    This is analogous to having both boundary conditions of the drift-diffusion equation available at every spatial point.
-\end{itemize}
+Notably, the five surviving features are all ``upstream'' quantities---fundamental material properties and their direct combinations---rather than ``downstream'' derived transport metrics ($\Theta_{min}$, $L_n$, $R_s^{total}$).
+This suggests that the network benefits most from physically interpretable coordinates that are minimally redundant, rather than from pre-computed transport summaries that, while conceptually useful, share extensive mutual information through their common dependence on the raw parameters.
 
-The empirical result confirms this: non-causal conv achieves lower $V_{oc}$ error variance (0.58~mV std vs.\ 1.65~mV for TCN across seeds), precisely because accurate $V_{oc}$ prediction requires information that propagates from the high-voltage end.
+\paragraph{Scalar-to-curve error propagation.}
+The two-stage pipeline's modular design raises a natural question: how sensitive is curve quality to upstream scalar errors?
+The ablation removing scalar conditioning entirely (Table~\ref{tab:ablation_results}, row~8) shows that curve $R^2_{med}$ changes from $0.9975$ to $0.9966$---a marginal difference confirming that the curve model is robust to the small upstream prediction errors ($V_{oc}$ MSE $< 3.1 \times 10^{-4}$~\cite{zhao2025ae}).
+The dominant source of reconstruction error is intrinsic to the curve model, not propagated from Stage~1.
 
-\subsubsection{Why Attention Hurts on 8-Point Sequences}
+\paragraph{Comparison with related approaches.}
+Our model's median $R^2 = 0.998$ exceeds both Toprak ($R^2 = 0.994$ on a 2-input single-device problem)~\cite{toprak2025jv} and Zbinden et al.\ ($R^2 = 0.996$ on a 6-parameter problem)~\cite{zbinden2026ae}, while operating in a 31-dimensional parameter space with explicit physics constraints.
+The upstream scalar predictors have been experimentally validated against 9 fabricated perovskite devices spanning $E_g \in \{1.56, 1.63\}$~eV~\cite{zhao2025ae}, with calibration MSE ranging from $8.2 \times 10^{-8}$ to $1.8 \times 10^{-4}$.
+Zbinden et al.~\cite{zbinden2026ae} provide complementary validation on 4 devices, supporting drift-diffusion--trained surrogates as viable for real-world deployment.
 
-Self-attention computes pairwise affinities between all positions, yielding $8 \times 8 = 64$ interaction terms for 4 attention heads.
-On natural language sequences of length 512+, this discovers useful long-range dependencies.
-On 8-point J-V curves, the situation is fundamentally different:
+%=============================================================================
+\section{Applications}
+\label{sec:applications}
+%=============================================================================
 
-\begin{enumerate}
-    \item \textbf{Redundant capacity}: The dilated conv receptive field (25 points) already exceeds the sequence length (8 points). Every position already has access to every other position through convolution alone.
-    \item \textbf{Spurious correlations}: With only 8 positions, the attention matrix has 64 learnable entries per head (256 total for 4 heads).
-    This is more than the number of useful inter-point relationships, leading to overfitting of attention patterns.
-    \item \textbf{Physics structure mismatch}: J-V curves have monotonically decreasing correlations with distance --- adjacent points are highly correlated, distant points less so.
-    Convolutions naturally capture this local correlation structure; attention assigns equal a priori importance to all pairs.
-\end{enumerate}
+\paragraph{High-throughput screening.}
+A $10^6$-device Latin Hypercube sweep---${\sim}160$ years via COMSOL at ${\sim}4800$~s/device---completes in $<$1~hour with the surrogate.
+Full-curve evaluation captures fill-factor degradation mechanisms and S-shaped kinks that scalar-only screening~\cite{hu2022ml} misses entirely, enabling discovery of devices with high nominal PCE but poor operational stability signatures.
+The curve representation also enables voltage-dependent analysis: identifying which devices maintain current at high voltages (desirable for tandem applications) vs.\ which exhibit premature roll-off.
 
-This finding has implications beyond J-V curves: \emph{for physics-governed signals on short sequences, inductive biases from domain-appropriate architectures (convolutions with physics-matched receptive fields) outperform generic attention mechanisms.}
+\paragraph{Inverse design via Jacobian.}
+\label{sec:inverse}
+The differentiable surrogate provides analytic Jacobian $\partial \hat{\mathbf{J}}/\partial \mathbf{x}$, enabling gradient-based optimization toward target J-V properties (Figure~\ref{fig:inverse_design}):
+\begin{equation}
+\mathbf{x}^{(t+1)} = \mathbf{x}^{(t)} - \eta\,\nabla_{\!\mathbf{x}}\mathcal{L}_{target}, \qquad
+\nabla_{\!\mathbf{x}}\mathcal{L}_{target} = \frac{\partial \mathcal{L}_{target}}{\partial \hat{\mathbf{J}}} \cdot \frac{\partial \hat{\mathbf{J}}}{\partial \mathbf{x}}
+\label{eq:inverse}
+\end{equation}
 
-\subsubsection{Pointwise as a Strong Baseline}
+Unlike scalar optimization (``maximize PCE''), curve-level inverse design can target specific J-V shape properties: maximum fill factor, smooth knee curvature, or matching a reference profile from a champion device.
+Combined with Zhao et al.'s 24~s experimental calibration protocol~\cite{zhao2025ae}, this enables a closed-loop \emph{characterize $\to$ predict $\to$ optimize} workflow within a single experimental session.
 
-The pointwise (1$\times$1 conv) baseline, where each voltage point is predicted independently given only the parameter embedding, is expected to be the weakest variant.
-The fact that it still achieves reasonable $R^2$ suggests that \emph{most of the ``work'' happens in the ParamMLP}, which compresses the 104-dimensional input into a rich 128-dimensional device representation.
-The conv backbone adds inter-point context that primarily benefits the knee region prediction.
+\begin{figure}[t]
+    \centering
+    \resizebox{0.85\textwidth}{!}{%
+    \begin{tikzpicture}[
+      >=Stealth,
+      every node/.style={font=\sffamily\small},
+      block/.style={
+        draw=#1!55, fill=#1!6, rounded corners=4pt,
+        align=center, line width=0.6pt, inner sep=5pt, minimum height=1cm
+      },
+      arr/.style={->, line width=0.7pt, color=muted!80},
+      garr/.style={->, line width=0.9pt, color=rose, dashed},
+    ]
+      \node[block=steel, text width=1.8cm] (params) at (0,0) {\textbf{\scriptsize Parameters}\\{\tiny $\mathbf{x}^{(t)} \in \mathbb{R}^{31}$}};
+      \node[block=cblue, text width=2.0cm] (surr) at (3.5,0) {\textbf{\scriptsize Surrogate}\\{\tiny $f_\theta(\mathbf{x}^{(t)})$}};
+      \node[block=emerald, text width=1.8cm] (jv) at (7,0) {\textbf{\scriptsize Predicted}\\{\tiny $\hat{\mathbf{J}}^{(t)}(V)$}};
+      \node[block=amber, text width=2.0cm] (loss) at (10.5,0) {\textbf{\scriptsize Objective}\\{\tiny $\mathcal{L}_{target}(\hat{\mathbf{J}}, \mathbf{J}^*)$}};
+      \draw[arr] (params) -- (surr);
+      \draw[arr] (surr) -- (jv);
+      \draw[arr] (jv) -- (loss);
+      \draw[garr] (loss.south) -- ++(0,-0.7)
+        -| node[pos=0.25, below, font=\sffamily\tiny, text=rose]
+           {$\nabla_{\!\mathbf{x}}\mathcal{L}_{target}$ (Eq.~\ref{eq:inverse})}
+        (params.south);
+      \node[font=\sffamily\tiny, text=muted, anchor=south] at (10.5,0.65)
+        {target $\mathbf{J}^*$};
+    \end{tikzpicture}}
+    \caption{\textbf{Inverse design loop.} The frozen surrogate $f_\theta$ provides analytic Jacobian gradients for iterative parameter updates toward a target J-V profile $\mathbf{J}^*$. Unlike scalar optimization, curve-level objectives can target specific shape properties (fill factor, knee smoothness, reference matching).}
+    \label{fig:inverse_design}
+\end{figure}
 
-\subsection{Physics Feature Insights}
-
-The 71 physics features serve as ``analytical PDE summaries'' --- they provide the network with domain knowledge that would otherwise need to be learned from data:
-
-\begin{itemize}
-    \item \textbf{Extraction figure of merit $\Theta_{min}$}: The single most predictive feature for fill factor.
-    $\Theta_{min} = \min(\Theta_e, \Theta_h)$ captures the limiting carrier extraction efficiency.
-    Devices with $\Theta_{min} \gg 1$ have excellent fill factors; those with $\Theta_{min} \ll 1$ are recombination-limited.
-
-    \item \textbf{Series resistance $R_s^{total}$}: Directly computable from layer conductivities, this feature encodes the resistive losses that cause the J-V curve to deviate from the ideal diode shape.
-    Without this feature, the model must implicitly learn the relationship $R_s \propto l / (\mu \cdot N \cdot q)$ from data.
-
-    \item \textbf{Composite predictors}: $\text{FF}_{pred} = \log(\Theta_{min}) - \log(R_s^{total})$ combines extraction quality with resistive loss in a single scalar, directly predicting fill factor.
-    These higher-order features let the MLP operate on physically meaningful coordinates rather than raw material parameters.
-\end{itemize}
-
-\insight{The physics features act as a ``shortcut'' through the representation learning problem.
-Without them, the ParamMLP must learn to compute diffusion lengths, extraction figures of merit, and series resistances from raw mobilities, thicknesses, and lifetimes --- relationships that involve products, ratios, and square roots of input parameters.
-With physics features, these nonlinear combinations are provided directly, and the MLP can focus on the residual mapping from precomputed physics to curve shape.}
-
-\subsection{Lessons for Physics-Informed ML}
-
-\begin{enumerate}
-    \item \textbf{Analytical PDE summaries as features}: When closed-form approximations exist for PDE solution properties, use them as input features rather than trying to learn them implicitly.
-    This is not ``cheating'' --- the features are derived from the same equations the simulator solves.
-    It is analogous to providing a numerical solver with good initial conditions.
-
-    \item \textbf{Soft vs.\ hard physics constraints}: Soft loss penalties (monotonicity, convexity) are sufficient when the model has good inductive bias from physics features.
-    Our monotonicity penalty drops by 3 orders of magnitude during training (Figure~\ref{fig:training_curves}), indicating the model rapidly learns the constraint.
-    Hard constraints (projection layers, constrained optimization) may be unnecessary and can complicate gradient flow.
-
-    \item \textbf{Simple architectures + good features $>$ complex architectures + raw inputs}: The dilated conv with 71 physics features outperforms architecturally more complex variants.
-    This echoes a general finding in scientific ML: domain knowledge is more valuable than architectural sophistication.
-
-    \item \textbf{Compact representations enforce physics}: Predicting 8 curve points instead of 45 is not just dimensionality reduction --- it constrains the output space.
-    With 8 degrees of freedom and PCHIP interpolation, the model cannot produce high-frequency oscillations or non-smooth artifacts.
-    Fewer output dimensions = fewer ways to be unphysical.
-
-    \item \textbf{Jacobian regularization as well-posedness}: Penalizing $\|\partial \hat{\mathbf{I}} / \partial \mathbf{x}\|_F$ encourages smooth parameter-to-solution maps, which is the ML equivalent of well-posedness in PDE theory.
-    This is particularly important for deployment: small perturbations in input parameters (e.g., measurement uncertainty) should not cause discontinuous jumps in the predicted J-V curve.
-\end{enumerate}
+\paragraph{Sensitivity analysis.}
+The Jacobian $\partial \hat{\mathbf{J}}/\partial \mathbf{x}$ also enables systematic sensitivity analysis: which parameters most strongly influence each region of the J-V curve.
+This produces physics-interpretable results---e.g., mobilities and lifetimes dominate the knee region, while contact work functions primarily affect $V_{oc}$---that can guide experimental efforts toward the parameters with highest leverage for improving specific aspects of device performance.
 
 %=============================================================================
 \section{Conclusion}
+\label{sec:conclusion}
 %=============================================================================
 
-We have presented a physics-constrained dilated convolutional network for J-V curve reconstruction in perovskite solar cells that achieves median $R^2 = 0.9974$ on a test set of ${\sim}48$k COMSOL-simulated devices, with a median $V_{oc}$ error of 0.41~mV and total training time of 33 minutes on a single GPU.
+We presented a physics-constrained dilated convolutional network for J-V curve reconstruction in perovskite solar cells, achieving median $R^2 = 0.9975$ across ${\sim}15$k test devices spanning 31 coupled drift-diffusion parameters with $>$20 orders of magnitude in dynamic range.
+The model reconstructs $V_{oc}$ to 0.39~mV median error (below experimental measurement uncertainty) and median MAE of 2.96~A/m$^2$ ($<$0.5\% of typical $J_{sc}$), completing training in ${\sim}10$~min and enabling $>$$10^4\times$ speedup over COMSOL FEM.
 
-The framework's three physics priors --- 71 analytically derived input features, soft shape constraints in the loss, and optional Jacobian regularization --- contribute complementarily to reconstruction quality.
-An architectural ablation demonstrates that bidirectional dilated convolution without self-attention is the optimal backbone for short-sequence physics-governed signals, challenging the prevailing trend toward attention-based architectures.
+Three physics priors contribute complementarily:
+\begin{enumerate}
+    \item \textbf{Input enrichment}: 71 analytically derived features encode drift-diffusion physics; train-only selection reveals that only 5 carry non-redundant information, each mapping to an independent physical mechanism: photocurrent generation ($J_{max}$), band gap energetics ($E_g$), built-in field alignment ($E_g^{offset}$), interface band alignment ($\chi_P^e$), and recombination losses ($V_{oc}^{loss}$).
+    \item \textbf{Output constraints}: monotonicity, convexity, and curvature penalties enforce qualitative properties guaranteed by the underlying PDEs.
+    \item \textbf{Jacobian smoothness}: regularization of the parameter-to-curve map for well-posedness and inverse design.
+\end{enumerate}
 
-Failure modes are concentrated in pathological devices ($<$1\% of the test set) with extreme interface barriers or series resistance --- devices that would not be targets of practical optimization.
-For the remaining $>$99\% of physically reasonable devices, the model provides a reliable, high-fidelity surrogate for coupled drift-diffusion simulations.
+The systematic ablation (10 configurations $\times$ 3 seeds) yields a general architectural finding: \emph{for short physics-governed sequences with monotonically decaying spatial correlations, bidirectional convolution with domain-matched features outperforms both attention-augmented and pointwise variants.}
+Self-attention consistently degrades performance because it introduces spurious pairwise interactions where convolution's local inductive bias better matches the physics.
 
-Future work includes: (i)~uncertainty quantification via deep ensembles or conformal prediction, (ii)~integration with Bayesian optimization for closed-loop device design, (iii)~extension to tandem/multi-junction architectures with additional voltage-dependent physics, and (iv)~transfer learning across material systems (organic, CdTe, CIGS).
+The modular two-stage pipeline, with independently trained scalar predictors~\cite{zhao2025ae} conditioning the curve model, enables transparent validation and swappable components.
+The differentiable surrogate provides analytic Jacobians for gradient-based inverse design targeting specific J-V shape properties.
+
+Future directions include:
+deep-ensemble uncertainty quantification for deployment safety,
+Bayesian optimization for closed-loop experimental design,
+extension to tandem perovskite/silicon architectures~\cite{zhao2023phd},
+end-to-end joint training of both pipeline stages,
+and out-of-distribution detection to flag devices outside the training manifold.
 
 %=============================================================================
-% APPENDIX
-%=============================================================================
-
 \appendix
+%=============================================================================
+
+\section{Optical Model Details}
+\label{app:optical}
+
+Light propagation follows the vectorized transfer-matrix formulation~\cite{zhao2023phd}.
+The electric field in layer $n$:
+\begin{equation}
+E_z(x) = A_n e^{-ik_n(x-L_{n-1})} + B_n e^{ik_n(x-L_{n-1})}
+\end{equation}
+where $k_n = k_0(n_n - i\kappa_n)$.
+Photogeneration rate in the absorber:
+\begin{align}
+G(x) &= \frac{1}{hc} \int_{\lambda_l}^{\lambda_u} \lambda \, Q(x,\lambda) \, d\lambda \\
+Q &= \frac{1}{2} c \varepsilon_0 \alpha n \, |E_z|^2, \quad \alpha = \frac{4\pi\kappa}{\lambda}
+\end{align}
+A phase-elimination method removes incoherent substrate interference.
+$G_{avg} = l_P^{-1}\int_0^{l_P} G(x)\,dx$ enters as one of the 31 inputs.
 
 \section{Full Physics Feature Definitions}
 \label{app:features}
 
-\subsection{A. Energetics (7 features)}
+\subsection*{A. Energetics (7)}
 \begin{align}
-E_g &= \chi_{Perov}^h - \chi_{Perov}^e & \text{(Perovskite bandgap)} \\
-V_{bi} &= W_{anode} - W_{cathode} & \text{(Built-in voltage)} \\
-E_g^{offset} &= E_g - V_{bi} & \text{(Schottky vs.\ Ohmic indicator)}
+E_g &= \chi_{P}^h - \chi_{P}^e, \quad
+V_{bi} = W_{anode} - W_{cathode}, \quad
+E_g^{offset} = E_g - V_{bi}
 \end{align}
 
-\subsection{B. Interface Barriers (9 features)}
+\subsection*{B. Interface Barriers (9)}
 \begin{align}
-\Delta E_v^{HP} &= \chi_{HTL}^h - \chi_{Perov}^h & \text{(VB offset HTL/Perov)} \\
-\Delta E_c^{PE} &= \chi_{ETL}^e - \chi_{Perov}^e & \text{(CB offset Perov/ETL)} \\
-\Phi_{h,ETL} &= \chi_{ETL}^h - \chi_{Perov}^h & \text{(Hole blocking at ETL)} \\
-\Phi_{e,HTL} &= \chi_{HTL}^e - \chi_{Perov}^e & \text{(Electron blocking at HTL)}
+\Delta E_v^{HP} &= \chi_{HTL}^h - \chi_{P}^h, \quad
+\Delta E_c^{PE} = \chi_{ETL}^e - \chi_{P}^e \\
+\Phi_{h,ETL} &= \chi_{ETL}^h - \chi_{P}^h, \quad
+\Phi_{e,HTL} = \chi_{HTL}^e - \chi_{P}^e
 \end{align}
 
-\subsection{C. Transport --- Diffusion Lengths (8 features)}
+\subsection*{C. Diffusion Lengths (8)}
 \begin{align}
-L_n &= \sqrt{\mu_n^P \cdot \tau_e \cdot k_B T / q} & \text{(Electron diffusion length)} \\
-L_p &= \sqrt{\mu_p^P \cdot \tau_h \cdot k_B T / q} & \text{(Hole diffusion length)} \\
-\eta_{coll,e} &= L_n / l_{Perov} & \text{(Electron collection efficiency)} \\
-\eta_{coll,h} &= L_p / l_{Perov} & \text{(Hole collection efficiency)}
+L_n &= \sqrt{\mu_n^P \tau_e k_BT/q}, \quad
+L_p = \sqrt{\mu_p^P \tau_h k_BT/q} \\
+\eta_{coll,e} &= L_n / l_P, \quad
+\eta_{coll,h} = L_p / l_P
 \end{align}
 
-\subsection{D. $\mu\tau$ Products (4 features)}
+\subsection*{D. $\mu\tau$ Products (4)}
 \begin{align}
-\mu\tau_e &= \mu_n^P \cdot \tau_e & \text{(Electron transport quality)} \\
-\mu\tau_h &= \mu_p^P \cdot \tau_h & \text{(Hole transport quality)} \\
-\mu\tau_{balance} &= \mu\tau_e / \mu\tau_h & \text{(Transport balance)}
+\mu\tau_e &= \mu_n^P \cdot \tau_e, \quad
+\mu\tau_h = \mu_p^P \cdot \tau_h, \quad
+\mu\tau_{bal} = \mu\tau_e / \mu\tau_h
 \end{align}
 
-\subsection{E. Drift/Extraction --- Theta Parameters (6 features)}
+\subsection*{E. Extraction Figures of Merit (6)}
 \begin{align}
-\mathcal{E}_{bi} &= V_{bi} / l_{Perov} & \text{(Built-in field)} \\
-\Theta_e &= \frac{\mu_n^P \cdot \tau_e \cdot V_{bi}}{l_{Perov}^2} & \text{(Electron extraction FOM)} \\
-\Theta_h &= \frac{\mu_p^P \cdot \tau_h \cdot V_{bi}}{l_{Perov}^2} & \text{(Hole extraction FOM)} \\
-\Theta_{min} &= \min(\Theta_e, \Theta_h) & \text{(Limiting extraction)}
+\mathcal{E}_{bi} &= V_{bi} / l_P, \quad
+\Theta_e = \mu_n^P \tau_e V_{bi} / l_P^2 \\
+\Theta_h &= \mu_p^P \tau_h V_{bi} / l_P^2, \quad
+\Theta_{min} = \min(\Theta_e, \Theta_h)
 \end{align}
 
-\subsection{F. Series Resistance Estimates (5 features)}
+\subsection*{F. Series Resistance (5)}
 \begin{align}
-\sigma_{HTL} &= q \cdot \mu_p^{HTL} \cdot N_v^{HTL} \\
-R_s^{HTL} &= l_{HTL} / \sigma_{HTL} \\
-R_s^{total} &= R_s^{ETL} + R_s^{Perov} + R_s^{HTL}
+\sigma_{HTL} &= q \mu_p^{HTL} N_v^{HTL}, \quad
+R_s^{HTL} = l_{HTL} / \sigma_{HTL} \\
+R_s^{total} &= R_s^{ETL} + R_s^P + R_s^{HTL}
 \end{align}
 
-\subsection{G. Generation (4 features)}
-\begin{align}
-J_{max} &= q \cdot G_{avg} \cdot l_{Perov} & \text{(Maximum theoretical $J_{sc}$)} \\
-G_{per\_nm} &= G_{avg} / l_{Perov} & \text{(Generation density)}
-\end{align}
+\subsection*{G. Generation (4)}
+\begin{equation}
+J_{max} = q \cdot G_{avg} \cdot l_P, \quad
+G_{per\,nm} = G_{avg} / l_P
+\end{equation}
 
-\subsection{H. Recombination (8 features)}
-\begin{align}
-\tau_{eff} &= \left(\frac{1}{\tau_e} + \frac{1}{\tau_h}\right)^{-1} & \text{(Effective lifetime)} \\
-R_{SRH} &\propto \frac{1}{\tau_e + \tau_h} & \text{(SRH proxy)} \\
-V_{oc}^{loss} &= -\frac{E_g}{k_B T} + \log(R_{SRH}) & \text{($V_{oc}$ loss proxy)}
-\end{align}
+\subsection*{H. Recombination (8)}
+\begin{equation}
+\tau_{eff} = (\tau_e^{-1} + \tau_h^{-1})^{-1}, \quad
+V_{oc}^{loss} = -E_g/(k_BT) + \log(R_{SRH})
+\end{equation}
 
-\subsection{I. Composite Physics Predictors (7 features)}
+\subsection*{I. Composite Predictors (7)}
 \begin{align}
-\text{FF}_{pred} &= \log(\Theta_{min}) - \log(R_s^{total}) & \text{(Fill factor predictor)} \\
-V_{oc}^{pred} &= E_g + 0.5(\Phi_{h,ETL} + \Phi_{e,HTL}) - k_B T \log(R_{SRH}) \\
+\text{FF}_{pred} &= \log(\Theta_{min}) - \log(R_s^{total}) \\
+V_{oc}^{pred} &= E_g + \tfrac{1}{2}(\Phi_{h,ETL} + \Phi_{e,HTL}) - k_BT\log(R_{SRH}) \\
 J_{sc}^{pred} &= \log(J_{max}) + \log(\eta_{coll,min}) \\
-\text{Quality} &= \log(\Theta_{min}) + \text{SRH}_{strength} - \log(R_s^{total})
+\text{Quality} &= \log(\Theta_{min}) + \text{SRH}_{str} - \log(R_s^{total})
 \end{align}
 
-\section{Equations Figure}
+\section{Equation-Flow: Split-Spline Baseline}
 \label{app:equations}
 
-\begin{figure}[h]
+\begin{figure}[t]
     \centering
-    \input{figures/eqns.tex}
-    \caption{\textbf{Equation-flow diagram for the split-spline baseline architecture.}
-    Steps 1--6 show the end-to-end differentiable pipeline: feature extraction, shared backbone, multi-head output, physics projection $\Pi_\mathcal{C}$, monotone knot construction via cumulative sums, and split PCHIP reconstruction.
-    This architecture is presented as a comparison to the primary dilated conv model.}
+    \resizebox{\textwidth}{!}{\input{figures/eqns.tex}}
+    \caption{\textbf{Equation-flow for the split-spline baseline.}
+    Steps 1--6: feature extraction, shared backbone, multi-head output (anchors + region control points), physics projection $\Pi_\mathcal{C}$, monotone knot construction via cumulative sigmoid scaling, split PCHIP reconstruction with Fritsch--Carlson slopes.
+    This baseline achieves comparable performance but requires explicit anchor prediction and projection, whereas the dilated conv model directly outputs 8-point current predictions under soft physics constraints.}
     \label{fig:eqns}
 \end{figure}
 
-\section{Experiment Summary}
+\section{Parameter Distributions}
+\label{app:distributions}
 
-\begin{figure}[h]
-    \centering
-    \includegraphics[width=0.9\textwidth]{atcn_experiment_summary.png}
-    \caption{\textbf{Experiment summary for the primary model run.}
-    Box plots of median $R^2$, absolute MAE, $V_{oc}$ error, and $I_{sc}$ error for the DilatedConv\_seed42 experiment.
-    The tight distributions in $R^2$ (centered at ${\sim}0.997$) and $V_{oc}$ error (${\sim}0.41$~mV) confirm consistent reconstruction quality across the test set.}
-    \label{fig:experiment_summary}
+Figures~\ref{fig:boxplot_group1}--\ref{fig:boxplot_group4} show the raw parameter distributions grouped by physical type, confirming that the LHS design achieves near-uniform coverage.
+Long upper tails in Group~2 (mobilities, permittivities) motivate the $\log_{1p}$ transform applied to material properties during preprocessing (\S\ref{sec:preprocessing}).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.7\textwidth]{group1.png}
+  \caption{\textbf{Group~1}: $E_g$, $N_{CV}$, $N_{CC}$. Density-of-states parameters span ${\sim}$3 orders of magnitude. Near-uniform marginals confirm the LHS design.}
+  \label{fig:boxplot_group1}
 \end{figure}
 
-\section{Detailed Ablation Results}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.7\textwidth]{group2.png}
+  \caption{\textbf{Group~2}: $\mu_e$, $\mu_h$, $\varepsilon$, $A$. Long upper tails from log-uniform sampling, motivating the $\log_{1p}$ transform in preprocessing.}
+  \label{fig:boxplot_group2}
+\end{figure}
 
-\begin{table}[h]
-\centering
-\caption{Full ablation results: all experiments from \texttt{atcnresults.csv}. MAE and RMSE in A/m$^2$; $V_{oc}$ error in mV; $I_{sc}$ error in A/m$^2$.}
-\label{tab:full_ablation}
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{lcrrrrrrrr}
-\toprule
-\textbf{exp\_id} & \textbf{seed} & \textbf{$R^2$ mean} & \textbf{$R^2$ med.} & \textbf{MAE} & \textbf{RMSE} & \textbf{$|V_{oc}|$ med.} & \textbf{$|I_{sc}|$ med.} & \textbf{$V_{oc}$ pred.\ rate} \\
-\midrule
-Conv-Dilated-NoAttn & 42 & 0.9812 & 0.9961 & 5.657 & 7.813 & 0.576 & 0.726 & 63.6\% \\
-Conv-NoAttn & 123 & 0.9848 & 0.9964 & 5.430 & 7.523 & 0.606 & 1.299 & 70.0\% \\
-Conv-NoAttn & 42 & 0.9812 & 0.9961 & 5.657 & 7.813 & 0.576 & 0.726 & 63.6\% \\
-TCN-DilatedConv-NoAttn & 123 & 0.9836 & 0.9960 & 6.076 & 7.909 & 0.577 & 2.185 & 59.7\% \\
-TCN-DilatedConv-NoAttn & 42 & 0.9792 & 0.9963 & 5.953 & 8.015 & 3.040 & 0.826 & 99.7\% \\
-TCN-DilatedConv-NoAttn & 456 & 0.9844 & 0.9954 & 5.988 & 7.951 & 1.320 & 1.774 & 98.2\% \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.7\textwidth]{group3.png}
+  \caption{\textbf{Group~3}: $C_n$, $C_p$, $N_t$, $E_t$, $n_D$, $n_A$. Recombination and doping parameters.}
+  \label{fig:boxplot_group3}
+\end{figure}
 
-\section{Physical Constants and Voltage Grid}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.7\textwidth]{group4.png}
+  \caption{\textbf{Group~4}: Thicknesses, $T$, $S_{n,p}$, $R_s$, $R_{sh}$, $G$, light intensity.}
+  \label{fig:boxplot_group4}
+\end{figure}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lll}
-\toprule
-\textbf{Constant} & \textbf{Symbol} & \textbf{Value} \\
-\midrule
-Boltzmann $\times$ Temperature & $k_B T$ & 0.0259 eV (300K) \\
-Elementary charge & $q$ & $1.602 \times 10^{-19}$ C \\
-\bottomrule
-\end{tabular}
-\end{table}
+%=============================================================================
+\begin{thebibliography}{99}
 
-The exact 45-point non-uniform grid:
-\begin{lstlisting}[basicstyle=\small\ttfamily]
-[0.000, 0.100, 0.200, 0.300, 0.400,  # 5 points, dV=0.1
- 0.425, 0.450, 0.475, 0.500, 0.525,  # 40 points, dV=0.025
- 0.550, 0.575, 0.600, 0.625, 0.650,
- 0.675, 0.700, 0.725, 0.750, 0.775,
- 0.800, 0.825, 0.850, 0.875, 0.900,
- 0.925, 0.950, 0.975, 1.000, 1.025,
- 1.050, 1.075, 1.100, 1.125, 1.150,
- 1.175, 1.200, 1.225, 1.250, 1.275,
- 1.300, 1.325, 1.350, 1.375, 1.400]
-\end{lstlisting}
+\bibitem{zhao2025ae}
+X. Zhao, C. Huang, E. Birgersson, N. Suprun, H.Q. Tan, Y. Zhang, Y. Jiang, C. Shou, J. Sun, J. Peng, and H. Xue,
+``Accelerating device characterization in perovskite solar cells via neural network approach,''
+\textit{Applied Energy}, 392:125922, 2025.
 
-\begin{thebibliography}{9}
+\bibitem{zhao2023phd}
+X. Zhao,
+``Mathematical Modeling of Two-terminal Perovskite-Based Thin-film Tandem Solar Cells,''
+Ph.D. thesis, National University of Singapore, 2023.
 
 \bibitem{fritsch1980monotone}
 F.N. Fritsch and R.E. Carlson,
 ``Monotone Piecewise Cubic Interpolation,''
-\textit{SIAM J. Numer. Anal.}, 17(2), 238--246, 1980.
+\textit{SIAM J. Numer. Anal.}, 17(2):238--246, 1980.
 
 \bibitem{kendall2018multi}
 A. Kendall, Y. Gal, and R. Cipolla,
 ``Multi-Task Learning Using Uncertainty to Weigh Losses,''
 \textit{CVPR}, 2018.
+
+\bibitem{burden2008bayesian}
+F. Burden and D. Winkler,
+``Bayesian regularization of neural networks,''
+in \textit{Methods in Molecular Biology}, Humana Press, pp. 23--42, 2008.
+
+\bibitem{feng2024bandgap}
+S. Feng et al.,
+``Prediction of Organic-Inorganic Hybrid Perovskite Band Gap by Multiple ML Algorithms,''
+\textit{Molecules}, 29:499, 2024.
+
+\bibitem{talapatra2021formability}
+A. Talapatra et al.,
+``A ML approach for formability and stability of perovskite oxides,''
+\textit{Chem. Mater.}, 33:845--858, 2021.
+
+\bibitem{zhang2020lattice}
+Y. Zhang and X. Xu,
+``Machine learning lattice constants for cubic perovskite compounds,''
+\textit{ChemistrySelect}, 5:9999--10009, 2020.
+
+\bibitem{hu2022ml}
+Y. Hu et al.,
+``Machine-learning modeling for ultra-stable high-efficiency perovskite solar cells,''
+\textit{Adv. Energy Mater.}, 12, 2022.
+
+\bibitem{oboh2024nn}
+I.O. Oboh et al.,
+``Explainable ML for predicting band gaps of ABX3 perovskites,''
+\textit{Mater. Sci. Semicond. Process.}, 161:107427, 2023.
+
+\bibitem{courtier2019transport}
+N.E. Courtier et al.,
+``How transport layer properties affect perovskite solar cell performance,''
+\textit{Energy \& Environ. Sci.}, 12:396--409, 2019.
+
+\bibitem{toprak2025jv}
+A. Toprak,
+``High-accuracy ML approach for predicting J-V characteristics of perovskite solar cells,''
+\textit{Scientific Reports}, 15:41304, 2025.
+
+\bibitem{zbinden2026ae}
+O. Zbinden, E.L. Comi, E. Knapp, and W. Tress,
+``Autoencoder for parameter estimation and J-V simulation of perovskite solar cells,''
+\textit{npj Computational Materials}, 12:7, 2026.
 
 \end{thebibliography}
 

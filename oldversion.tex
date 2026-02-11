@@ -1,0 +1,667 @@
+\documentclass{article}
+
+\usepackage{PRIMEarxiv}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{fancyhdr}       % header
+\usepackage{graphicx}       % graphics
+\graphicspath{{media/}}     % organize your images and other figures under media/ folder
+\usepackage[table]{xcolor}
+\usepackage{multicol}
+\usepackage{siunitx}
+\usepackage{geometry}
+\usepackage{caption}
+\usepackage{array}
+\usepackage{subcaption}
+
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{float}
+
+%Header
+\pagestyle{fancy}
+\thispagestyle{empty}
+\rhead{ \textit{ }} 
+\sisetup{
+  round-mode = places,
+  round-precision = 6,
+  table-align-text-post = false,
+  detect-weight = true,
+  detect-family = true
+}
+
+\definecolor{headerblue}{HTML}{DCE6F1}
+\definecolor{lightgray}{gray}{0.95}
+\definecolor{summaryyellow}{HTML}{FFFACD}
+
+% Update your Headers here
+\fancyhead[LO]{High-Fidelity Reconstruction of PSC I-V Characteristics}
+% \fancyhead[RE]{Firstauthor and Secondauthor} % Firstauthor et al. if more than 2 - must use \documentclass[twoside]{article}
+  
+%% Title
+\title{Full J-V Curve Reconstruction of Perovskite Solar Cells using Physics-informed Temporal Convolutional Networks for Fast Characterization\thanks{\textit{\underline{Code available}}: \href{https://github.com/memo-ozdincer/PINN-iV-curve-reconstruction}{https://github.com/memo-ozdincer/PINN-iV-curve-reconstruction}
+}
+
+%%%% Cite as
+%%%% Update your official citation here when published 
+}
+
+\author{
+  Mehmet Ozdincer\thanks{These authors contributed equally to this work.},
+  Jet Chiang\footnotemark[2] \\
+  University of Toronto 
+  \And
+  Erik Birgersson \\
+  National University of Singapore \\
+  Solar Energy Research Institute of Singapore (SERIS)
+}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The current–voltage (J–V) characteristic is the primary diagnostic of photovoltaic device behavior, yet high-fidelity drift–diffusion simulations remain too slow for iterative design and high-throughput screening. We introduce a \textit{physics-informed, two-stage surrogate} for perovskite solar cells that reconstructs the \textit{entire} J–V curve from device parameters and a small set of experimentally accessible scalars. Stage~1 predicts the maximum-power voltage \(V_{\mathrm{mpp}}\) using a calibrated ensemble that blends parameter-only and hybrid predictors conditioned on fill factor. Stage~2 queries a dilated temporal convolutional network (TCN) \textit{only} at an 8-point, MPP-anchored voltage slice; a monotone, shape-preserving PCHIP interpolant lifts these points to a dense curve while masking beyond the physically valid support (\(\le 0.995\,V_{\mathrm{oc}}\)). Training is guided by a physics-informed objective that penalizes non-monotonic segments, excess curvature, and boundary inconsistencies at \(J_{\mathrm{sc}}\) and \(V_{\mathrm{oc}}\).
+On a 100k-simulation dataset, the surrogate achieves high fidelity on held-out devices (median \(R^2 \ge 0.98\) in deploy conditions) while preserving physical plausibility, and produces curves in milliseconds on a CPU—enabling orders-of-magnitude speedups over finite-element solvers. The design is \textit{justified by ablations}: removing self-attention improved physical metrics despite similar global \(R^2\), and the two-stage formulation stabilizes the knee and tail regions that dominate power conversion.
+\end{abstract}
+
+% keywords can be removed
+\keywords{Perovskite solar cell \and Surrogate modeling \and Physics-informed learning \and Temporal Convolutional Network \and J–V reconstruction \and Calibration \and PCHIP}
+
+\section{Introduction}
+\label{sec:intro}
+
+Perovskite solar cells (PSCs) have advanced rapidly in power-conversion efficiency while retaining low manufacturing complexity. Despite this progress, optimizing architectures and material stacks still depends on costly multiphysics simulations that resolve charge transport, recombination, and electrostatics across layers. Such solvers (e.g., finite-element drift–diffusion) provide mechanistic accuracy but are too slow for systematic exploration of large parameter spaces or for rapid inverse design.
+
+Machine learning surrogates have begun to bridge this gap, yet most models predict only scalar figures of merit (e.g., \(V_{\mathrm{oc}}, J_{\mathrm{sc}}, \mathrm{FF}, \mathrm{PCE}\)), not the full J–V curve that practitioners actually inspect to diagnose transport bottlenecks, interfacial losses, and series-/shunt-like regimes. When full-curve surrogates are attempted, two pitfalls recur: (i) \emph{good global error but poor physicality} (spurious non-monotone segments, negative currents), and (ii) \emph{good near zero bias but unstable around the knee and tail}, where small errors disproportionately affect power.
+
+We recast J–V reconstruction as a \emph{physically structured sequence problem} and contribute three ideas:
+
+\begin{enumerate}
+  \item \textbf{Two-stage reconstruction.} We first infer \(V_{\mathrm{mpp}}\) with a calibrated ensemble that blends a parameter-only model and a hybrid model using a fill-factor–conditioned logistic gate. We then condition a lightweight dilated TCN on \([J_{\mathrm{sc}}, V_{\mathrm{mpp}}, V_{\mathrm{oc}}, \mathrm{FF}]\) and device parameters, but restrict evaluation to an 8-point, MPP-anchored voltage slice. This concentrates model capacity where the curve is most informative.
+  \item \textbf{Physics-informed training.} Beyond a data term, the loss penalizes non-monotonicity, excess curvature, and boundary mismatches at \(J_{\mathrm{sc}}\) and \(V_{\mathrm{oc}}\), with additional emphasis around the MPP “knee” and the post-knee tail. These terms reduce physically implausible artifacts without hand-coded diode models.
+  \item \textbf{Shape-preserving densification.} At inference we lift the 8 points to a dense curve using a monotone PCHIP interpolant and \emph{mask} beyond \(\approx 0.995\,V_{\mathrm{oc}}\), avoiding extrapolation where the surrogate provides no support. This preserves curve shape while keeping the output physically defensible.
+\end{enumerate}
+
+This paper prioritizes \emph{physical credibility} alongside accuracy. We therefore report not only \(R^2\), MAE and RMSE, but also: (i) violation counts for \(dI/dV>0\), (ii) negative-current fraction near \(V_{\mathrm{oc}}\), and (iii) boundary errors at \(V=0\) and \(V\approx V_{\mathrm{oc}}\). We further separate \textbf{oracle} (true \(V_{\mathrm{mpp}}\) in features) from \textbf{deploy} (predicted \(V_{\mathrm{mpp}}\)) evaluation to quantify the impact of Stage~1 calibration on end-to-end performance.
+
+Finally, we justify design decisions via ablation: self-attention was removed after we observed that—despite competitive \(R^2\)—it degraded the knee/tail fit and increased boundary errors. The resulting attention-free, dilated TCN is smaller, faster, and more physically stable.
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Dataset and Preprocessing}
+\label{ssec:data}
+
+\paragraph{Scope.}
+We use a corpus of \(10^5\) device simulations covering 31 physically interpretable inputs spanning layer thicknesses, carrier mobilities, effective densities of states, interfacial energetics, and recombination/generation terms. Each simulation provides a J–V trace on a fixed \emph{coarse} voltage grid from 0.0 to 1.4~V with 45 points. The coarse grid is intentionally regular across samples to enable reproducible interpolation and scalar extraction.
+
+\subsubsection{Device Parameters}
+\label{ssec:input_params}
+
+The 31 inputs are grouped for transformation and interpretation as follows:
+
+\begin{itemize}
+  \item \textbf{Layer thicknesses:} active and transport layers.
+  \item \textbf{Material properties:} carrier mobilities, effective densities of states, dielectric constants, electron affinities/ionization energies; these span orders of magnitude and are log-stabilized prior to robust scaling.
+  \item \textbf{Contacts:} metal work functions and interfacial alignment terms.
+  \item \textbf{Recombination and generation:} radiative, Auger, lifetimes, and impact-ionization-like terms.
+\end{itemize}
+
+This grouping drives a ColumnTransformer used consistently in training, ablation, and inference, and allows us to probe sensitivity by parameter family (e.g., mobilities vs. contacts). Table~\ref{tab:input_params} (Appendix~\ref{sec:appendix}) enumerates the symbols and ranges, and Fig.~\ref{fig:fishbone_diagram} provides a high-level map of influence pathways.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.8\textwidth]{fishbone.png}
+\caption{High-level map of parameter families (thickness, materials, contacts, recombination/generation) and their influence on transport and energetics.}
+\label{fig:fishbone_diagram}
+\end{figure}
+
+Parameter distributions are heterogeneous and heavy-tailed in several families. We therefore apply \(\log(1+x)\) to selected material terms, followed by robust scaling and a bounded min–max map to \([-1,1]\). Figure~\ref{fig:input_param_distributions} summarizes the resulting spread by family.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{distributions.png}
+\caption{Post-transform distributions by parameter family. Material properties are log-stabilized before robust/min–max scaling to reduce leverage from extreme values.}
+\label{fig:input_param_distributions}
+\end{figure}
+
+\subsubsection{IV Curve Data and Scalars}
+\label{ssec:iv_data}
+
+Each simulation yields currents \(I(V)\) on the 45-point coarse grid. We extract physically meaningful scalars on a \emph{fine} grid using a shape-preserving monotone cubic Hermite interpolant (PCHIP):
+
+\begin{enumerate}
+  \item \textbf{Interpolation.} PCHIP maps the coarse grid to a fine grid (2000 points) without oscillations that plague high-order splines.
+  \item \textbf{Open-circuit voltage.} \(V_{\mathrm{oc}}\) is the smallest voltage at which the interpolated current crosses zero. It \emph{need not} coincide with the last coarse grid point; many curves reach open-circuit well before 1.4~V.
+  \item \textbf{Short-circuit current.} \(J_{\mathrm{sc}}\) is the current at \(V=0\).
+  \item \textbf{Maximum power point.} We compute \(P(V)=V\,I(V)\) on the fine grid, take \(V_{\mathrm{mpp}}=\arg\max_V P(V)\), and define \(\mathrm{FF} = \frac{V_{\mathrm{mpp}}I(V_{\mathrm{mpp}})}{V_{\mathrm{oc}}J_{\mathrm{sc}}}\).
+\end{enumerate}
+
+\paragraph{Knee-anchored slice.}
+To focus learning capacity where it matters, we do not train on the entire dense curve. Instead, for each device we construct an 8-point voltage slice \(S\) anchored at the MPP “knee”:
+\[
+S = \{v_1,\dots,v_8\},\quad
+v_1 = 0,\quad
+v_8 \approx 0.995\,V_{\mathrm{oc}},
+\]
+with three pre-knee and four post-knee points spaced by linear interpolation of a denser local grid around \(V_{\mathrm{mpp}}\). The target sequence is the corresponding current values \(I(S)\). During training we scale currents by \(J_{\mathrm{sc}}\) (so \(I(0)\) sits near \(+1\)), and during inference we \emph{denormalize} with the provided \(J_{\mathrm{sc}}\).
+
+\paragraph{Densification at inference.}
+At test time, the model predicts \(I(S)\) at the 8 slice voltages (given parameters and scalars). We then apply PCHIP on \((S, I(S))\) to reconstruct a dense J–V curve and \emph{mask} values beyond \(0.995\,V_{\mathrm{oc}}\) to avoid extrapolation. This preserves monotone, physically plausible behavior near open circuit. Figure~\ref{fig:iv_curves} illustrates the coarse grid, the fine PCHIP reference used to compute scalars, and the 8-point slice used for learning.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{iv_curves.png}
+\caption{Representative J–V curves. Left: coarse 45-point grid from simulation. Middle: fine PCHIP interpolation used to compute \(J_{\mathrm{sc}}, V_{\mathrm{oc}}, V_{\mathrm{mpp}}, \mathrm{FF}\). Right: the 8-point MPP-anchored slice (orange markers) used for learning; the dense prediction at inference is obtained by PCHIP over these 8 points and truncated at \(0.995\,V_{\mathrm{oc}}\).}
+\label{fig:iv_curves}
+\end{figure}
+
+\paragraph{Splits, reproducibility, and evaluation modes.}
+We adopt a stratified split into train/validation/test sets and report two evaluation modes:
+\emph{oracle} (the slice features include the true \(V_{\mathrm{mpp}}\)) and \emph{deploy} (the slice features include the Stage~1 predicted \(V_{\mathrm{mpp}}\)). The latter reflects real-world usage and is the primary figure of merit. Random seeds and preprocessing transformers are fixed and saved to artifacts to guarantee end-to-end reproducibility.
+
+\paragraph{Why not end-to-end dense prediction?}
+Directly predicting 2000 fine-grid points increases parameter count, encourages over-smoothing, and makes it harder to enforce monotonicity and boundary conditions. By concentrating supervision on an MPP-anchored slice and delegating densification to a shape-preserving interpolant, we (i) reduce learning burden, (ii) improve knee/tail fidelity, and (iii) retain control of the valid support.
+
+
+
+\subsubsection{Preprocessing Pipeline}
+
+The learning problem is formulated as finding a mapping $f_\theta:(\mathbf{p},\mathbf{v})\mapsto \mathbf{i}_\text{pred}$ that closely approximates the true current sequence $\mathbf{i}=[i_1^*,\dots,i_L^*]^\top$ for a given vector of $d$ device parameters $\mathbf{p}\in\mathbb{R}^d$ and a fixed voltage grid $\mathbf{v}=[v_1,\dots,v_L]^\top$. The model parameters $\theta$ are optimized by minimizing a composite loss function $\mathcal{L}_{\text{total}}$ over the training set:
+\[
+\theta^*=\arg\min_{\theta}\frac{1}{N}\sum_{n=1}^{N}\mathcal{L}_{\text{total}}\bigl(f_\theta(\mathbf{p}^{(n)},\mathbf{v}^{(n)}),\,\mathbf{i}^{(n)}\bigr)
+\]
+where $N$ is the number of training samples, and $\mathcal{L}_{\text{total}}$ is the composite loss defined in Equation~\ref{eq:full_loss}. 
+
+Before training, the data undergo preprocessing pipeline as shown in Figure~\ref{fig:preprocessing_pipeline}. Each I–V curve is truncated at the point where $i\le0.01\,J_{\mathrm{sc}}$ and subsequently normalized by its short-circuit current $J_{\mathrm{sc}}=i_1^*$:
+\[
+\tilde{i}_n=\frac{i_n^*}{J_{\mathrm{sc}}},
+\quad
+\hat{i}_n=2\tilde{i}_n-1
+\]
+This transformation scales the output to the range $[-1,1]$ to ensure stable optimization. Analogously, each input parameter $p_j$ is scaled to $[-1,1]$ via a group-wise pipeline; material properties that span multiple orders of magnitude are first transformed by $\log(1+p_j)$ to compress their range before scaling.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.5\linewidth]{preprocessing_pipeline.png}
+    \caption{Overview of the preprocessing workflow used to prepare device parameters and I–V curves for model training. Raw device parameters (left) and high-resolution I–V traces (right) are first interpolated via PCHIP, key points (short-circuit, open-circuit, MPP) are determined to be concatenated. On the right, simultaneously passed through a group-wise ColumnTransformer, while the slice currents are scaled by \(I_{\rm sc}\) to \([-1,1]\) and re-weighted according to a curvature-based mask.}
+    \label{fig:preprocessing_pipeline}
+\end{figure}
+
+\subsection{Model Architecture}
+\label{ssec:architecture}
+
+The proposed network integrates two parallel embedding pathways—one processing physical device parameters through a multi-layer perceptron, and the other encoding the voltage sweep via high-frequency positional embeddings—before merging into a sequence model that alternates temporal convolution and attention layers. This hybrid design leverages the efficiency of convolutional filters to capture local curve dynamics and the flexibility of self-attention to identify long-range dependencies, producing a concise latent representation that is decoded into a full I–V curve using a lightweight output head.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.4\textwidth]{ml_workflow.png}
+\caption{Schematic of the proposed model architecture. The input consists of device parameters and a fixed voltage grid. The device parameters are processed through a multi-layer perceptron (MLP) to produce a latent vector, while the voltage points are lifted into a higher-dimensional space using Fourier or Gaussian RBF embeddings. These two pathways are then merged and processed through a series of temporal blocks to produce the final current sequence.}
+\label{fig:model_architecture}
+\end{figure}
+
+\subsubsection{Temporal Convolutional Network (TCN)}
+
+The core of our model is a sequence of stacked Temporal Convolutional Attention Network (TCAN) blocks. 
+This is based on TCNs that generally outperform traditional recurrent neural networks (RNNs) in sequence modeling tasks due to their ability to capture long-range dependencies and parallelize computations \cite{bai2018empirical}. The architecture is illustrated in Figure~\ref{fig:tcn_network}.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.8\textwidth]{tcn_network.png}
+\caption{Schematic for the temporal convolutional network showing dilated causal convolutions (DCC) layers.}
+\label{fig:tcn_network}
+\end{figure}
+
+The dilation factor for the convolution in block $\ell$ is increased exponentially. Specifically, the dilation factor for layer $\ell$ is defined as:
+\begin{equation}
+d_\ell = 2^{\ell-1}, \quad \ell = 1, 2, \ldots, N
+\end{equation}
+This exponential growth in dilation allows the network to efficiently capture dependencies across increasingly long time horizons. The receptive field (RF) of the entire network, which determines the maximum input sequence length that can influence a single output prediction, grows exponentially with the number of layers. For a kernel size $k$ and $N$ layers, the total receptive field is given by:
+\begin{equation}
+\text{RF} = 1 + \sum_{\ell=1}^{N} d_\ell \cdot (k - 1) = 1 + (k - 1) \sum_{\ell=1}^{N} 2^{\ell-1} = 1 + (k - 1)(2^N - 1)
+\end{equation}
+
+This exponential scaling enables the network to cover long-term historical data efficiently while maintaining computational tractability.
+
+\subsubsection{Temporal Convolution Attention Network (TCAN)}
+
+Leveraging attention in TCN has shown to improve performance in various tasks, including time series forecasting and sequence generation in fields like climate modelling \cite{li2024dapnet,wang2024pm25}. This can be done by interleaving attention layers with dilated causal convolutions \cite{hao2020tcan}.
+This hybrid architecture is designed to synergistically leverage the strengths of both convolutional and attention mechanisms. To address the limitations of pure TCNs in capturing non-local dependencies and the computational cost of pure attention models, we alternate between dilated causal convolutions that efficiently process local sequential patterns and temporal attention (TA) that adapts from causal self-attention to model complex, long-range relationships across the entire I-V curve. This structure ensures that predictions are based solely on past and present data, preserving the causal nature of the sequence.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{tcan_network.png}
+\caption{Schematic for the TCAN network showing the blocks and components. The DCC block is shown in Figure~\ref{fig:tcn_network} and the TA mechanism is shown in Figure~\ref{fig:attention}.}
+\label{fig:tcan_network}
+\end{figure}
+
+The computation within a single TCAN block $\ell$ proceeds as follows for an input sequence $\mathbf{I}^{(\ell-1)}$:
+
+\begin{enumerate}
+    \item \textbf{Dilated Causal Convolution:} First, we apply a dilated causal convolution to the input sequence, followed by normalization, activation, and dropout as shown in Figure~\ref{fig:tcn_network}. This captures local temporal features.
+    \begin{equation}
+    \mathbf{H}^{(\ell)} = \text{Dropout}(\text{GELU}(\text{LayerNorm}(\text{Conv1D}_{\text{causal, dilated}}(\mathbf{I}^{(\ell-1)}))))
+    \end{equation}
+    A residual connection is added to the output of this sub-block:
+    \begin{equation}
+    \mathbf{I'}^{(\ell)} = \mathbf{I}^{(\ell-1)} + \mathbf{H}^{(\ell)}
+    \end{equation}
+
+    \begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\textwidth]{attention.png}
+    \caption{Schematic for masked multihead self attention.}
+    \label{fig:attention}
+    \end{figure}
+
+    \item \textbf{Causal Self-Attention:} The intermediate representation $\mathbf{I'}^{(\ell)}$ is then processed by a causal self-attention mechanism shown in Figure~\ref{fig:attention}. This allows the model to re-weight the features at each position by attending to all previous positions in the sequence, thereby capturing global context. Queries ($Q$), keys ($K$), and values ($V$) are projected from $\mathbf{I'}^{(\ell)}$:
+    \begin{equation}
+        Q, K, V = \text{Linear}(\mathbf{I'}^{(\ell)})
+    \end{equation}
+    The attention output is computed by applying a causal mask to the scaled dot-product of queries and keys. This ensures that the prediction for a given voltage point $v_i$ can only depend on previous points $v_j$ where $j \le i$. The mask is an upper-triangular matrix $M$ where elements corresponding to future positions are set to $-\infty$:
+    \begin{equation}
+    M_{ij} = 
+    \begin{cases} 
+    0 & \text{if } j \le i \\ 
+    -\infty & \text{if } j > i 
+    \end{cases}
+    \end{equation}
+    This mask is added to the attention scores before the softmax operation:
+    \begin{equation}
+    \mathrm{AttnOut} = \mathrm{Attention}(Q, K, V) = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}} + M \right)V
+    \end{equation}
+    This formulation is analogous to the masked multi-head attention used in Transformer models to maintain auto-regressive properties \cite{vaswani2017attention}.
+
+    \item \textbf{Final Output:} The output of the attention mechanism is passed through a final normalization and feed-forward layer to produce the output of the TCAN block, $\mathbf{I}^{(\ell)}$.
+\end{enumerate}
+
+The full network is constructed by stacking $N$ such TCAN blocks.
+
+\subsubsection{Feature Embeddings}
+
+Previous research has shown that Fourier feature embeddings can significantly improve the performance of neural networks on sequence tasks by providing high-frequency positional information \cite{tancik2020fourier}. To enhance the expressive capacity of the model, each voltage point $v_i$ is lifted into a higher-dimensional space through a fixed Fourier or Gaussian RBF mapping, $\gamma(\cdot)$. 
+
+For Fourier features, this mapping is defined as:
+\begin{equation}
+\gamma(v) = [\sin(2\pi B_1 v), \ldots, \sin(2\pi B_m v), \cos(2\pi B_1 v), \ldots, \cos(2\pi B_m v)]^\top \in \mathbb{R}^{2m},
+\end{equation}
+where $B_k$ are log-spaced frequency bands (e.g., $B_k \in [1, 1000]$). Each index in $\gamma(v)$ corresponds to either a sine or cosine at a specific frequency:
+\begin{align*}
+\gamma_k(v) &= \sin(2\pi B_k v), \quad k=1,\ldots,m \\
+\gamma_{m+k}(v) &= \cos(2\pi B_k v), \quad k=1,\ldots,m
+\end{align*}
+This provides a multi-scale basis for representing complex, nonlinear functions of voltage, enabling the model to capture both smooth and rapidly varying behaviors.
+
+For Gaussian RBF features, we use a set of $m$ radial basis functions centered at \(\mu_k\in[0,1]\) with bandwidth \(\sigma\):
+\begin{equation}
+\gamma_k(v) = \exp\Bigl(-\tfrac{1}{2}\Bigl(\frac{v/v_{\max}-\mu_k}{\sigma}\Bigr)^2\Bigr),\quad k=1,\dots,m,
+\end{equation}
+where $v_{\max}$ normalizes the voltage input to $[0,1]$. This embedding captures local variations around each center and complements the Fourier features by providing smooth, localized positional information.
+
+\subsection{Physics-Informed Loss Function}
+\label{ssec:loss}
+
+The model is trained using a composite loss function, which is a weighted sum of a standard data-fitting term and several physics-based regularization terms:
+    \begin{equation} \label{eq:full_loss}
+    \mathcal{L}_{\text{total}} = w_1 \mathcal{L}_{\text{MSE}} + w_2 \mathcal{L}_{\text{mono}} + w_3 \mathcal{L}_{\text{curv}} + w_4 \mathcal{L}_{\text{Jsc}} + w_5 \mathcal{L}_{\text{Voc}}
+    \end{equation}\
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+Loss Term & Symbol & Description \\
+\midrule
+Data fitting (MSE) & $\mathcal{L}_{\text{MSE}}$ & Mean squared error on predicted current \\
+Monotonicity & $\mathcal{L}_{\text{mono}}$ & Penalizes $dI/dV > 0$ (non-physical) \\
+Curvature & $\mathcal{L}_{\text{curv}}$ & Penalizes excessive oscillations \\
+Boundary (Jsc) & $\mathcal{L}_{\text{Jsc}}$ & Anchors current at $V=0$ to $J_{sc}$ \\
+Boundary (Voc) & $\mathcal{L}_{\text{Voc}}$ & Anchors current near $V_{oc}$ to zero \\
+\bottomrule
+\end{tabular}
+\vspace{10pt}
+\caption{Summary of loss terms used in the physics-informed loss function.}
+\label{tab: physics_loss}
+\end{table}
+
+This design took inspiration from the physics-informed neural networks (PINNs) framework \cite{raissi2019pinn}, which demonstrated that incorporating physical constraints into the loss function can significantly improve model performance on tasks involving physical systems.
+
+\section{Hyperparameter Optimization}
+
+To systematically tune our Physics‐Informed Attention‐TCN, we employed Optuna’s Bayesian optimization (TPE sampler) with median pruning. We conducted 50 trials over a 4‐hour budget, using early stopping at epoch 5 for under-performing runs. Table~\ref{tab:hpo_results_compact} summarizes the search space and the optimal values found in our best trial (\#47).
+
+\begin{table}[htbp]
+  \centering
+  \small % Makes the font slightly smaller to ensure it fits well
+  \begin{tabular}{@{} lcc @{\hspace{4em}} lcc @{}}
+    \toprule
+    \textbf{Hyperparameter} & \textbf{Range} & \textbf{Best} & \textbf{Hyperparameter} & \textbf{Range} & \textbf{Best} \\ 
+    \midrule
+    \multicolumn{3}{@{}l}{\textit{Optimizer}} & \multicolumn{3}{l}{\textit{Positional Embedding (RBF)}} \\
+    \quad Learning rate, $\eta$ & $[1\text{e-}3, 2\text{e-}2]$ & $1.99\text{e-}2$ & \quad \# Gaussian bands, $B$ & $[12, 28]$ & $19$ \\
+    \quad Weight decay, $\lambda$ & $[1\text{e-}6, 1\text{e-}4]$ & $7.47\text{e-}6$ & \quad Width, $\sigma$ & $[0.05, 0.15]$ & $0.1278$ \\
+    \midrule
+    \multicolumn{3}{@{}l}{\textit{Regularization}} & \multicolumn{3}{l}{\textit{MLP (“Dense”) Embedding}} \\
+    \quad Dropout & $[0.0, 0.2]$ & $0.0107$ & \quad \# layers & $[1, 4]$ & $3$ \\
+    & & & \quad Layer width & $\{64, \dots, 512\}$ & $512$ \\
+    \midrule
+    \multicolumn{3}{@{}l}{\textit{TCN Architecture}} & \multicolumn{3}{l}{\textit{Physics‐Loss Weights}} \\
+    \quad Kernel size & $\{3,5,7,9\}$ & $5$ & \quad $w_{\rm mono}$ & $[1\text{e-}4, 5\text{e-}2]$ & $2.51\text{e-}2$ \\
+    \quad \# residual blocks & $[1, 3]$ & $3$ & \quad $w_{\rm convex}$ & $[1\text{e-}4, 5\text{e-}2]$ & $1.03\text{e-}4$ \\
+    \quad Channel width & $\{32,64,128\}$ & $[64,64,32]$ & \quad $w_{\rm excurv}$ & $[1\text{e-}4, 5\text{e-}2]$ & $4.08\text{e-}4$ \\
+    \quad Attention heads & $\{2,4,8\}$ & $4$ & & & \\
+    \bottomrule
+  \end{tabular}
+  \vspace{10pt}
+  \caption{Hyperparameter optimization search space and optimal values. The table lists the search range for each hyperparameter and the final values selected in the best-performing trial (\#47).}
+  \label{tab:hpo_results_compact}
+\end{table}
+
+
+\paragraph{Discussion.}  
+The TPE sampler homed in on a relatively high learning rate ($\approx2\times10^{-2}$) with minimal weight decay, suggesting that aggressive optimization was beneficial given our large dataset. Very low dropout ($\sim1\%$) indicates limited overfitting, while a three‐block TCN with kernel size 5 and channel progression $64\!\to\!64\!\to\!32$ provided sufficient temporal receptive field (28 points) without unecessary parameter bloat. Four‐head self‐attention balanced expressivity and computational cost.  
+
+In the positional embedding, slightly more RBF bands than our default (19 vs.\ 18) and a broader $\sigma$ yielded smoother overlap across neighboring voltage locations, improving continuity and convexity enforcement. The dense parameter embedding favored a deep, wide MLP ($3 \times 512$) to capture complex interactions among the 34 device parameters plus 3 scalar descriptors.  
+
+Finally, tuning the physics‐loss weights revealed that strong monotonicity enforcement ($w_{\rm mono}\approx0.025$) was crucial for high median $R^2$, whereas convexity and curvature penalties remained very light, acting as gentle regularizers rather than hard constraints. Altogether, these settings produced our best median $R^2=0.9986$ and MAE$≈2.4 \space mA/cm^2$ on held‐out test curves.
+
+
+\subsection{Hyperparameter Landscape Analysis}
+
+To understand how hyperparameters influence model performance, we analyzed the 50 completed HPO trials. Figure~\ref{fig:hpo_analysis} presents this analysis through two lenses: a Spearman correlation heatmap showing individual parameter importance (a), and a pairwise scatter plot revealing joint effects and high-performance clusters (b).
+
+\begin{figure}[htbp]
+  \centering
+  % Panel (a): Correlation Heatmap
+  \begin{subfigure}[b]{0.5\linewidth}
+    \includegraphics[width=\linewidth]{media/HPO_Correlation_Heatmap.png}
+    \caption{Spearman rank correlation heatmap.}
+    \label{fig:correlation_heatmap}
+  \end{subfigure}
+  \hfill % Adds space between the subfigures
+  % Panel (b): Pairwise Scatter Plot
+  \begin{subfigure}[b]{0.4\linewidth}
+    \includegraphics[width=\linewidth]{media/HPO_Pairplot.png}
+    \caption{Pairwise plot of top hyperparameters.}
+    \label{fig:pairplot}
+  \end{subfigure}
+  \caption{Hyperparameter landscape analysis. \textbf{(a)}~Correlation between hyperparameters and median $R^2$. Warm colors (red) indicate positive correlation; cold (blue) negative. \textbf{(b)}~Joint distributions for the top four hyperparameters, color-coded by performance. High-performing trials (yellow) cluster in a distinct region of the search space.}
+  \label{fig:hpo_analysis}
+\end{figure}
+
+The analysis reveals a clear path to high performance. The learning rate shows the strongest positive correlation with median $R^2$ ($\rho=0.56$), while dropout has the strongest negative correlation ($\rho=-0.58$), suggesting that aggressive optimization is more beneficial than heavy regularization for this architecture. The pairplot (Fig.~\ref{fig:pairplot}) reinforces this, showing that top-performing trials ($R^2>0.998$, yellow) consistently cluster at high learning rates ($>0.015$) and low dropout ($<0.05$). Furthermore, these elite trials favor moderate Gaussian widths ($\sigma \in [0.10, 0.14]$) for the positional embedding and a strong monotonicity weight ($w_{\rm mono} > 0.02$), which enforces physical consistency. These insights directly informed our final model configuration.
+\subsection{Ablation Study: Justifying the Final Architecture}
+\label{ssec:ablation}
+
+To validate our architectural choices, we conducted an ablation study to isolate the individual contributions of dilated convolutions and the self-attention mechanism. We benchmarked four model variants on the test set, with results averaged over an 8-fold cross-validation. All variants were trained with the same final hyperparameters and physics-informed loss function. The variants are:
+\begin{description}
+    \item[\texttt{RegularConv\_NoAttention}] A baseline TCN without dilation or attention.
+    \item[\texttt{DilatedConv\_NoAttention}] The final, selected model with dilated convolutions only.
+    \item[\texttt{RegularConv\_WithAttention}] Baseline TCN augmented with a self-attention layer.
+    \item[\texttt{DilatedConv\_WithAttention}] A model combining both components.
+\end{description}
+
+The performance of each variant across four key metrics is summarized in Figure~\ref{fig:exp_summary} and Table~\ref{tab:ablation_metrics}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.8\textwidth]{dilation_n_attention.png}
+  \caption{Ablation study results comparing four architectural variants. The plots show the median performance for $R^2$ (higher is better) and three error metrics (lower is better). Dilated convolutions provide the most significant performance gain, dramatically improving the overall curve fit ($R^2$). In contrast, adding self-attention significantly degrades performance on key physical metrics (MAE and V\textsubscript{oc} error), revealing a poor trade-off.}
+  \label{fig:exp_summary}
+\end{figure}
+
+The analysis reveals that \textbf{dilated convolutions are the single most important architectural component}. By dramatically expanding the model's receptive field, this change alone boosts the median $R^2$ from a modest 0.9895 to an excellent 0.9959 and achieves the lowest Mean Absolute Error (MAE) of all variants. This demonstrates that capturing long-range dependencies across the voltage spectrum is essential for high-fidelity curve reconstruction.
+
+Conversely, the study shows that \textbf{the self-attention mechanism is detrimental in this application}. While adding attention does fractionally increase the abstract $R^2$ metric to 0.9986, this comes at a severe and unacceptable cost to physically meaningful metrics. With attention, the V\textsubscript{oc} error quadruples from 0.48 mV to 2.10 mV, and the MAE increases by 7\%. This suggests that the attention layer, while improving the global statistical fit, overfits to local noise patterns, particularly around the crucial V\textsubscript{oc} and "knee" regions of the curve.
+
+Based on this clear trade-off, we selected the \texttt{DilatedConv\_NoAttention} model for all subsequent analyses. It provides the best balance of excellent global curve fidelity (high $R^2$) and superior local accuracy (lowest MAE and V\textsubscript{oc} error), making it the most robust and reliable choice for practical applications.
+
+\begin{table}[htbp]
+  \centering
+  \sisetup{detect-weight, mode=text} % Make siunitx respect \textbf
+  \small
+  \begin{tabular}{@{}l S[table-format=1.4] S[table-format=1.2] S[table-format=1.5] S[table-format=1.3]@{}}
+    \toprule
+    \textbf{Variant} & {\textbf{Median $R^2 \uparrow$}} & {\textbf{Median MAE $\downarrow$}} & {\textbf{V\textsubscript{oc} Err. (V) $\downarrow$}} & {\textbf{I\textsubscript{sc} Err. (mA/cm$^2$) $\downarrow$}} \\
+    \midrule
+    \texttt{RegularConv\_NoAttention}   & 0.9895          & 2.48          & 0.00052           & 0.209 \\
+    \texttt{DilatedConv\_NoAttention}   & 0.9959          & \bfseries 2.45& \bfseries 0.00048 & 0.215 \\
+    \texttt{RegularConv\_WithAttention} & 0.9980          & 2.61          & 0.00186           & 0.252 \\
+    \texttt{DilatedConv\_WithAttention} & \bfseries 0.9986& 2.63          & 0.00210           & \bfseries 0.205 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{10pt}
+  \caption{Ablation study metrics for the four architecture variants. Best performance for each metric is highlighted in bold. The chosen model, \texttt{DilatedConv\_NoAttention}, offers the best combination of low error and high R$^2$.}
+  \label{tab:ablation_metrics}
+\end{table}
+\section{Results and Discussion}
+\label{sec:results}
+
+\subsection{I-V Curve Reconstruction Performance}
+
+We evaluated the final model's ability to reconstruct full current-voltage (I-V) curves from sparse, noisy input points. Figure~\ref{fig:test_reconstructions} provides a qualitative assessment, showcasing the model's high fidelity across eight randomly selected examples from the test set. The model accurately captures the shape of the ground-truth curves, including key features like the short-circuit current ($I_{\rm sc}$) and open-circuit voltage ($V_{\rm oc}$).
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{random_samples_result.png}
+  \caption{Eight randomly selected test-set J–V curves. \textbf{Solid line:} ground-truth (fine PCHIP grid); \textbf{dashed line:} model reconstruction; \textbf{blue dots:} sample points; \textbf{red crosses:} predicted points. Each subplot reports its curve-level $R^2$.}
+  \label{fig:test_reconstructions}
+\end{figure}
+
+For a rigorous quantitative evaluation, Table~\ref{tab:metrics} summarizes the key test-set performance metrics. The model achieves an excellent mean $R^2$ of 0.9972 and a mean RMSE of 3.56 mA/cm\textsuperscript{2}. The MAE in short-circuit current is only 0.313 mA/cm\textsuperscript{2}, corresponding to a relative MAE of 13.4\% of typical $I_{\rm sc}$ values. Furthermore, voltage predictions are highly precise, with a mean $V_{\rm oc}$ error below 2 mV and a 55\% success rate in correctly identifying $V_{\rm oc}$ from the reconstructed curves. These metrics collectively underscore the model's high fidelity in reconstructing full I–V characteristics.
+% Preamble requirements:
+% \usepackage{booktabs}
+% \usepackage{siunitx}
+% \usepackage{array}
+
+\begin{table}[hbpt]
+  \centering
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.5cm}
+                  S[table-format=1.6]
+                  >{\raggedright\arraybackslash}p{5.5cm}
+                  S[table-format=2.6]@{}}
+    \toprule
+    \textbf{Metric (Group 1)} & {\textbf{Value}} 
+      & \textbf{Metric (Group 2)} & {\textbf{Value}} \\
+    \midrule
+    \multicolumn{2}{c}{\textit{Current Errors (I\textsubscript{sc})}} & \multicolumn{2}{c}{\textit{Mean Absolute Error (MAE)}} \\
+    \cmidrule(r){1-2} \cmidrule(l){3-4}
+    \texttt{isc\_error\_abs\_mean}   & 0.312840 & \texttt{mae\_mean}    & 2.332660 \\
+    \texttt{isc\_error\_abs\_median} & 0.278969 & \texttt{mae\_median}  & 1.761596 \\
+                                    &          & \texttt{mae\_std}     & 1.934438 \\
+    \addlinespace
+    
+    \multicolumn{2}{c}{\textit{Fit Quality (R\textsuperscript{2})}} & \multicolumn{2}{c}{\textit{Root Mean Squared Error (RMSE)}} \\
+    \cmidrule(r){1-2} \cmidrule(l){3-4}
+    \texttt{r2\_mean}    & 0.997231 & \texttt{rmse\_mean}   & 3.562985 \\
+    \texttt{r2\_median}  & 0.999016 & \texttt{rmse\_median} & 2.568879 \\
+    \texttt{r2\_std}     & 0.005369 & \texttt{rmse\_std}    & 3.222777 \\
+    \addlinespace
+
+    \multicolumn{2}{c}{\textit{Voltage Metrics (V\textsubscript{oc})}} & \multicolumn{2}{c}{\textit{Other}} \\
+    \cmidrule(r){1-2} \cmidrule(l){3-4}
+    \texttt{voc\_error\_abs\_mean}      & 0.001707 & \texttt{voc\_prediction\_rate} & 0.550194 \\
+    \texttt{voc\_error\_abs\_median}    & 0.000265 & \texttt{test\_loss}            & 0.003255 \\
+
+    \midrule
+    \multicolumn{4}{l}{\textbf{Summary (Key Metrics)}} \\
+    \addlinespace[2pt]
+    \texttt{MAE (mean)}                 & 2.332660 & \texttt{R\textsuperscript{2} (mean)} & 0.997231 \\
+    \texttt{RMSE (mean)}                & 3.562985 & \texttt{Relative MAE (\% of Isc)}     & 0.3225 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{10pt}
+  \caption{Test-set performance metrics, organized by category.}
+  \label{tab:metrics}
+\end{table}
+\paragraph{Commentary}  
+The average absolute error in short‐circuit current (\texttt{isc\_error\_abs\_mean}) is only 0.313 mA/cm\textsuperscript{2}, corresponding to a relative MAE of 13.4\% of typical Isc values. Overall fit quality is excellent, with a mean $R^2$ of 0.9972 and mean RMSE of 3.56 mA/cm\textsuperscript{2}. Voltage predictions are highly precise (mean Voc error $<2$ mV) with a 55\% success rate at correctly identifying Voc from the reconstructed curves. The summary row highlights the most critical metrics-mean MAE, mean RMSE, and relative MAE, underscoring the model’s high fidelity in reconstructing full I–V characteristics.
+
+\subsection{Parity Analysis of Reconstructions}
+
+To demonstrate the practical utility of our model, we compare predicted vs.\ ground‐truth for both the full J–V curve and key photovoltaic parameters derived from the reconstructions.
+
+\begin{figure}[hbpt]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{media/full_residuals.png}
+    \caption{Full‐curve current density parity: predicted vs.\ ground truth across all test points.}
+    \label{fig:parity_iv}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{media/parity_plot.png}
+    \caption{Parity of derived photovoltaic metrics: PCE, FF, $V_{\mathrm{oc}}$, $J_{\mathrm{sc}}$.}
+    \label{fig:parity_params}
+  \end{subfigure}
+  \caption{(a) The parity plot for the full J–V curve shows a slope near 1 and $R^2>0.998$, indicating excellent reconstruction fidelity. (b) The derived‐parameter parity demonstrates tight clustering around the diagonal for power conversion efficiency (PCE), fill factor (FF), open‐circuit voltage ($V_{\mathrm{oc}}$), and short‐circuit current density ($J_{\mathrm{sc}}$), confirming reliable extraction of key figures of merit.}
+  \label{fig:parity_analysis}
+\end{figure}
+
+\paragraph{Discussion}
+\begin{itemize}
+  \item \textbf{Curve fidelity:} Fig.~\ref{fig:parity_iv} exhibits near‐perfect agreement ($R^2>0.998$), validating the model’s capacity to reproduce the entire I–V characteristic.
+  \item \textbf{Parameter accuracy:} In Fig.~\ref{fig:parity_params}, the mean absolute relative errors are below 2\% for PCE and FF, under 1 mV for $V_{\mathrm{oc}}$, and below 5 mA/cm$^2$ for $J_{\mathrm{sc}}$.
+  \item \textbf{Practical impact:} These parity results show that reconstructed curves can be used directly for photovoltaic parameter extraction, bridging high‐fidelity modeling and real‐world characterization workflows.
+\end{itemize}
+\subsection{Analysis}
+\label{ssec:arch_analysis}
+\begin{itemize}
+    \item Validate the importance of physics informed loss approach -- compare model trained on different combinations of loss like MSE only, MSE + Monotonicity, Full physics loss
+    \item Visualization of the attention weights for a sample I-V curve. Discuss what the model "focuses" on when predicting different parts of the curve (e.g., does it pay more attention to the parameter embedding or specific voltage features near the knee?).
+    \item Comparison between Fourier and Gaussian RBF embeddings, showing that Gaussian is better and some justification
+\end{itemize}
+
+\subsection{Applications}
+\label{sec:applications}
+The development of a rapid and high-fidelity surrogate model for I-V curve reconstruction has significant implications for accelerating perovskite solar cell (PSC) research. The substantial speed-up compared to traditional physics-based simulators unlocks new possibilities for large-scale computational experiments, primarily through two powerful workflows: high-throughput virtual screening and inverse design.
+
+\subsubsection{High-Throughput Virtual Screening}
+The search for optimal material compositions and device architectures is a resource-intensive endeavor. 
+Our model functions as a core predictive engine for high-throughput virtual screening (HTVS) \cite{chen2025screening,wen2025screening}, enabling the rapid evaluation of vast parameter spaces. 
+As illustrated in the workflow in Figure~\ref{fig:screening}, a researcher can define a virtual library of devices by varying parameters like layer thicknesses and material choices. 
+Our model then predicts the full I-V curve for each candidate, allowing for a holistic performance assessment that includes not only power conversion efficiency but also crucial metrics like fill factor. 
+This approach extends beyond screening for single material properties like bandgaps \cite{djeradi2024bandgap} by evaluating the entire device's performance. 
+The outcome is a highly-curated list of promising device configurations, focusing costly experimental efforts only on candidates with the highest probability of success.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{screening.png}
+    \caption{A high-throughput virtual screening workflow enabled by our neural emulator. The model rapidly evaluates a large library of virtual devices to identify top-performing candidates for physical fabrication.}
+    \label{fig:screening}
+\end{figure}
+
+\subsubsection{Inverse Design and Optimization}
+Beyond forward prediction, our differentiable surrogate model is a key enabler for inverse design, which seeks to find optimal input parameters to achieve a desired output \cite{wang2022inverse,lu2022inverse}. 
+This approach transforms device optimization from a trial-and-error process into a targeted search for superior performance. 
+As depicted in Figure~\ref{fig:inverse_design}, our model can act as a fast and physics-aware evaluator within an optimization loop. 
+An algorithm iteratively proposes device parameters, and our model provides the resulting I-V curve and, crucially, the gradients needed for efficient feedback. 
+This loop continues until the predicted performance converges on a predefined target, such as an I-V curve with near-ideal efficiency and stability. 
+This methodology, inspired by similar frameworks used for material microstructure design \cite{lee2020fast}, provides experimentalists with concrete device-level targets to accelerate the discovery of next-generation PSCs.
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\textwidth]{inverse_design.png}
+    \caption{An inverse design workflow where our model acts as a differentiable evaluator inside an optimization loop to discover device parameters that produce a target I-V curve.}
+    \label{fig:inverse_design}
+\end{figure}
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+\begin{itemize}
+This work proposes a physics-informed surrogate model that uses temporal convolution network to reconstruct perovskite solar cell I-V curves with exceptional accuracy (R² of 0.998). The core contribution of this work is a >100,000-fold acceleration over traditional physics-based simulations, achieved without sacrificing physical realism due to a carefully engineered loss function. This breakthrough transforms previously intractable computational tasks, such as large-scale virtual screening and inverse design, into feasible research pathways. Future efforts will aim to deploy this powerful surrogate model on experimental data, integrate it into inverse design frameworks for device optimization, and generalize its application to other photovoltaic systems, thereby accelerating the materials-to-device discovery cycle.
+\end{itemize}
+
+\appendix
+\section{Hyperparameter Configuration}
+\label{app:hyperparams}
+\subsubsection{Final Model and Training Hyperparameters}
+
+Table~\ref{tab:final_hyperparams} lists the complete set of hyperparameters used in our final Physics‐Informed Attention‐TCN model, covering architecture, embedding, loss weights, optimizer, and training settings.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Final hyperparameters for model architecture and training}
+  \label{tab:final_hyperparams}
+  \rowcolors{3}{lightgray}{white}
+  \begin{tabular}{@{}l S[round-precision=6]@{}}
+    \toprule
+    \textbf{Parameter}                  & \textbf{Value}      \\
+    \midrule
+    \multicolumn{2}{l}{\textit{Random Seed}} \\
+    seed                                & 42                  \\
+
+    \midrule
+    \multicolumn{2}{l}{\textit{TCN Architecture}} \\
+    Channels (per block)                & {64,64,32}          \\
+    Kernel size                         & 5                   \\
+    Residual blocks                     & 3                   \\
+    Attention heads                     & 4                   \\
+    Dropout                             & 0.010668            \\
+
+    \midrule
+    \multicolumn{2}{l}{\textit{Positional Embedding}} \\
+    Embedding type                      & {gaussian}          \\
+    Gaussian bands $B$                  & 19                  \\
+    Gaussian width $\sigma$             & 0.127808            \\
+
+    \midrule
+    \multicolumn{2}{l}{\textit{MLP (Dense) Embedding}} \\
+    Layers                              & 3                   \\
+    Units per layer                     & 512                 \\
+
+    \midrule
+    \multicolumn{2}{l}{\textit{Physics‐Loss Weights}} \\
+    $w_{\rm mse}$                       & 1.000000            \\
+    $w_{\rm mono}$                      & 0.025102            \\
+    $w_{\rm convex}$                    & 0.000103            \\
+    $w_{\rm excurv}$                    & 0.000408            \\
+    Excess‐threshold                    & 0.800000            \\
+
+    \midrule
+    \multicolumn{2}{l}{\textit{Optimizer}} \\
+    Learning rate $\eta$                & 0.019882            \\
+    Weight decay $\lambda$              & 0.000007            \\
+    Final LR ratio                      & 0.010000            \\
+    Warmup epochs                       & 7                   \\
+
+    \midrule
+    \multicolumn{2}{l}{\textit{Training Settings}} \\
+    Batch size                          & 128                 \\
+    Max epochs                          & 12                  \\
+    Precision                           & 32                  \\
+    Gradient clip value                 & 1.000000            \\
+    Logging interval (steps)            & 50                  \\
+
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Commentary}  
+We chose a three‐block TCN with moderate channel counts to ensure a receptive field of 28 steps for the 8‐point slices, combined with four‐head self‐attention for dynamic context modeling. A very low dropout rate and light weight decay support complex curve fitting without overfitting. The positional embedding uses 19 Gaussian bands with $\sigma\approx0.128$ for smooth, localized voltage features. A deep MLP (3×512) encodes the device parameters into a rich latent representation. Physics‐loss weights emphasize monotonicity while lightly enforcing convexity and curvature. Finally, the optimizer settings (high $\eta$, low $\lambda$, 7‐epoch warmup) and training protocol (128‐sample batches, 12 epochs, 32‐bit precision) balance fast convergence with numerical stability.
+
+% \section{TEMPORARY TO BE REMOVED: Random Sources}
+
+% \begin{itemize}
+%     \item \href{https://arxiv.org/html/2412.17739v1}{I believe this is related} -- would be interesting to discuss this vs. RoPE (rotational positional encoding), commonly used in LLM and the one I picked
+%     \item Dilated NA variant \href{https://arxiv.org/pdf/2209.15001}{neighbour attention / dilated}.
+%     \item \href{https://arxiv.org/pdf/2312.07507:}{This paper} also discusses further the combination of TCN with dilated neighbor attention but customized to make it causal.
+% \end{itemize}
+
+
+
+%Bibliography
+\bibliographystyle{unsrt}  
+\bibliography{references}  % Assumes you have a references.bib file
+
+
+\end{document}
