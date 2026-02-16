@@ -25,3 +25,8 @@ lightning_logs/
 # IDE
 .vscode/
 .idea/
+.claude/
+
+/figures
+/paper
+/references_and_intext_to_add
