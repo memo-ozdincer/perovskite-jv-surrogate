@@ -2,7 +2,7 @@
 
 Reconstructing full J-V curves of perovskite solar cells from 31 coupled drift-diffusion parameters.
 
-**Paper:** *Physics-Informed Convolutional Surrogates for Coupled Drift-Diffusion Equations: Reconstructing Full J-V Curves of Perovskite Solar Cells* (Ozdincer, 2026)
+**Paper (PDF):** [src/ArXiV_paper.pdf](src/ArXiV_paper.pdf) — *Physics-Informed Convolutional Surrogates for Coupled Drift-Diffusion Equations: Reconstructing Full J-V Curves of Perovskite Solar Cells* (Ozdincer, 2026)
 
 **Pre-trained models:** [huggingface.co/memo-ozdincer/perovskite-jv-surrogate](https://huggingface.co/memo-ozdincer/perovskite-jv-surrogate)
 
